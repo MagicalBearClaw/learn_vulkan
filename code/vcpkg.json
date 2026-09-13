@@ -1,0 +1,21 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "learn-vulkan-com",
+  "version": "0.1.0",
+  "description": "Accompanying code for the LearnVulkan tutorial series",
+  "builtin-baseline": "118bba14b94bc040c098c0c15e63c142148c05ca",
+  "dependencies": [
+    "vulkan-headers",
+    "volk",
+    "vulkan-memory-allocator",
+    "glm",
+    "spdlog",
+    "stb",
+    {
+      "name": "sdl3",
+      "features": [
+        "vulkan"
+      ]
+    }
+  ]
+}

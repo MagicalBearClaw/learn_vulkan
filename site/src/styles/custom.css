@@ -1,0 +1,52 @@
+/* LearnVulkan reads as a book, not as API documentation: a wider prose column, a
+   longer measure, and figures that sit in the flow with their captions attached. */
+
+:root {
+  --sl-content-width: 50rem;
+  --sl-text-code: 0.9em;
+  --sl-line-height: 1.75;
+}
+
+/* Vulkan red, dark enough to pass contrast on the light theme and light enough on
+   the dark one. */
+:root {
+  --sl-color-accent-low: #3b0a0a;
+  --sl-color-accent: #a02c2c;
+  --sl-color-accent-high: #f0b8b8;
+}
+
+:root[data-theme="light"] {
+  --sl-color-accent-low: #f5d9d9;
+  --sl-color-accent: #9b2020;
+  --sl-color-accent-high: #4a0f0f;
+}
+
+.sl-markdown-content p {
+  text-wrap: pretty;
+}
+
+/* Figures: centred, bounded, with a small caption underneath. */
+.sl-markdown-content figure {
+  margin: 2rem auto;
+  text-align: center;
+}
+
+.sl-markdown-content figure img {
+  border-radius: 0.4rem;
+  border: 1px solid var(--sl-color-gray-5);
+  max-width: 100%;
+  height: auto;
+}
+
+.sl-markdown-content figcaption {
+  margin-top: 0.6rem;
+  font-size: 0.85rem;
+  color: var(--sl-color-gray-3);
+  font-style: italic;
+}
+
+/* Code blocks carry long Vulkan struct initialisers; let them scroll rather than
+   wrap into something unreadable. */
+.expressive-code .frame pre {
+  overflow-x: auto;
+}

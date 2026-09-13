@@ -1,0 +1,27 @@
+# Build output
+code/out/
+build/
+*.spv
+
+# Downloaded assets (see bootstrap.json / tools/bootstrap.py)
+assets/*
+!assets/.gitkeep
+
+# Site
+site/node_modules/
+site/dist/
+site/.astro/
+
+# Editors and tooling
+.vscode/
+.idea/
+.cache/
+compile_commands.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Screenshots produced by a manual capture run; reference images are committed
+# explicitly under site/public/img/reference/
+/captures/

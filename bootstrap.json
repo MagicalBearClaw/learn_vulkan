@@ -1,0 +1,14 @@
+{
+  "$comment": "Assets used by the tutorial samples. Fetched by tools/bootstrap.py into assets/, which is gitignored. Everything here is openly licensed; see CREDITS.md. Chapters add entries as they need them.",
+  "assets": [
+    {
+      "name": "gltf-sample-assets",
+      "description": "Khronos glTF sample models, used from the model-loading chapter onward",
+      "type": "git",
+      "url": "https://github.com/KhronosGroup/glTF-Sample-Assets.git",
+      "revision": "main",
+      "shallow": true,
+      "licence": "CC-BY 4.0 and others, per model; see the repository's LICENSE"
+    }
+  ]
+}

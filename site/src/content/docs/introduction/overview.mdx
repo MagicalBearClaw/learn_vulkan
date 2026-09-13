@@ -1,0 +1,100 @@
+---
+title: Introduction
+description: What this series covers, who it is for, and how to read it.
+sidebar:
+  order: 1
+---
+
+Vulkan has a reputation, and the reputation is mostly deserved: it is a large API that
+asks you to be explicit about things other graphics APIs decide on your behalf. The
+usual consequence is that beginner material spends its entire length getting a single
+triangle onto the screen, and stops there - just at the point where graphics
+programming gets interesting.
+
+This series goes the whole way. It starts at "what is a GPU and why does it need a
+command buffer" and ends at image-based lighting, by way of Phong shading, shadow
+maps, normal mapping, deferred rendering and a small 2D game. Each chapter continues
+the program the previous one left off, so by the final chapter you have built one
+renderer rather than forty disconnected samples.
+
+## Who this is for
+
+You should be comfortable with C++ - classes, references, RAII, the standard
+library - and comfortable enough with a terminal to run CMake. You do **not** need
+prior graphics experience. Where a chapter needs mathematics, it derives what it needs
+and the [appendices](/appendices/linear-algebra/) cover the rest.
+
+If you have used OpenGL or Direct3D 11 before, you will find the early chapters slower
+than you expect and the later ones familiar. There is a
+[cheat sheet](/appendices/vulkan-for-opengl-programmers/) mapping the concepts across.
+
+## What makes this different
+
+Most Vulkan tutorials were written against Vulkan 1.0, and it shows. They spend three
+chapters on `VkRenderPass` and `VkFramebuffer` objects, describe subpasses at length,
+and hand-roll memory allocation.
+
+This series targets **Vulkan 1.3** and uses what that gave us:
+
+- **Dynamic rendering** replaces render passes and framebuffers entirely. You describe
+  what you are rendering into at the moment you render into it.
+- **`synchronization2`** gives barriers a single coherent form instead of three
+  overlapping ones.
+- **Vulkan Memory Allocator** handles the memory-type puzzle, which is real engineering
+  but is not something you need to solve by hand to learn graphics.
+- **Descriptor indexing** and **buffer device address** make binding resources far less
+  ceremonial than it was.
+
+The result is roughly a third less setup code than a 1.0-era tutorial, and setup code
+is precisely the part that teaches you nothing.
+
+## How the code is organised
+
+Every chapter is a standalone program in its own directory under `code/src/`, built as
+its own target. You can compile and run any chapter independently, and diff one against
+the next to see exactly what a chapter added.
+
+Chapters share a small library called `vkcommon`, and it follows one strict rule:
+
+:::note[The vkcommon rule]
+Nothing enters the shared library until the chapter that teaches it has been written.
+Chapter N writes the code out in full and explains every line. From chapter N+1 onward
+that same code lives in `vkcommon`, and the chapter says so explicitly.
+:::
+
+So `vkcommon` grows as you read. It is never a black box you are asked to trust - it is
+a record of what you have already built.
+
+## How to read it
+
+In order. The parts are:
+
+| Part | What you end up with |
+|---|---|
+| **Getting Started** | A textured, transformed cube you can fly a camera around |
+| **Lighting** | Phong shading, materials, and multiple light types |
+| **Model Loading** | Real models with real materials, loaded from disk |
+| **Advanced Vulkan** | Pipeline state, offscreen targets, cubemaps, instancing, compute |
+| **Advanced Lighting** | Shadows, normal mapping, HDR, bloom, deferred shading, SSAO |
+| **PBR** | A physically based renderer with image-based lighting |
+| **In Practice** | Debugging, profiling, text, and a complete 2D game |
+| **Extra Topics** | Skeletal animation, cascaded shadows, frustum culling, tessellation |
+| **Vulkan Only** | GPU-driven rendering, mesh shaders, ray queries - what the API is *for* |
+
+Read the prose before the code. Every chapter opens with the problem before it shows
+the solution, and the reasoning is the part worth having.
+
+## A debt
+
+The structure of this series - the order of the topics, which idea has to come before
+which other idea, the decision to treat lighting and PBR as essential rather than
+advanced - is taken from [LearnOpenGL](https://learnopengl.com) by Joey de Vries. It is
+the best introduction to real-time graphics there is, and the reason it works is the
+order it puts things in.
+
+The text and the code here are new; Vulkan is different enough that they had to be. But
+the shape is borrowed, with gratitude. See [credits](/appendices/credits/) for the full
+acknowledgements.
+
+Next: [what Vulkan actually is](/introduction/what-is-vulkan/), and why it looks the
+way it does.
