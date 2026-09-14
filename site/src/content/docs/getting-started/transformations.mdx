@@ -10,7 +10,7 @@ sidebar:
   <figcaption>Chapter 1.12: two quads, the same two matrices, multiplied in opposite orders.</figcaption>
 </figure>
 
-There is almost no new Vulkan in this chapter — a `mat4` in a push constant, and nothing
+There is almost no new Vulkan in this chapter — a matrix in a push constant, and nothing
 else. It is about the mathematics, because everything from here to the end of the series
 rests on it. A camera is a matrix. A bone in a skeleton is a matrix. A shadow map's light
 is a matrix.
@@ -29,7 +29,7 @@ here on.
 
 ## Homogeneous coordinates
 
-A 3D position needs three numbers, so why is `gl_Position` a `vec4`?
+A 3D position needs three numbers, so why is `SV_Position` a `float4`?
 
 Because translation is not a linear operation on three components. Scaling and rotation
 can both be written as a 3×3 matrix; moving something cannot, since a matrix always maps
@@ -47,8 +47,8 @@ you translate a model ten metres sideways, its normals must not move with it. Se
 `w = 0` makes that happen automatically, with no special case — chapter 2.2 leans on this
 directly.
 
-```glsl title="code/src/1.getting_started/transformations/transform.vert"
-gl_Position = push.model * vec4(in_position, 0.0, 1.0);
+```slang title="code/src/1.getting_started/transformations/transform.slang"
+output.position = mul(push.model, float4(input.position, 0.0, 1.0));
 ```
 
 `w` also does one more job, later: a perspective projection puts the distance to the
@@ -115,7 +115,7 @@ That is not a convention someone chose to be awkward. The vertex is a column vec
 the right of the product:
 
 ```
-gl_Position = M₁ · M₂ · M₃ · v
+position = M₁ · M₂ · M₃ · v
 ```
 
 so `M₃` meets `v` first, then `M₂`, then `M₁`. Nothing more mysterious than that.
@@ -141,27 +141,51 @@ When something rotates around a point it should not, or grows in the wrong direc
 check the order before you check anything else.
 :::
 
-## Column-major, and the transpose trap
+## `mul()`, and the transpose trap
 
-glm stores matrices **column-major**, matching GLSL. `m[0]` is the first *column*, not
-the first row.
+Slang's spelling of a matrix product is `mul()`, not `*`:
 
-This matters in three places:
+```slang title="code/src/1.getting_started/transformations/transform.slang"
+output.position = mul(push.model, float4(input.position, 0.0, 1.0));
+```
 
-1. **`memcpy` works.** A `glm::mat4` is 16 floats in exactly the order GLSL wants, so
-   pushing one as a push constant or copying it into a uniform buffer needs no
-   conversion.
-2. **`mat[3]` is the translation**, because translation lives in the last column.
-3. **Multiplication order in GLSL matches C++.** `push.model * position` in the shader
-   and `model * position` in glm mean the same thing.
+Read `mul(model, position)` as "model times position" — the same order and the same
+meaning as GLSL's `model * position`, and the same order as `model * position` in glm on
+the C++ side. The vertex is a column vector on the right, transforms compose right to
+left, and that stays true for the rest of the series.
 
-The trap is that GLSL accepts `position * push.model` too, and it means the *other*
-convention — as if the matrix were transposed. It compiles, it renders, and the result
-looks nearly right at small angles and is never actually right. If a transform looks
-subtly skewed, check which side the vertex is on.
+`*` is not an alternative spelling. Slang inherits HLSL's operators, where `*` on two
+matrices multiplies them **element by element** — which compiles without complaint and is
+almost never what you meant. Matrix times vector with `*` at least fails outright:
 
-DirectX and HLSL use row-major with row vectors, which is why porting shader code between
-them means reversing every multiplication chain.
+```
+error: no overload for '*' applicable to arguments of type (matrix<float,4,4>,
+vector<float,4>)
+```
+
+Use `mul()` for anything that is a transform, and be suspicious of a `*` between two
+matrices.
+
+The other half of the convention is memory layout, and here the good news is that there
+is nothing to do:
+
+1. **`memcpy` works.** A `glm::mat4` is 16 floats, column by column, and it goes into a
+   push constant or a uniform buffer with no transpose on the way. Slang stores matrices
+   row-major *and* implements `mul(M, v)` against that layout, so the two conventions
+   cancel and the arithmetic comes out the same as GLSL's. If you go looking in the
+   SPIR-V you will find a `RowMajor` decoration and an `OpVectorTimesMatrix`, which is
+   the same product written the other way round.
+2. **`mat[3]` is the translation** on the C++ side, because glm puts translation in the
+   last column.
+
+The trap is that Slang also accepts `mul(position, model)`, with the arguments the other
+way round, and it means the *other* convention — as if the matrix were transposed. It
+compiles, it renders, and the result looks nearly right at small angles and is never
+actually right. If a transform looks subtly skewed, check the argument order first.
+
+That argument order is exactly what HLSL code written for DirectX uses, since DirectX
+convention puts row vectors on the left. Porting a shader across means swapping the
+arguments to every `mul()`, not just the chain order.
 
 ## The aspect ratio stopgap
 
@@ -197,7 +221,7 @@ careful about what else goes in there. A model matrix in push constants with the
 in a uniform buffer is the standard arrangement, and it is exactly what chapter 1.14
 ends up with.
 
-std140 alignment is not a problem here: a `mat4` is four `vec4` columns, all naturally
+std140 alignment is not a problem here: a 4×4 matrix is four four-component columns, all naturally
 16-byte aligned, and push constant blocks follow the same rules as uniform blocks.
 
 ## Running it
@@ -213,7 +237,7 @@ rather than being told.
 ## What changed
 
 - the vertex buffer is now a plain unit square that never changes
-- the push constant block holds a `mat4` instead of loose floats
+- the push constant block holds a `float4x4` instead of loose floats
 - the vertex shader is one multiplication
 - `glm/gtc/matrix_transform.hpp` is included for `translate`, `rotate` and `scale`
 - `main.cpp` lost about 250 lines: chapter 1.11's texture loading is now
@@ -241,8 +265,9 @@ what `tools/capture.py` is for.
    after it. Two different shapes, because scale and rotation do not commute either.
 4. Delete `aspect_fix` from both chains and resize the window into a tall thin shape.
    This is the problem the next chapter solves; it is worth seeing it clearly once.
-5. Replace `push.model * vec4(...)` with `vec4(...) * push.model` in the vertex shader.
-   It compiles. Work out what transform you are actually applying, and at what angle the
-   difference becomes obvious.
+5. Swap the arguments: `mul(float4(...), push.model)` instead of
+   `mul(push.model, float4(...))`. It compiles. Work out what transform you are actually
+   applying, and at what angle the difference becomes obvious. Then try `push.model *
+   float4(...)` and note that *that* one the compiler catches.
 6. Make a third quad that orbits *and* spins: an orbit chain with a second rotation
    after the translation. That is a moon, and it is the whole idea behind a scene graph.

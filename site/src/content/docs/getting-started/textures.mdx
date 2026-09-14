@@ -263,25 +263,35 @@ Note there is **one** descriptor set this time, not one per frame in flight. Not
 it changes: it points at the same texture and sampler every frame. The per-frame
 duplication in 1.10 was needed because the *contents* of that buffer changed.
 
-In GLSL the type is `sampler2D`:
+In Slang the type is `Sampler2D`:
 
-```glsl title="code/src/1.getting_started/textures/textured.frag"
-layout(set = 0, binding = 0) uniform sampler2D tex;
+```slang title="code/src/1.getting_started/textures/textured.slang"
+[[vk::binding(0, 0)]] Sampler2D tex;
 
-void main() {
-    out_colour = texture(tex, frag_uv);
+[shader("fragment")]
+float4 fragmentMain(VSOutput input) : SV_Target {
+    return tex.Sample(input.uv);
 }
 ```
 
-:::note[`texture()` does more than a memory read]
+`Sampler2D` is the combined form: the view and the sampler arrive together in one
+descriptor, matching the `VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER` above. Slang can
+also describe the two halves separately, as a `Texture2D` plus a `SamplerState`, which is
+what a `SAMPLED_IMAGE` and a `SAMPLER` descriptor would be. That split is how you sample
+one texture with several different samplers without duplicating the image descriptor;
+this chapter takes the combined form because it is one descriptor to allocate and one
+object to reason about.
+
+:::note[`Sample()` does more than a memory read]
 The hardware compares this fragment's `uv` against its neighbours' — which is *why*
 fragment shaders run in groups of at least 2×2 — works out how fast the coordinate is
 changing across the screen, picks the mip level where one texel is about one pixel, and
 blends the two nearest levels. All of that is one instruction.
 
-It also means `texture()` inside non-uniform control flow is trouble: if some fragments
+It also means `Sample()` inside non-uniform control flow is trouble: if some fragments
 in the group took the other branch, their `uv` is undefined and so is the derivative.
-Sample first, branch afterwards.
+Sample first, branch afterwards. `SampleLevel()` names the mip level explicitly and is
+safe anywhere, at the cost of choosing it yourself.
 :::
 
 ## Texture coordinates
@@ -305,8 +315,8 @@ has an asymmetric marker in it: if the triangle points down, your v is flipped.
 
 Tiling is just multiplication in the vertex shader:
 
-```glsl title="code/src/1.getting_started/textures/textured.vert"
-frag_uv = in_uv * push.uv_scale;
+```slang title="code/src/1.getting_started/textures/textured.slang"
+output.uv = input.uv * push.uv_scale;
 ```
 
 With `uv_scale` of 4 the coordinate runs 0…4 across the quad, and what happens past 1 is
@@ -329,7 +339,7 @@ modes, and a triangle so a flipped v is obvious.
 
 ## What changed
 
-- `Vertex` gained a `vec2 uv`
+- `Vertex` gained a `glm::vec2 uv`
 - a `VkImage`, `VkImageView` and `VkSampler` exist, plus the mip chain
 - the descriptor set holds a `COMBINED_IMAGE_SAMPLER`, and there is one of it, not two
 - layout transitions moved from the swapchain image to a texture, per mip level

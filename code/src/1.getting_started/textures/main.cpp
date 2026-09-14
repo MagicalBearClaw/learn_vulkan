@@ -599,20 +599,19 @@ private:
         VK_CHECK(vkCreatePipelineLayout(device, &layout_info, nullptr,
                                         &pipeline_layout_));
 
-        const VkShaderModule vertex_shader =
-            vkc::load_shader(device, LVK_CHAPTER_ID, "textured.vert");
-        const VkShaderModule fragment_shader =
-            vkc::load_shader(device, LVK_CHAPTER_ID, "textured.frag");
+        // One module, both stages: textured.slang compiles to a single SPIR-V
+        // binary with a vertexMain and a fragmentMain entry point in it.
+        const VkShaderModule shader =
+            vkc::load_shader(device, LVK_CHAPTER_ID, "textured.slang");
 
         pipeline_ = vkc::PipelineBuilder(device)
-                        .shaders(vertex_shader, fragment_shader)
+                        .shaders(shader)
                         .vertex_input(std::span(&binding, 1), attributes)
                         .colour_attachment(swapchain().format())
                         .layout(pipeline_layout_)
                         .build();
 
-        vkDestroyShaderModule(device, fragment_shader, nullptr);
-        vkDestroyShaderModule(device, vertex_shader, nullptr);
+        vkDestroyShaderModule(device, shader, nullptr);
     }
 
     vkc::Buffer vertex_buffer_;

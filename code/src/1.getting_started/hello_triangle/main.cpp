@@ -809,8 +809,9 @@ private:
     }
 
     void create_pipeline() {
-        const VkShaderModule vertex_shader = load_shader("triangle.vert");
-        const VkShaderModule fragment_shader = load_shader("triangle.frag");
+        // One module for both stages. triangle.slang declares a vertexMain and a
+        // fragmentMain, and slangc compiled the pair into this single SPIR-V binary.
+        const VkShaderModule shader = load_shader("triangle.slang");
 
         const VkPipelineShaderStageCreateInfo stages[2]{
             {
@@ -818,10 +819,15 @@ private:
                 .pNext = nullptr,
                 .flags = 0,
                 .stage = VK_SHADER_STAGE_VERTEX_BIT,
-                .module = vertex_shader,
-                // The entry point. It does not have to be called "main", and a single
-                // module can hold several.
-                .pName = "main",
+                .module = shader,
+                // The entry point, by name. A SPIR-V module can hold as many as you
+                // like, and pName is what selects one -- which is why the same module
+                // appears twice here with a different name each time.
+                //
+                // Nothing requires the name "main". Slang keeps the function's own name
+                // because the build passes -fvk-use-entrypoint-name; GLSL has no choice
+                // in the matter, since glslang always emits an entry point called main.
+                .pName = "vertexMain",
                 .pSpecializationInfo = nullptr,
             },
             {
@@ -829,14 +835,14 @@ private:
                 .pNext = nullptr,
                 .flags = 0,
                 .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-                .module = fragment_shader,
-                .pName = "main",
+                .module = shader,
+                .pName = "fragmentMain",
                 .pSpecializationInfo = nullptr,
             },
         };
 
         // No vertex buffers: the vertex shader generates its own positions from
-        // gl_VertexIndex. Chapter 1.8 fills this struct in properly.
+        // the vertex index. Chapter 1.8 fills this struct in properly.
         const VkPipelineVertexInputStateCreateInfo vertex_input{
             .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
             .pNext = nullptr,
@@ -996,9 +1002,8 @@ private:
         VK_CHECK(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipeline_info,
                                            nullptr, &pipeline_));
 
-        // The modules have been compiled into the pipeline and are no longer needed.
-        vkDestroyShaderModule(device_, fragment_shader, nullptr);
-        vkDestroyShaderModule(device_, vertex_shader, nullptr);
+        // The module has been compiled into the pipeline and is no longer needed.
+        vkDestroyShaderModule(device_, shader, nullptr);
     }
 
     void draw_frame(bool capture_this_frame) {
@@ -1098,7 +1103,7 @@ private:
         vkCmdSetScissor(frame.cmd, 0, 1, &scissor);
 
         // Three vertices, one instance. The vertex shader runs three times, with
-        // gl_VertexIndex counting 0, 1, 2.
+        // SV_VulkanVertexID counting 0, 1, 2.
         vkCmdDraw(frame.cmd, 3, 1, 0, 0);
 
         vkCmdEndRendering(frame.cmd);

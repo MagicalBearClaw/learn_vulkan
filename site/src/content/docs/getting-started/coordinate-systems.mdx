@@ -29,9 +29,15 @@ one matrix.
 | **View** | the camera | after the view matrix, camera at the origin looking down −z |
 | **Clip** | — | after the projection, ready for the divide by `w` |
 
-```glsl title="code/src/1.getting_started/coordinate_systems/cube.vert"
-gl_Position = globals.projection * globals.view * push.model * vec4(in_position, 1.0);
+```slang title="code/src/1.getting_started/coordinate_systems/cube.slang"
+float4 world = mul(push.model, float4(input.position, 1.0));
+float4 view_space = mul(globals.view, world);
+output.position = mul(globals.projection, view_space);
 ```
+
+Nested `mul()` calls would be the literal translation of GLSL's
+`projection * view * model * position`, but three named steps read better and compile to
+the same thing — and the names are the coordinate spaces this chapter is about.
 
 Right to left, as always: model first, then view, then projection.
 
@@ -262,7 +268,7 @@ whatever is behind it. Resize the window and the proportions stay right.
 
 ## What changed
 
-- vertices are `vec3`, and the mesh is a 24-vertex cube
+- vertices are `glm::vec3`, and the mesh is a 24-vertex cube
 - a view matrix and a projection matrix, in a per-frame uniform buffer
 - a depth image, recreated on resize, attached through `pDepthAttachment`
 - the pipeline has a depth test, a depth format, and back-face culling

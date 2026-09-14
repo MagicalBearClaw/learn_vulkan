@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -12,6 +13,10 @@ namespace vkc {
 
 // Reads the SPIR-V the build produced for this chapter and wraps it in a shader
 // module. Chapter 1.7 wrote this out by hand; nothing here is new.
+//
+// One Slang file compiles to one SPIR-V module holding every stage, so `shader_name`
+// is the .slang file the chapter's CMakeLists lists ("quad.slang"), and one call here
+// covers the whole pipeline.
 //
 // The module is a throwaway: it is consumed by pipeline creation and can be destroyed
 // as soon as the pipeline exists.
@@ -31,10 +36,16 @@ class PipelineBuilder {
 public:
     explicit PipelineBuilder(VkDevice device) noexcept : device_(device) {}
 
-    PipelineBuilder& shaders(VkShaderModule vertex, VkShaderModule fragment);
+    // The module holds both stages. The entry point names are the Slang function
+    // names -- this project marks them [shader("vertex")] vertexMain and
+    // [shader("fragment")] fragmentMain, and the build passes
+    // -fvk-use-entrypoint-name so those names survive into the SPIR-V.
+    PipelineBuilder& shaders(VkShaderModule module,
+                             std::string vertex_entry = "vertexMain",
+                             std::string fragment_entry = "fragmentMain");
 
     // Describes the vertex buffer layout. Leave unset for shaders that generate their
-    // own vertices from gl_VertexIndex, as 1.7's did.
+    // own vertices from the vertex index, as 1.7 did.
     PipelineBuilder& vertex_input(
         std::span<const VkVertexInputBindingDescription> bindings,
         std::span<const VkVertexInputAttributeDescription> attributes);
@@ -71,8 +82,9 @@ public:
 private:
     VkDevice device_ = VK_NULL_HANDLE;
 
-    VkShaderModule vertex_shader_ = VK_NULL_HANDLE;
-    VkShaderModule fragment_shader_ = VK_NULL_HANDLE;
+    VkShaderModule module_ = VK_NULL_HANDLE;
+    std::string vertex_entry_ = "vertexMain";
+    std::string fragment_entry_ = "fragmentMain";
 
     std::vector<VkVertexInputBindingDescription> bindings_;
     std::vector<VkVertexInputAttributeDescription> attributes_;

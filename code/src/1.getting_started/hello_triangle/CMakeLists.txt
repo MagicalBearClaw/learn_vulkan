@@ -1,5 +1,5 @@
 add_chapter(1.7.hello_triangle
     SOURCES main.cpp
-    SHADERS triangle.vert triangle.frag
+    SHADERS triangle.slang
     NO_SCAFFOLD
 )

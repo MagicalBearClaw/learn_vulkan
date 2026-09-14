@@ -9,7 +9,7 @@ introduction to real-time graphics that exists, and the reason it works is the o
 it puts things in. That order is what has been borrowed here.
 
 What is *not* borrowed: the prose and the code. Every article in this series is
-written from scratch against the Vulkan specification, and every line of C++ and GLSL
+written from scratch against the Vulkan specification, and every line of C++ and Slang
 here is new. Vulkan is different enough from OpenGL that adapting sentence by
 sentence would produce worse explanations than writing them fresh.
 
@@ -42,6 +42,7 @@ listed in `bootstrap.json`, and each entry there records its licence.
 | [stb](https://github.com/nothings/stb) | Image loading and writing | MIT / public domain |
 | [Dear ImGui](https://github.com/ocornut/imgui) | Debug UI (later chapters) | MIT |
 | [Assimp](https://github.com/assimp/assimp) | Model loading (later chapters) | BSD-3-Clause |
+| [Slang](https://github.com/shader-slang/slang) | Shading language and `slangc` compiler | Apache-2.0 with LLVM exception |
 
 ## Reference material
 

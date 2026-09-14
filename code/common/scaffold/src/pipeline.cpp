@@ -4,6 +4,7 @@
 #include "vkc/paths.hpp"
 
 #include <stdexcept>
+#include <utility>
 
 namespace vkc {
 
@@ -25,10 +26,12 @@ VkShaderModule load_shader(VkDevice device, std::string_view chapter_id,
     return module;
 }
 
-PipelineBuilder& PipelineBuilder::shaders(VkShaderModule vertex,
-                                          VkShaderModule fragment) {
-    vertex_shader_ = vertex;
-    fragment_shader_ = fragment;
+PipelineBuilder& PipelineBuilder::shaders(VkShaderModule module,
+                                          std::string vertex_entry,
+                                          std::string fragment_entry) {
+    module_ = module;
+    vertex_entry_ = std::move(vertex_entry);
+    fragment_entry_ = std::move(fragment_entry);
     return *this;
 }
 
@@ -92,7 +95,7 @@ PipelineBuilder& PipelineBuilder::layout(VkPipelineLayout layout) {
 }
 
 VkPipeline PipelineBuilder::build() const {
-    if (vertex_shader_ == VK_NULL_HANDLE || fragment_shader_ == VK_NULL_HANDLE) {
+    if (module_ == VK_NULL_HANDLE) {
         throw std::runtime_error("PipelineBuilder::build: shaders() was never called");
     }
     if (layout_ == VK_NULL_HANDLE) {
@@ -118,8 +121,10 @@ VkPipeline PipelineBuilder::build() const {
             .pNext = nullptr,
             .flags = 0,
             .stage = VK_SHADER_STAGE_VERTEX_BIT,
-            .module = vertex_shader_,
-            .pName = "main",
+            // Both stages come from the same module; pName is what picks one of the
+            // two entry points out of it.
+            .module = module_,
+            .pName = vertex_entry_.c_str(),
             .pSpecializationInfo = nullptr,
         },
         {
@@ -127,8 +132,8 @@ VkPipeline PipelineBuilder::build() const {
             .pNext = nullptr,
             .flags = 0,
             .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-            .module = fragment_shader_,
-            .pName = "main",
+            .module = module_,
+            .pName = fragment_entry_.c_str(),
             .pSpecializationInfo = fragment_specialisation,
         },
     };

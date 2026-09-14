@@ -646,14 +646,14 @@ private:
         VK_CHECK(vkCreatePipelineLayout(device, &layout_info, nullptr,
                                         &pipeline_layout_));
 
-        const VkShaderModule vertex_shader =
-            vkc::load_shader(device, LVK_CHAPTER_ID, "cube.vert");
-        const VkShaderModule fragment_shader =
-            vkc::load_shader(device, LVK_CHAPTER_ID, "cube.frag");
+        // One module, both stages: cube.slang compiles to a single SPIR-V
+        // binary with a vertexMain and a fragmentMain entry point in it.
+        const VkShaderModule shader =
+            vkc::load_shader(device, LVK_CHAPTER_ID, "cube.slang");
 
         pipeline_ =
             vkc::PipelineBuilder(device)
-                .shaders(vertex_shader, fragment_shader)
+                .shaders(shader)
                 .vertex_input(std::span(&binding, 1), attributes)
                 // Throw away faces pointing away from the camera: half the triangles of
                 // a closed object, discarded before they are rasterised.
@@ -673,8 +673,7 @@ private:
                 .layout(pipeline_layout_)
                 .build();
 
-        vkDestroyShaderModule(device, fragment_shader, nullptr);
-        vkDestroyShaderModule(device, vertex_shader, nullptr);
+        vkDestroyShaderModule(device, shader, nullptr);
     }
 
     Camera camera_;

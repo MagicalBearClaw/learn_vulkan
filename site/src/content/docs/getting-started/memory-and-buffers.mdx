@@ -263,13 +263,15 @@ padding in it, and then it silently does not.
 
 `location` is the pairing with the shader, and it is the whole contract:
 
-```glsl title="code/src/1.getting_started/memory_and_buffers/quad.vert"
-layout(location = 0) in vec2 in_position;
-layout(location = 1) in vec3 in_colour;
+```slang title="code/src/1.getting_started/memory_and_buffers/quad.slang"
+struct VSInput {
+    [[vk::location(0)]] float2 position;
+    [[vk::location(1)]] float3 colour;
+};
 ```
 
 :::caution[The one mistake validation cannot fully catch]
-If the `location` numbers or the formats disagree between C++ and GLSL, the shader reads
+If the `location` numbers or the formats disagree between C++ and the shader, it reads
 the wrong bytes. The validation layers catch some cases — a missing attribute, a
 mismatched type — but they cannot know that you meant to swap position and colour. The
 symptom is geometry in the wrong place or colours that make no sense, with no error
@@ -314,13 +316,16 @@ pipeline.
 `vkCmdDrawIndexed` takes an index count where `vkCmdDraw` took a vertex count. The vertex
 shader still runs per vertex; which vertex it runs on now comes from the index buffer.
 
-The shader itself barely changed. `gl_VertexIndex` and the constant array are gone,
-replaced by two `in` declarations:
+The shader itself barely changed. The vertex index and the constant array are gone,
+replaced by a `VSInput` parameter:
 
-```glsl title="code/src/1.getting_started/memory_and_buffers/quad.vert"
-void main() {
-    gl_Position = vec4(in_position, 0.0, 1.0);
-    frag_colour = in_colour;
+```slang title="code/src/1.getting_started/memory_and_buffers/quad.slang"
+[shader("vertex")]
+VSOutput vertexMain(VSInput input) {
+    VSOutput output;
+    output.position = float4(input.position, 0.0, 1.0);
+    output.colour = input.colour;
+    return output;
 }
 ```
 

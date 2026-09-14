@@ -1,0 +1,151 @@
+---
+title: Slang for GLSL Programmers
+description: A translation table from Vulkan GLSL to Slang, and the four differences that actually cause bugs.
+sidebar:
+  order: 80
+---
+
+This series writes its shaders in Slang. Most Vulkan material you will find elsewhere is
+in GLSL, so this page is the translation table for reading that material, and for porting
+a shader you found into this project.
+
+The syntax comes from HLSL. If you can read GLSL you can read Slang after about ten
+minutes of adjustment — but four of the differences are not cosmetic, and those are at
+the bottom.
+
+## Types
+
+| GLSL | Slang |
+|---|---|
+| `vec2` `vec3` `vec4` | `float2` `float3` `float4` |
+| `ivec3`, `uvec3`, `bvec3` | `int3`, `uint3`, `bool3` |
+| `dvec3` | `double3` |
+| `mat4`, `mat3` | `float4x4`, `float3x3` |
+| `mat2x3` (2 columns, 3 rows) | `float3x2` (3 rows, 2 columns) |
+| `sampler2D` | `Sampler2D` |
+| `texture2D` + `sampler` | `Texture2D` + `SamplerState` |
+| `samplerCube` | `SamplerCube` |
+| `image2D` | `RWTexture2D<T>` |
+
+Note the matrix row: GLSL names a matrix *columns first*, HLSL and Slang name it *rows
+first*, so the two spellings of a non-square matrix are transposed. Square matrices —
+which is nearly everything — are unaffected.
+
+## Functions
+
+| GLSL | Slang |
+|---|---|
+| `mix(a, b, t)` | `lerp(a, b, t)` |
+| `fract(x)` | `frac(x)` |
+| `mod(x, y)` | `fmod(x, y)` |
+| `inversesqrt(x)` | `rsqrt(x)` |
+| `atan(y, x)` | `atan2(y, x)` |
+| `dFdx`, `dFdy` | `ddx`, `ddy` |
+| `texture(s, uv)` | `s.Sample(uv)` |
+| `textureLod(s, uv, lod)` | `s.SampleLevel(uv, lod)` |
+| `texelFetch(s, p, lod)` | `s.Load(int3(p, lod))` |
+| `textureSize(s, lod)` | `s.GetDimensions(...)` |
+| `M * v` | `mul(M, v)` |
+
+`dot`, `cross`, `normalize`, `length`, `reflect`, `refract`, `clamp`, `smoothstep`,
+`abs`, `min`, `max`, `pow`, `exp`, `log` and the trigonometric functions keep their
+names.
+
+## Declarations
+
+| GLSL | Slang |
+|---|---|
+| `layout(location = 0) in vec3 x;` | `[[vk::location(0)]] float3 x;` in the input struct |
+| `layout(location = 0) out vec4 c;` | `: SV_Target` on the return value |
+| `layout(set = 0, binding = 1) uniform ...` | `[[vk::binding(1, 0)]]` — **binding first, set second** |
+| `layout(push_constant) uniform Push {...} p;` | `[[vk::push_constant]] Push p;` |
+| `layout(constant_id = 0) const int k = 0;` | `[[vk::constant_id(0)]] const int k = 0;` |
+| `uniform Globals { ... } g;` | `ConstantBuffer<Globals> g;` |
+| `buffer Things { ... };` | `StructuredBuffer<T>` / `RWStructuredBuffer<T>` |
+| `flat` | `nointerpolation` |
+| `noperspective` | `noperspective` |
+| `centroid` | `centroid` |
+| `#version 450` | nothing — the target is a compiler flag |
+| `void main()` | `[shader("vertex")] VSOutput vertexMain(...)` |
+
+## Built-ins
+
+| GLSL | Slang |
+|---|---|
+| `gl_Position` | `: SV_Position` field on the output struct |
+| `gl_FragCoord` | `: SV_Position` field on the *input* struct |
+| `gl_VertexIndex` | `: SV_VulkanVertexID` |
+| `gl_InstanceIndex` | `: SV_VulkanInstanceID` |
+| `gl_FragDepth` | `: SV_Depth` |
+| `gl_FrontFacing` | `: SV_IsFrontFace` |
+| `gl_PrimitiveID` | `: SV_PrimitiveID` |
+| `gl_GlobalInvocationID` | `: SV_DispatchThreadID` |
+| `gl_LocalInvocationID` | `: SV_GroupThreadID` |
+| `gl_WorkGroupID` | `: SV_GroupID` |
+| `layout(local_size_x = 8, ...) in;` | `[numthreads(8, 8, 1)]` |
+
+## The four that cause bugs
+
+Everything above is a lookup. These four are worth understanding rather than
+memorising.
+
+### `*` is not a matrix product
+
+In GLSL, `M * v` is the matrix product and `M * N` is matrix multiplication. In Slang,
+as in HLSL, `*` is **element-wise**:
+
+- `M * N` between two matrices compiles happily and multiplies them component by
+  component. It is a silent wrong answer.
+- `M * v` between a matrix and a vector does not compile at all, which is the one case
+  the compiler saves you from.
+
+Use `mul(M, v)` and `mul(M, N)`. Chapter 1.12 goes through this.
+
+### `mul()` argument order is the convention
+
+`mul(M, v)` treats `v` as a column vector and means "apply M to v" — the same as GLSL's
+`M * v`. `mul(v, M)` treats `v` as a row vector and means the transposed thing.
+
+DirectX-flavoured HLSL conventionally writes `mul(v, M)`, so shader code lifted from
+DirectX material needs every `mul()`'s arguments swapped, not just the chain reversed.
+
+### `vk::binding` takes binding before set
+
+`[[vk::binding(1, 0)]]` is **binding 1 of set 0**, which is the opposite order from how
+GLSL reads and from how you say it out loud. Getting it backwards produces a descriptor
+mismatch that validation does report, but the message will not point at the attribute.
+
+### `SV_VertexID` is not `gl_VertexIndex`
+
+`SV_VertexID` is HLSL's draw-relative index, which Slang compiles to
+`VertexIndex - BaseVertex`, pulling in SPIR-V's `DrawParameters` capability and failing
+validation unless you enabled `shaderDrawParameters`.
+
+`SV_VulkanVertexID` is `gl_VertexIndex` exactly. Same for `SV_InstanceID` versus
+`SV_VulkanInstanceID`. The two agree whenever `firstVertex` is 0, which is most of the
+time, which is why this one hides.
+
+## Things Slang has that GLSL does not
+
+Worth knowing they exist, because they change how you organise shader code once there is
+a lot of it:
+
+- **Modules.** `import lighting;` rather than string-pasted `#include`.
+- **Generics and interfaces.** A `float3 shade<T : IBrdf>(T brdf, ...)` specialised at
+  compile time, instead of a `#define` per variant.
+- **Real overloading and operator overloading.**
+- **Automatic differentiation**, which is niche until it is not.
+- **Multiple backends.** The same source compiles to SPIR-V, DXIL, Metal and WGSL.
+
+## Going back the other way
+
+`slangc` can emit GLSL as well as SPIR-V, which is occasionally useful for seeing what a
+piece of Slang means:
+
+```bash
+slangc quad.slang -target glsl -entry fragmentMain -stage fragment
+```
+
+For the reverse direction — reading someone's GLSL — `glslangValidator -H` prints the
+SPIR-V with a human-readable header, and `spirv-cross` will turn a SPIR-V module back
+into readable source in several languages.

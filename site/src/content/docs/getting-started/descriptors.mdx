@@ -39,13 +39,17 @@ They are the simpler half by a wide margin.
 
 Declare the block in the shader:
 
-```glsl title="code/src/1.getting_started/descriptors/quad.vert"
-layout(push_constant) uniform Push {
-    vec2 offset;
+```slang title="code/src/1.getting_started/descriptors/quad.slang"
+struct PushConstants {
+    float2 offset;
     float scale;
     float phase;
-} push;
+};
+[[vk::push_constant]] PushConstants push;
 ```
+
+Declared once, at file scope, and both entry points read it. In GLSL each stage repeats
+the block in its own file and the two copies have to agree.
 
 Declare a matching range in the pipeline layout:
 
@@ -81,7 +85,7 @@ a draw needs goes in that single struct.
 `maxPushConstantsSize` is guaranteed to be at least 128 bytes and that is exactly what
 a good deal of hardware offers. The sample prints yours at startup.
 
-128 bytes is two `mat4`s with nothing left over, which is why the usual arrangement is a
+128 bytes is two 4×4 matrices with nothing left over, which is why the usual arrangement is a
 model matrix in push constants and the camera matrices in a uniform buffer. Chapter 1.13
 does precisely that.
 :::
@@ -193,8 +197,9 @@ vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                         pipeline_layout_, 0, 1, &descriptor_sets_[slot], 0, nullptr);
 ```
 
-The `0` after the layout is the **set index**, and it is the `set = 0` in the shader's
-`layout(set = 0, binding = 0)`.
+The `0` after the layout is the **set index**, and it is the second number in the
+shader's `[[vk::binding(0, 0)]]` — Slang writes the attribute as
+`[[vk::binding(binding, set)]]`, binding first.
 
 ## One buffer per frame in flight
 
@@ -247,19 +252,23 @@ coherent, `vmaFlushAllocation` goes after the `memcpy`.
 
 Now the part that catches everyone, once, and costs an afternoon.
 
-GLSL lays out uniform blocks using **std140** rules, and they are not C++'s rules:
+A uniform buffer is laid out by **std140** rules, and they are not C++'s rules:
 
 | Type | Alignment |
 |---|---|
 | `float`, `int`, `bool` | 4 |
-| `vec2` | 8 |
-| `vec3` | **16** |
-| `vec4` | 16 |
-| `mat4` | 16 |
+| `float2` | 8 |
+| `float3` | **16** |
+| `float4` | 16 |
+| `float4x4` | 16 |
 | struct or array | 16, rounded up |
 
-The two that bite are `vec3` aligning to 16 rather than 12, and the whole block's size
+The two that bite are `float3` aligning to 16 rather than 12, and the whole block's size
 rounding up to a multiple of 16.
+
+Slang applies these rules to every `ConstantBuffer<T>`, and the SPIR-V says so out loud —
+the generated type is literally named `Globals_std140`. It will not warn you when the
+C++ struct disagrees with it.
 
 `glm::vec3` in C++ is 12 bytes. Put one in the middle of a uniform struct and everything
 after it lands at the wrong offset — and *nothing reports an error*. The shader reads
@@ -279,12 +288,12 @@ static_assert(sizeof(Globals) == 32);
 
 Three habits make this a non-issue:
 
-1. **Use `vec4`, not `vec3`**, in uniform blocks. The fourth component is free — the
+1. **Use `float4`, not `float3`**, in uniform blocks. The fourth component is free — the
    space is there either way — and you can put something useful in it.
 2. **`static_assert` the size** of every uniform struct. It turns a silent corruption
    into a compile error.
-3. **Order members largest first**: `mat4`, then `vec4`, then `vec2`, then scalars. The
-   padding mostly takes care of itself.
+3. **Order members largest first**: `float4x4`, then `float4`, then `float2`, then
+   scalars. The padding mostly takes care of itself.
 
 You can also annotate the C++ side with `alignas(16)`, and glm offers
 `GLM_FORCE_DEFAULT_ALIGNED_GENTYPES` to make its types match std140. Both help. Neither
@@ -294,7 +303,7 @@ removes the need to check.
 `spirv-dis` prints the real offsets the compiler chose, and it settles any argument:
 
 ```bash
-spirv-dis code/out/build/linux-debug/shaders/1.10.descriptors/quad.vert.spv \
+spirv-dis code/out/build/linux-debug/bin/shaders/1.10.descriptors/quad.slang.spv \
   | grep Offset
 ```
 :::
@@ -322,18 +331,18 @@ like.
 
 ## Exercises
 
-1. Swap the two members round — `float time` first, `glm::vec4 ambient` second — in
-   `Globals`, in `quad.vert` and in `quad.frag`, and drop the padding. Every declaration
-   still agrees with every other one, so this *looks* correct.
+1. Swap the two members round — `float time` first, `glm::vec4 ambient` second — in the
+   C++ `Globals` and in the shader's `Globals`, and drop the padding. There are only two
+   declarations to change now, and they agree with each other, so this *looks* correct.
 
    It is not, and the quads come out bright orange and magenta. C++ puts `ambient` at
-   offset 4; std140 puts it at 16, because a `vec4` aligns to 16. The shader reads twelve
+   offset 4; std140 puts it at 16, because a `float4` aligns to 16. The shader reads twelve
    bytes of `ambient` as the tail of nothing in particular.
 
    Nothing in the validation layers says a word. Convince yourself of that before moving
    on — it is the single best reason to `static_assert` your uniform structs.
-2. Now put `ambient` back first but change it to `vec3` on both sides, with no padding.
-   Work out, before running it, what the shader reads for `time`.
+2. Now put `ambient` back first but change it to `float3`/`glm::vec3` on both sides, with
+   no padding. Work out, before running it, what the shader reads for `time`.
 3. Use one uniform buffer instead of two, by forcing `slot` to `0`. It will very likely
    look perfectly fine — the bug needs the GPU to actually be a frame behind. Try it with
    `--frames 2000` and a window dragged around to make the GPU work.

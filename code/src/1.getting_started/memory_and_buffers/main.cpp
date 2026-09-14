@@ -364,7 +364,7 @@ private:
 
         // Where each shader input lives inside one Vertex.
         //
-        // `location` matches `layout(location = N) in` in the vertex shader; `format`
+        // `location` matches `[[vk::location(N)]]` in the shader's VSInput; `format`
         // describes the data as if it were an image format, which reads oddly at first
         // but is exactly the same vocabulary: R32G32_SFLOAT is two 32-bit floats.
         // `offset` is where the field starts, and offsetof is the right way to get it
@@ -399,20 +399,19 @@ private:
         // vkc::PipelineBuilder is chapter 1.7's pipeline creation, unchanged, with the
         // parts a chapter needs to vary turned into methods. Read it at
         // code/common/scaffold/src/pipeline.cpp.
-        const VkShaderModule vertex_shader =
-            vkc::load_shader(device, LVK_CHAPTER_ID, "quad.vert");
-        const VkShaderModule fragment_shader =
-            vkc::load_shader(device, LVK_CHAPTER_ID, "quad.frag");
+        // One module, both stages: quad.slang compiles to a single SPIR-V
+        // binary with a vertexMain and a fragmentMain entry point in it.
+        const VkShaderModule shader =
+            vkc::load_shader(device, LVK_CHAPTER_ID, "quad.slang");
 
         pipeline_ = vkc::PipelineBuilder(device)
-                        .shaders(vertex_shader, fragment_shader)
+                        .shaders(shader)
                         .vertex_input(std::span(&binding, 1), attributes)
                         .colour_attachment(swapchain().format())
                         .layout(pipeline_layout_)
                         .build();
 
-        vkDestroyShaderModule(device, fragment_shader, nullptr);
-        vkDestroyShaderModule(device, vertex_shader, nullptr);
+        vkDestroyShaderModule(device, shader, nullptr);
     }
 
     Buffer vertex_buffer_{};

@@ -2,5 +2,5 @@
 # there is no NO_SCAFFOLD here.
 add_chapter(1.8.memory_and_buffers
     SOURCES main.cpp
-    SHADERS quad.vert quad.frag
+    SHADERS quad.slang
 )

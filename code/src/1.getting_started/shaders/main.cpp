@@ -4,9 +4,10 @@
 // needs are the ones 1.8 wrote, now living in vkcommon as vkc::Buffer and
 // vkc::upload_to_device_local, so main.cpp is half the length it was.
 //
-// The subject this time is GLSL itself and the one piece of Vulkan that goes with it:
-// specialisation constants, which let the same SPIR-V module be compiled into different
-// pipelines with different constant values baked in.
+// The subject this time is the shading language itself -- Slang, and the SPIR-V it
+// compiles to -- plus the one piece of Vulkan that goes with it: specialisation
+// constants, which let the same SPIR-V module be compiled into different pipelines
+// with different constant values baked in.
 
 #include <vkc/app.hpp>
 #include <vkc/buffer.hpp>
@@ -44,9 +45,9 @@ constexpr std::array<uint16_t, 6> kIndices{0, 1, 2, 2, 3, 0};
 // This is a plain struct whose layout we control, because VkSpecializationInfo takes a
 // flat block of bytes plus a table saying which constant id lives at which offset.
 struct ShaderConstants {
-    // Matches `layout(constant_id = 0) const int kShadingMode` in quad.frag.
+    // Matches `[[vk::constant_id(0)]] const int kShadingMode` in quad.slang.
     int32_t shading_mode = 0;  // 0 = smooth, 1 = flat
-    // Matches `layout(constant_id = 1) const float kCheckerSize`.
+    // Matches `[[vk::constant_id(1)]] const float kCheckerSize`.
     float checker_size = 48.0F;
 };
 
@@ -182,10 +183,10 @@ private:
 
         const ShaderConstants constants{};
 
-        const VkShaderModule vertex_shader =
-            vkc::load_shader(device, LVK_CHAPTER_ID, "quad.vert");
-        const VkShaderModule fragment_shader =
-            vkc::load_shader(device, LVK_CHAPTER_ID, "quad.frag");
+        // One module, both stages: quad.slang compiles to a single SPIR-V
+        // binary with a vertexMain and a fragmentMain entry point in it.
+        const VkShaderModule shader =
+            vkc::load_shader(device, LVK_CHAPTER_ID, "quad.slang");
 
         const VkPipelineLayoutCreateInfo layout_info{
             .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
@@ -201,7 +202,7 @@ private:
 
         pipeline_ =
             vkc::PipelineBuilder(device)
-                .shaders(vertex_shader, fragment_shader)
+                .shaders(shader)
                 .vertex_input(std::span(&binding, 1), attributes)
                 .fragment_specialisation(
                     entries, std::span(reinterpret_cast<const std::byte*>(&constants),
@@ -210,8 +211,7 @@ private:
                 .layout(pipeline_layout_)
                 .build();
 
-        vkDestroyShaderModule(device, fragment_shader, nullptr);
-        vkDestroyShaderModule(device, vertex_shader, nullptr);
+        vkDestroyShaderModule(device, shader, nullptr);
 
         spdlog::info("Pipeline built with shading_mode={} checker_size={}",
                      constants.shading_mode, constants.checker_size);

@@ -35,6 +35,13 @@ even if it renders correctly. The samples are what readers copy.
 buffer device address. No `VkRenderPass`, no `VkFramebuffer`, no subpasses anywhere
 except the appendix that explains why older code has them.
 
+**Shaders are Slang.** One `.slang` file per pipeline, holding every stage, compiled by
+`slangc` to one SPIR-V module. Entry points are `vertexMain` / `fragmentMain` /
+`computeMain`, and the build passes `-fvk-use-entrypoint-name` so those names survive to
+`pName`. Use `mul(M, v)` and never `*` for a transform; use `SV_VulkanVertexID` and never
+`SV_VertexID`. GLSL appears only in the *Slang for GLSL programmers* appendix and where an
+article contrasts the two.
+
 ## Commands
 
 ```bash
@@ -49,6 +56,9 @@ cmake --build code/out/build/x64-debug
 
 # Run a sample
 ./code/out/build/linux-debug/bin/<chapter-id>
+
+# If slangc is not on PATH or in the Vulkan SDK
+cd code && cmake --preset linux-debug -DLVK_SLANGC=/path/to/slangc
 
 # Scaffold a chapter
 python3 tools/new_chapter.py <part>.<n>.<slug> --title "..." --part <part-slug>
@@ -65,8 +75,9 @@ cd site && npm run dev
 
 ## Conventions
 
-- **Chapter ids** are `<part>.<n>.<slug>`, e.g. `1.8.hello_triangle`. The binary is
-  named after the id; the CMake target is `ch_1_8_hello_triangle`.
+- **Chapter ids** are `<part>.<n>.<slug>`, e.g. `1.7.hello_triangle`. The binary is
+  named after the id; the CMake target is `ch_1_7_hello_triangle`. A chapter's shaders
+  compile to `bin/shaders/<chapter-id>/<name>.slang.spv`.
 - **Docs directories** carry no numeric prefix (`getting-started`, not
   `1.getting-started`) because Starlight strips dots from URLs. Ordering comes from
   the explicit sidebar in `site/astro.config.mjs` plus `sidebar.order` in frontmatter.

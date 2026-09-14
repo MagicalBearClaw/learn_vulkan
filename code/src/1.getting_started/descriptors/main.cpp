@@ -50,10 +50,13 @@ constexpr std::array<uint16_t, 6> kIndices{0, 1, 2, 2, 3, 0};
 
 // Data shared by every draw in the frame, in a uniform buffer.
 //
-// The padding is not decoration. GLSL's std140 layout rules round a struct's size up to
-// a multiple of 16 bytes and align a vec4 to 16, so this struct has to be laid out the
-// way the shader expects it or the values arrive shifted. See the article: this is one
-// of the most common and most baffling bugs in early Vulkan code.
+// The padding is not decoration. A uniform buffer is laid out by the std140 rules,
+// which round a struct's size up to a multiple of 16 bytes and align a four-component
+// vector to 16, so this struct has to match what the shader expects or the values
+// arrive shifted. Slang lays its ConstantBuffer<Globals> out by exactly those rules --
+// the SPIR-V even names the type Globals_std140 -- and it will not warn you when the
+// C++ struct disagrees. See the article: this is one of the most common and most
+// baffling bugs in early Vulkan code.
 struct Globals {
     glm::vec4 ambient;  // offset 0, 16 bytes
     float time;         // offset 16
@@ -356,20 +359,19 @@ private:
         VK_CHECK(vkCreatePipelineLayout(device, &layout_info, nullptr,
                                         &pipeline_layout_));
 
-        const VkShaderModule vertex_shader =
-            vkc::load_shader(device, LVK_CHAPTER_ID, "quad.vert");
-        const VkShaderModule fragment_shader =
-            vkc::load_shader(device, LVK_CHAPTER_ID, "quad.frag");
+        // One module, both stages: quad.slang compiles to a single SPIR-V
+        // binary with a vertexMain and a fragmentMain entry point in it.
+        const VkShaderModule shader =
+            vkc::load_shader(device, LVK_CHAPTER_ID, "quad.slang");
 
         pipeline_ = vkc::PipelineBuilder(device)
-                        .shaders(vertex_shader, fragment_shader)
+                        .shaders(shader)
                         .vertex_input(std::span(&binding, 1), attributes)
                         .colour_attachment(swapchain().format())
                         .layout(pipeline_layout_)
                         .build();
 
-        vkDestroyShaderModule(device, fragment_shader, nullptr);
-        vkDestroyShaderModule(device, vertex_shader, nullptr);
+        vkDestroyShaderModule(device, shader, nullptr);
 
         spdlog::info("maxPushConstantsSize on this GPU: {} bytes",
                      context().gpu_properties().limits.maxPushConstantsSize);

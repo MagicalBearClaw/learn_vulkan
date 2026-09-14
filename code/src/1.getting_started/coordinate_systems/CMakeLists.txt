@@ -1,4 +1,4 @@
 add_chapter(1.13.coordinate_systems
     SOURCES main.cpp
-    SHADERS cube.vert cube.frag
+    SHADERS cube.slang
 )

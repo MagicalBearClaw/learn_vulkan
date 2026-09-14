@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Scaffold a new chapter: the article page, the code directory, and the build entry.
 
-    python3 tools/new_chapter.py 1.8.hello_triangle --title "Hello Triangle" --part 1.getting-started --shaders triangle.vert triangle.frag
+    python3 tools/new_chapter.py 1.7.hello_triangle --title "Hello Triangle" --part 1.getting-started --shaders triangle.slang
 
 Creates:
     site/src/content/docs/<part>/<slug>.mdx
@@ -90,6 +90,32 @@ int main(int argc, char** argv) {{
 }}
 '''
 
+SLANG_TEMPLATE = """// Shaders for {chapter_id}.
+//
+// One file, every stage. Entry points are marked with [shader("...")] and this project
+// names them vertexMain and fragmentMain, which is what main.cpp passes as pName.
+
+struct VSInput {{
+    [[vk::location(0)]] float3 position;
+}};
+
+struct VSOutput {{
+    float4 position : SV_Position;
+}};
+
+[shader("vertex")]
+VSOutput vertexMain(VSInput input) {{
+    VSOutput output;
+    output.position = float4(input.position, 1.0);
+    return output;
+}}
+
+[shader("fragment")]
+float4 fragmentMain(VSOutput input) : SV_Target {{
+    return float4(1.0, 0.0, 1.0, 1.0);
+}}
+"""
+
 CMAKE_TEMPLATE = """add_chapter({chapter_id}
     SOURCES main.cpp{shader_block}
 )
@@ -137,7 +163,8 @@ def main() -> int:
     parser.add_argument("chapter_id", help="e.g. 1.8.hello_triangle")
     parser.add_argument("--title", required=True, help='e.g. "Hello Triangle"')
     parser.add_argument("--part", required=True, help="docs part directory, e.g. 1.getting-started")
-    parser.add_argument("--shaders", nargs="*", default=[], help="shader files to create and compile")
+    parser.add_argument("--shaders", nargs="*", default=[],
+                        help="Slang shader files to create and compile, e.g. lit.slang")
     args = parser.parse_args()
 
     match = re.fullmatch(r"(\d+)\.(\d+)\.([a-z0-9_]+)", args.chapter_id)
@@ -164,8 +191,7 @@ def main() -> int:
     if args.shaders:
         shader_block = "\n    SHADERS " + " ".join(args.shaders)
         for shader in args.shaders:
-            stage = Path(shader).suffix.lstrip(".")
-            (code_dir / shader).write_text(f"#version 450\n\n// {stage} stage for {args.chapter_id}\n\nvoid main() {{}}\n")
+            (code_dir / shader).write_text(SLANG_TEMPLATE.format(chapter_id=args.chapter_id))
 
     (code_dir / "CMakeLists.txt").write_text(CMAKE_TEMPLATE.format(chapter_id=args.chapter_id, shader_block=shader_block))
 

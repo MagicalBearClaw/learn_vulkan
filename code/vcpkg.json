@@ -16,6 +16,7 @@
       "features": [
         "vulkan"
       ]
-    }
+    },
+    "shader-slang"
   ]
 }

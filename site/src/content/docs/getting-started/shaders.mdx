@@ -1,6 +1,6 @@
 ---
 title: Shaders
-description: GLSL for Vulkan - the SPIR-V toolchain, the interface between stages, built-ins, and specialisation constants.
+description: Slang for Vulkan - the SPIR-V toolchain, the interface between stages, system-value semantics, and specialisation constants.
 sidebar:
   order: 9
 ---
@@ -23,22 +23,24 @@ The subject this time is the shading language itself.
 
 ## The build compiles them
 
-Vulkan does not take GLSL. It takes **SPIR-V**: a binary intermediate representation,
-already parsed, with names stripped and control flow made explicit. Somebody has to do
-the translation, and the choice is whether that happens on your machine or on your
-user's.
+Vulkan does not take shader source. It takes **SPIR-V**: a binary intermediate
+representation, already parsed, with names stripped and control flow made explicit.
+Somebody has to do the translation, and the choice is whether that happens on your
+machine or on your user's.
 
 This project does it at build time, in `add_chapter`:
 
 ```cmake title="code/cmake/AddChapter.cmake"
-COMMAND "${LVK_GLSLANG_VALIDATOR}" --target-env vulkan1.3 -g
-        -o "${spv}" "${CMAKE_CURRENT_SOURCE_DIR}/${shader}"
+COMMAND "${LVK_SLANGC}" "${CMAKE_CURRENT_SOURCE_DIR}/${shader}"
+        -target spirv -profile ${LVK_SPIRV_PROFILE}
+        -emit-spirv-directly -fvk-use-entrypoint-name -g2
+        -o "${spv}"
 ```
 
 Three things fall out of that.
 
 A shader with a syntax error **fails your build**, not your user's launch. Anyone who
-has shipped a GLSL bug that only fired on one vendor's driver will recognise what that
+has shipped a shader bug that only fired on one vendor's driver will recognise what that
 is worth.
 
 There is **one compiler**, so there is one dialect. OpenGL's GLSL front end was each
@@ -49,90 +51,150 @@ SPIR-V moves that stage out of the driver.
 **Startup is faster**, because the driver receives something much closer to machine code
 than to text.
 
-The `-g` flag keeps debug information in the module, which is what lets RenderDoc show
-you the original GLSL beside the disassembly. Release builds drop it.
+The flags, briefly. `-profile spirv_1_6` picks the SPIR-V version — 1.6 is what Vulkan
+1.3 consumes. `-emit-spirv-directly` uses Slang's own SPIR-V backend rather than routing
+through generated GLSL, which older versions did. `-fvk-use-entrypoint-name` keeps the
+SPIR-V entry points named after the Slang functions, which is what lets one module carry
+both stages. `-g2` keeps debug information in the module, which is what lets RenderDoc
+show you the original Slang beside the disassembly; release builds drop it.
 
 :::tip[Look at the SPIR-V]
 `spirv-dis` prints a module in a readable assembly form, and it is the fastest way to
-answer "did the compiler really keep that branch?".
+answer "did the compiler really keep that branch?" or "which location did that end up
+at?".
 
 ```bash
-spirv-dis code/out/build/linux-debug/shaders/1.9.shaders/quad.frag.spv | head -40
+spirv-dis code/out/build/linux-debug/bin/shaders/1.9.shaders/quad.slang.spv | head -40
 ```
+
+`spirv-val --target-env vulkan1.3` on the same file tells you whether the module is
+legal before a driver ever sees it.
 :::
 
-## Stages talk through locations
+## Why Slang
 
-Vulkan's shading language is GLSL 4.50 with a few rules changed. The version directive
-is a GLSL version and never a Vulkan one:
+Vulkan does not care what language you write in — it sees SPIR-V and nothing else. GLSL
+via glslang is the traditional answer and still works. This series uses **Slang**
+instead, for reasons that show up immediately and keep paying off:
 
-```glsl title="code/src/1.getting_started/shaders/quad.vert"
-#version 450
+- **One file per pipeline.** Every stage lives in one module, and the interface between
+  them is a shared struct rather than two lists of declarations in two files.
+- **A real type system.** Generics, interfaces, modules and overload resolution, so the
+  lighting code you write once in Part 2 can be instantiated for a dozen pipelines
+  instead of copied into each of them with a `#define` on top.
+- **It is the direction the ecosystem moved.** Slang is a Khronos project and ships in
+  the Vulkan SDK; `slangc` sits beside `glslangValidator` in the same `bin` directory,
+  and the modules it produces identify their generator as "Khronos Slang Compiler".
+
+The syntax comes from HLSL. If you know GLSL you will be reading it fluently within a
+chapter: `vec3` is `float3`, `mat4` is `float4x4`, `mix` is `lerp`, `mod` is `fmod`, and
+the `layout(...)` qualifiers become `[[vk::...]]` attributes. Appendix *Slang for GLSL
+programmers* has the full table for when you are porting something.
+
+## Stages talk through a struct
+
+A Slang file declares entry points, and an attribute says which stage each one is:
+
+```slang title="code/src/1.getting_started/shaders/quad.slang"
+[shader("vertex")]
+VSOutput vertexMain(VSInput input) { ... }
+
+[shader("fragment")]
+float4 fragmentMain(VSOutput input) : SV_Target { ... }
 ```
 
-Data enters a stage through `in` and leaves through `out`, and the pairing is by
-`location` number rather than by name:
+Both compile into one SPIR-V module. `main.cpp` names them in
+`VkPipelineShaderStageCreateInfo::pName`, which is the mechanism chapter 1.7 introduced.
 
-```glsl title="code/src/1.getting_started/shaders/quad.vert"
-layout(location = 0) in vec2 in_position;
-layout(location = 1) in vec3 in_colour;
+What travels between stages is a struct, and the slots are attributes on its fields:
 
-layout(location = 0) out vec3 frag_colour;
+```slang title="code/src/1.getting_started/shaders/quad.slang"
+struct VSInput {
+    [[vk::location(0)]] float2 position;
+    [[vk::location(1)]] float3 colour;
+};
+
+struct VSOutput {
+    float4 position : SV_Position;
+    [[vk::location(0)]] float3 colour;
+    [[vk::location(1)]] nointerpolation float3 flat_colour;
+};
 ```
 
 Read those two blocks carefully, because the two numbering spaces are **completely
-independent**. The input locations pair with `VkVertexInputAttributeDescription` on the
-C++ side; the output locations pair with the fragment shader's `in` declarations. That
-`location = 0` appears twice in five lines and means two unrelated things.
+independent**. `VSInput`'s locations pair with `VkVertexInputAttributeDescription` on the
+C++ side; `VSOutput`'s pair with whatever the fragment stage declares as its input. That
+`location(0)` appears twice in eight lines and means two unrelated things.
 
-Names not mattering has one practical consequence: the vertex shader can call it
-`frag_colour` and the fragment shader can call it `tint`, and it still works, as long as
-the locations and types agree. Do not do that.
+The vertex-to-fragment half of that is where Slang differs from GLSL in a way you feel.
+`fragmentMain` takes **the same `VSOutput`**, so there is one declaration of the
+interface rather than two that must agree. Nothing stops you writing a second struct —
+and exercise 5 asks you to, precisely to see what goes wrong when the two disagree.
 
-A `vec3` output occupies one location. A `vec4` also occupies one. A `mat4` occupies
-four, and a `double`-precision type occupies two — so the numbers are not always
+A `float3` output occupies one location. A `float4` also occupies one. A `float4x4`
+occupies four, and a double-precision type occupies two — so the numbers are not always
 consecutive, and the compiler will tell you when you have overlapped them.
 
-## The built-ins you will actually use
+## System-value semantics
 
-GLSL supplies a handful of variables the hardware fills in or reads back. Four matter
-early.
+The `: SV_Something` suffixes are **system-value semantics**: they mark a field the
+hardware fills in or reads back, where GLSL would use a `gl_` global. Four matter early.
 
-**`gl_Position`** is the one output every vertex shader must write. It is a clip-space
+**`SV_Position`** is the one output every vertex shader must write. It is a clip-space
 position, and the hardware divides it by `w` to get normalised device coordinates:
 
-```glsl title="code/src/1.getting_started/shaders/quad.vert"
-gl_Position = vec4(in_position, 0.0, 1.0);
+```slang title="code/src/1.getting_started/shaders/quad.slang"
+output.position = float4(input.position, 0.0, 1.0);
 ```
 
 `w = 1.0` makes that division a no-op, which is right for flat 2D work. Once there is a
 perspective projection, `w` carries the distance to the camera and the division is
 precisely what makes far-away things small. That is chapter 1.13.
 
-**`gl_VertexIndex`** counts vertices within a draw — it is what 1.7 used to index its
-constant array, and it is still there when you need it. Its companion `gl_InstanceIndex`
-counts instances.
-
-**`gl_FragCoord`** is the fragment's position in pixels, and this chapter's shader uses
+Read as a *fragment input*, the same field means something different: the fragment's
+position in pixels. GLSL keeps these apart as `gl_Position` and `gl_FragCoord`; Slang
+gives the field one name and lets the stage decide. This chapter's fragment shader uses
 it:
 
-```glsl title="code/src/1.getting_started/shaders/quad.frag"
-vec2 cell = floor(gl_FragCoord.xy / kCheckerSize);
-float checker = mod(cell.x + cell.y, 2.0);
+```slang title="code/src/1.getting_started/shaders/quad.slang"
+float2 cell = floor(input.position.xy / kCheckerSize);
+float checker = fmod(cell.x + cell.y, 2.0);
 ```
 
 Its origin is the **top-left** of the framebuffer, consistent with Vulkan's downward y.
 OpenGL puts it at the bottom-left, and a shader ported without accounting for that comes
 out vertically mirrored.
 
-Because `gl_FragCoord` is in screen pixels, the checkerboard is nailed to the screen
-rather than to the quad. Resize the window and the quad changes size while the squares
-do not. Attaching a pattern to a *surface* needs texture coordinates, which arrive in
-1.11.
+Because it is in screen pixels, the checkerboard is nailed to the screen rather than to
+the quad. Resize the window and the quad changes size while the squares do not.
+Attaching a pattern to a *surface* needs texture coordinates, which arrive in 1.11.
 
-**`gl_FragDepth`** lets a fragment shader override the depth it writes. It is worth
-knowing about mostly so you know to avoid it: writing it disables early depth testing on
-most hardware.
+**`SV_VulkanVertexID`** counts vertices within a draw — it is what 1.7 used to index its
+constant array. Its companion is `SV_VulkanInstanceID`.
+
+:::caution[Not `SV_VertexID`]
+Slang has both, and they are not the same. `SV_VertexID` is the HLSL semantic, where the
+index is relative to the draw, so Slang compiles it to `VertexIndex - BaseVertex` and the
+module declares SPIR-V's `DrawParameters` capability. Unless you enabled
+`shaderDrawParameters` on the device, validation rejects it at `vkCreateShaderModule`:
+
+```
+SPIR-V Capability DrawParameters was declared, but one of the following requirements is
+required (VkPhysicalDeviceVulkan11Features::shaderDrawParameters OR
+VK_KHR_shader_draw_parameters [when using Vulkan 1.0]).
+```
+
+`SV_VulkanVertexID` is Vulkan's `VertexIndex` builtin directly, with nothing subtracted
+and nothing to enable. The two agree whenever `firstVertex` is 0, which is why the
+mistake can live in a codebase for a long time.
+:::
+
+**`SV_Target`** marks a fragment shader's colour attachment output; `SV_Target0` through
+`SV_TargetN` address them individually once there is more than one.
+
+**`SV_Depth`** lets a fragment shader override the depth it writes. It is worth knowing
+about mostly so you know to avoid it: writing it disables early depth testing on most
+hardware.
 
 :::caution[Vulkan's clip space differs in two ways]
 y points **down**, and z runs **0 to 1** rather than −1 to 1. Both differ from OpenGL,
@@ -149,24 +211,26 @@ A fragment shader input is not the value a vertex wrote. The hardware interpolat
 three vertex values across the triangle, weighted by the fragment's position. That is
 what produced 1.7's gradient, and it is free.
 
-It is also a choice. This chapter's vertex shader sends the same colour twice:
+It is also a choice. This chapter's vertex shader sends the same colour twice, and the
+second copy carries a qualifier:
 
-```glsl title="code/src/1.getting_started/shaders/quad.vert"
-layout(location = 0) out vec3 frag_colour;
-layout(location = 1) flat out vec3 flat_colour;
+```slang title="code/src/1.getting_started/shaders/quad.slang"
+[[vk::location(0)]] float3 colour;
+[[vk::location(1)]] nointerpolation float3 flat_colour;
 ```
 
-`flat` means no interpolation: every fragment in the triangle gets the value from one
-nominated vertex — the **provoking vertex**, which in Vulkan is the first vertex of the
-primitive. Each triangle comes out a single flat colour.
+`nointerpolation` — GLSL's `flat` — means every fragment in the triangle gets the value
+from one nominated vertex, the **provoking vertex**, which in Vulkan is the first vertex
+of the primitive. Each triangle comes out a single flat colour.
 
 There are two other qualifiers you will meet. `noperspective` interpolates in screen
 space rather than correcting for perspective, which is occasionally what you want for
-screen-space effects. `centroid` samples at the covered part of a pixel rather than its
-centre, which matters only with multisampling, at the edges of triangles.
+screen-space effects. `sample` forces the shader to run per sample rather than per pixel
+under multisampling; `centroid` keeps it per pixel but moves the sample point inside the
+covered area, which matters at the edges of triangles.
 
-Integers are *always* `flat`, whether you say so or not — there is no meaningful way to
-interpolate between two integers, and the compiler will reject a non-flat `int` input.
+Integers are *always* `nointerpolation`, whether you say so or not — there is no
+meaningful way to interpolate between two integers.
 
 ## Specialisation constants
 
@@ -174,13 +238,13 @@ Here is the one genuinely Vulkan-shaped idea in the chapter.
 
 A shader often has a value that never changes at run time but that you would like to
 choose from C++: a quality level, a light count, a feature toggle. In OpenGL you would
-either recompile the GLSL with a `#define` or pay for a uniform read and a branch.
+either recompile the shader with a `#define` or pay for a uniform read and a branch.
 
 Vulkan gives you a third option. Declare a constant with an id:
 
-```glsl title="code/src/1.getting_started/shaders/quad.frag"
-layout(constant_id = 0) const int kShadingMode = 0;    // 0 = smooth, 1 = flat
-layout(constant_id = 1) const float kCheckerSize = 48.0;
+```slang title="code/src/1.getting_started/shaders/quad.slang"
+[[vk::constant_id(0)]] const int kShadingMode = 0;      // 0 = smooth, 1 = flat
+[[vk::constant_id(1)]] const float kCheckerSize = 48.0;
 ```
 
 Those look like ordinary constants with defaults, and if the host says nothing that is
@@ -210,7 +274,7 @@ const std::array<VkSpecializationMapEntry, 2> entries{{
 ```
 
 Each entry says: constant id N is this many bytes at this offset. The ids match
-`constant_id` in the shader; the offsets match the struct. The whole thing goes into
+`vk::constant_id` in the shader; the offsets match the struct. The whole thing goes into
 `VkPipelineShaderStageCreateInfo::pSpecializationInfo`, which is the field 1.7 left as
 `nullptr`.
 
@@ -234,12 +298,12 @@ through to the shader stage.
 
 A few habits worth forming now, all of which pay off in the lighting chapters.
 
-Prefer the built-in functions. `mix`, `clamp`, `smoothstep`, `dot`, `normalize`,
+Prefer the built-in functions. `lerp`, `clamp`, `smoothstep`, `dot`, `normalize`,
 `length` and `reflect` usually map to single instructions, and hand-written equivalents
 usually do not.
 
-Write `vec3(0.0)` rather than `vec3(0, 0, 0)`. Vulkan's GLSL is stricter about implicit
-conversions than desktop OpenGL's ever was, and `float x = 1;` is an error.
+Write `float3(0.0)` rather than `float3(0, 0, 0)` — the splat constructor is there and
+it reads better.
 
 Watch out for `if` on a value that differs between neighbouring pixels. Fragment shaders
 run in groups — 2×2 quads at minimum, typically 32 or 64 invocations in lockstep — and
@@ -258,8 +322,8 @@ The quad from 1.8, with a screen-fixed checkerboard darkening alternate squares.
 ## What changed
 
 - `main.cpp` lost the buffer and upload code to `vkcommon`
-- the vertex shader gained a second, `flat` output
-- the fragment shader gained two specialisation constants and some real work
+- `VSOutput` gained a second, `nointerpolation` field
+- the fragment entry point gained two specialisation constants and some real work
 - the pipeline now supplies specialisation data
 
 ## Exercises
@@ -269,22 +333,28 @@ The quad from 1.8, with a screen-fixed checkerboard darkening alternate squares.
    first index of each triangle in `kIndices`.
 2. Change `checker_size` to `12.0` and to `400.0`. Note that you changed a value the
    shader treats as a compile-time constant and did not touch the shader.
-3. Make the checkerboard follow the quad instead of the screen: interpolate a `vec2`
+3. Make the checkerboard follow the quad instead of the screen: interpolate a `float2`
    from the vertex positions — mapping −0.6…0.6 to 0…1 — and use that instead of
-   `gl_FragCoord`. Resize the window and watch the difference. You have just invented
-   texture coordinates.
-4. Run `spirv-dis` on `quad.frag.spv` and find `OpSpecConstant`. Those are the two
+   `input.position.xy`. Resize the window and watch the difference. You have just
+   invented texture coordinates.
+4. Run `spirv-dis` on `quad.slang.spv` and find `OpSpecConstant`. Those are the two
    constants sitting in the module with their default values, waiting to be overridden.
-5. Delete `flat_colour` from the vertex shader entirely, leaving the fragment shader
-   reading it. The validation layers say so precisely:
+   While you are there, find the two `OpEntryPoint` lines and the `Flat` decoration.
+5. Break the stage interface on purpose, which takes a little work now that both stages
+   share `VSOutput`. Copy it to a second struct, `PSInput`, and make `fragmentMain` take
+   that instead. Now delete `flat_colour` from `VSOutput` (and the line that writes it),
+   leaving `PSInput` reading it. The validation layers say so precisely:
 
    ```
-   vkCreateGraphicsPipelines(): (SPIR-V Interface) [VK_SHADER_STAGE_FRAGMENT_BIT] has a
-   declared Input at Location 1 Component 0 but the previous stage
-   ([VK_SHADER_STAGE_VERTEX_BIT]) has no Output declared at that location
+   vkCreateGraphicsPipelines(): pCreateInfos[0] (SPIR-V Interface)
+   [EntryPoint "fragmentMain", VK_SHADER_STAGE_FRAGMENT_BIT] has a declared Input at
+   Location 1 Component 0 but the previous stage
+   ([EntryPoint "vertexMain", VK_SHADER_STAGE_VERTEX_BIT]) has no Output declared there.
    ```
 
-   Now put it back but remove only the `flat` qualifier from the vertex shader's copy,
-   leaving the fragment shader's `flat in`. **Nothing complains**, and it renders. The
-   layers check that locations and types line up; interpolation qualifiers are outside
-   what they verify. This is the class of mistake the caution above is about.
+   Now put the field back in `VSOutput` but **without** `nointerpolation`, leaving
+   `PSInput`'s copy with it. **Nothing complains**, and it renders. The layers check that
+   locations and types line up; interpolation qualifiers are outside what they verify.
+
+   Then delete `PSInput` and go back to sharing one struct, which is the reason to share
+   it: the mismatch you just spent five minutes constructing is not expressible.

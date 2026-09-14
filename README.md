@@ -30,11 +30,22 @@ Dependencies come from the distribution. On Arch and derivatives:
 
 ```bash
 sudo pacman -S cmake ninja clang vulkan-headers vulkan-validation-layers \
-               volk sdl3 glm spdlog glslang
+               volk sdl3 glm spdlog spirv-tools
 ```
 
 VMA and stb are header-only and are fetched automatically by CMake if they are not
 already installed.
+
+Shaders are written in **Slang**, so the build needs `slangc`. It ships with the Vulkan
+SDK (1.3.296 and newer), is packaged as `shader-slang` on some distributions, and is
+available as a standalone release from
+[github.com/shader-slang/slang/releases](https://github.com/shader-slang/slang/releases).
+CMake looks in `$VULKAN_SDK/bin`, `$SLANG_ROOT/bin`, the vcpkg tree and `PATH`; failing
+all of those, point it at the binary:
+
+```bash
+cd code && cmake --preset linux-debug -DLVK_SLANGC=/path/to/slangc
+```
 
 ```bash
 cd code
@@ -85,7 +96,7 @@ npm run build    # production build into site/dist
 # scaffold the article, the code directory and the build entry
 python3 tools/new_chapter.py 2.1.colours \
     --title "Colours" --part lighting \
-    --shaders lit.vert lit.frag
+    --shaders lit.slang
 
 (cd code && cmake --preset linux-debug)   # pick up the new target
 cmake --build code/out/build/linux-debug

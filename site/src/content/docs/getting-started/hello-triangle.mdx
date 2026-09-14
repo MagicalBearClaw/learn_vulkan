@@ -15,57 +15,99 @@ Everything so far has been preparation. This chapter adds shaders, a pipeline, a
 
 ## Shaders are compiled ahead of time
 
-Vulkan does not accept GLSL. It accepts **SPIR-V**, a binary intermediate
+Vulkan does not accept shader source. It accepts **SPIR-V**, a binary intermediate
 representation, and you compile your shaders into it as part of your build.
 
-This is a real improvement over runtime GLSL compilation. Syntax errors surface at
-build time rather than on a user's machine; there is no per-driver GLSL dialect to
-trip over; and startup is faster because the driver receives something much closer to
-machine code.
+This is a real improvement over the OpenGL model, where you handed the driver a string
+of GLSL at runtime and hoped. Syntax errors surface at build time rather than on a
+user's machine; there is no per-driver dialect to trip over; and startup is faster
+because the driver receives something much closer to machine code.
 
-Our build does it automatically:
+Several languages compile to SPIR-V. This series uses **Slang** — an open-source
+shading language stewarded by Khronos, shipped in the Vulkan SDK, with a syntax
+descended from HLSL. Two of its properties matter immediately:
+
+- **One file holds every stage of a pipeline**, and compiles to one SPIR-V module with
+  one entry point per stage. The vertex-to-fragment interface is a struct that both
+  stages share rather than two lists of declarations you keep in step by hand.
+- **It is an ordinary modern language**, with generics, modules, interfaces and real
+  type checking, which starts to matter around the lighting chapters where the same
+  shading code gets reused across a dozen pipelines.
+
+If you know GLSL, nothing here will be unfamiliar for long: the types are spelled
+`float3` instead of `vec3`, `mix` is `lerp`, and the layout qualifiers become
+attributes. Appendix *Slang for GLSL programmers* is the full table.
+
+Our build compiles it automatically:
 
 ```cmake title="code/src/1.getting_started/hello_triangle/CMakeLists.txt"
 add_chapter(1.7.hello_triangle
     SOURCES main.cpp
-    SHADERS triangle.vert triangle.frag
+    SHADERS triangle.slang
     NO_SCAFFOLD
 )
 ```
 
-Each shader is compiled by `glslangValidator` into a `.spv` file next to the binary.
+One shader file, not two. `slangc` turns it into a single `triangle.slang.spv` next to
+the binary.
 
 ## The vertex shader
 
-```glsl title="code/src/1.getting_started/hello_triangle/triangle.vert"
-#version 450
+```slang title="code/src/1.getting_started/hello_triangle/triangle.slang"
+struct VSOutput {
+    float4 position : SV_Position;
+    [[vk::location(0)]] float3 colour;
+};
 
-layout(location = 0) out vec3 frag_colour;
+static const float2 kPositions[3] = {
+    float2( 0.0, -0.5),   // top
+    float2( 0.5,  0.5),   // bottom right
+    float2(-0.5,  0.5),   // bottom left
+};
 
-const vec2 positions[3] = vec2[](
-    vec2( 0.0, -0.5),   // top
-    vec2( 0.5,  0.5),   // bottom right
-    vec2(-0.5,  0.5)    // bottom left
-);
+static const float3 kColours[3] = {
+    float3(1.0, 0.0, 0.0),
+    float3(0.0, 1.0, 0.0),
+    float3(0.0, 0.0, 1.0),
+};
 
-const vec3 colours[3] = vec3[](
-    vec3(1.0, 0.0, 0.0),
-    vec3(0.0, 1.0, 0.0),
-    vec3(0.0, 0.0, 1.0)
-);
-
-void main() {
-    gl_Position = vec4(positions[gl_VertexIndex], 0.0, 1.0);
-    frag_colour = colours[gl_VertexIndex];
+[shader("vertex")]
+VSOutput vertexMain(uint vertex_index: SV_VulkanVertexID) {
+    VSOutput output;
+    output.position = float4(kPositions[vertex_index], 0.0, 1.0);
+    output.colour = kColours[vertex_index];
+    return output;
 }
 ```
+
+`[shader("vertex")]` is what makes a function an entry point and says which stage it
+belongs to. The name `vertexMain` is this project's convention, not a rule — Vulkan
+takes the entry point by name, and we will pass that name in shortly.
+
+`SV_Position` is a **system-value semantic**: it marks the one output every vertex
+shader must write, the clip-space position. GLSL spells this `gl_Position` and makes it
+a global; Slang makes it a field of the output struct, which is why the struct is the
+return type. Everything else is an ordinary varying, and `[[vk::location(n)]]` is the
+slot it travels in.
 
 The vertices are in the shader. There is no vertex buffer in this chapter, deliberately:
 buffers, GPU memory and staging uploads are chapter 1.8's subject, and meeting them
 here would mean learning two large things at once.
 
-`gl_VertexIndex` counts 0, 1, 2 across the three vertices we asked for, so it can index
-a constant array directly.
+`SV_VulkanVertexID` counts 0, 1, 2 across the three vertices we asked for, so it can
+index a constant array directly.
+
+:::caution[`SV_VertexID` is not the same thing]
+Slang inherits `SV_VertexID` from HLSL, where the index is relative to the draw. It
+compiles to `VertexIndex - BaseVertex`, which pulls in SPIR-V's `DrawParameters`
+capability — so the validation layers will reject the module unless you enabled
+`shaderDrawParameters` on the device.
+
+`SV_VulkanVertexID` is Vulkan's `VertexIndex` builtin with nothing subtracted and
+nothing to enable. The two agree whenever `firstVertex` is 0, which is why the mistake
+can survive a long time before it bites. `SV_InstanceID` and `SV_VulkanInstanceID` are
+the same story.
+:::
 
 :::caution[Vulkan's y axis points down]
 In clip space, x and y run -1 to 1 with **y pointing down** the screen, and z runs
@@ -81,28 +123,31 @@ The y flip is handled where it arises, and flagged each time.
 
 ## The fragment shader
 
-```glsl title="code/src/1.getting_started/hello_triangle/triangle.frag"
-#version 450
-
-layout(location = 0) in vec3 frag_colour;
-layout(location = 0) out vec4 out_colour;
-
-void main() {
-    out_colour = vec4(frag_colour, 1.0);
+```slang title="code/src/1.getting_started/hello_triangle/triangle.slang"
+[shader("fragment")]
+float4 fragmentMain(VSOutput input) : SV_Target {
+    return float4(input.colour, 1.0);
 }
 ```
 
-One invocation per pixel the triangle covers.
+Same file, a few lines further down. One invocation per pixel the triangle covers.
 
-`frag_colour` is not the value any single vertex wrote. The hardware **interpolates**
+It takes the **same `VSOutput` struct** the vertex shader returned. That is the part
+worth pausing on: the interface between the two stages is one declaration, so the two
+ends cannot drift apart. In GLSL this is a list of `out` declarations in one file and a
+matching list of `in` declarations in another, and keeping the `location` numbers and
+types in step is your problem. Chapter 1.9 looks at what the validation layers do and
+do not catch when they disagree.
+
+`SV_Target` is the semantic for a colour attachment output — `SV_Target0` through
+`SV_TargetN` once there is more than one attachment to address.
+
+`input.colour` is not the value any single vertex wrote. The hardware **interpolates**
 the three vertex outputs across the triangle, weighted by how close the pixel is to
 each corner, which is why the result is a smooth gradient rather than three flat
 regions. That interpolation is free, it is done by fixed-function hardware, and it is
 the basis of nearly everything in the lighting chapters — normals, texture coordinates
 and world positions all reach the fragment shader the same way.
-
-The `location` numbers are what connect the two stages. Vertex output 0 becomes
-fragment input 0; the names are irrelevant.
 
 ## Shader modules
 
@@ -120,6 +165,35 @@ the rest of the state the shader will run under.
 Note `codeSize` is in **bytes** while `pCode` is a `const uint32_t*`. SPIR-V is a stream
 of 32-bit words and must be 4-byte aligned, which is why `read_spirv` returns a
 `std::vector<uint32_t>` — a `vector<char>` gives no such guarantee.
+
+There is **one** module here, not two, because `triangle.slang` compiled to one binary.
+Both pipeline stages point at it and pick their entry point by name:
+
+```cpp title="code/src/1.getting_started/hello_triangle/main.cpp"
+const VkShaderModule shader = load_shader("triangle.slang");
+
+const VkPipelineShaderStageCreateInfo stages[2]{
+    {
+        .stage = VK_SHADER_STAGE_VERTEX_BIT,
+        .module = shader,
+        .pName = "vertexMain",
+    },
+    {
+        .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+        .module = shader,
+        .pName = "fragmentMain",
+    },
+};
+```
+
+A SPIR-V module can hold as many entry points as you like — that has always been true
+of the format, and `pName` has always been how you select one. It is just that glslang
+never emitted more than one, and always called it `main`, so the field looked like
+boilerplate. With Slang it does real work.
+
+The build passes `-fvk-use-entrypoint-name` to keep the SPIR-V entry points named after
+the Slang functions. Without it, a module with a single entry point gets renamed to
+`main`, and the names stop matching what `pName` asks for.
 
 ## The pipeline
 
@@ -227,7 +301,7 @@ nothing is drawn, and validation's complaint about render pass compatibility is 
 obvious the first time you read it.
 :::
 
-Once the pipeline exists, the shader modules have been consumed and can be destroyed
+Once the pipeline exists, the shader module has been consumed and can be destroyed
 immediately.
 
 ## The draw
@@ -293,3 +367,7 @@ it taught, and you can read any of it at `code/common/scaffold/`.
 5. Set `polygonMode` to `VK_POLYGON_MODE_LINE` for a wireframe. Note this needs the
    `fillModeNonSolid` feature enabled at device creation — validation will tell you so
    if you forget, which is a good demonstration of why features are opt-in.
+6. Rename `fragmentMain` in the shader to something else, rebuild, and read the error.
+   Then fix it by changing `pName` rather than the shader. Two different places to say
+   the same name is the cost of one module holding both stages, and it is worth feeling
+   once.
