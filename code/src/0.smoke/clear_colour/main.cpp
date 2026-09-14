@@ -70,7 +70,7 @@ protected:
         };
 
         vkCmdBeginRendering(frame.cmd, &rendering);
-        // Nothing is drawn yet. The triangle arrives in chapter 1.8.
+        // Nothing is drawn yet. The triangle arrives in chapter 1.7.
         vkCmdEndRendering(frame.cmd);
     }
 };

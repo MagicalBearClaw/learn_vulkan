@@ -6,6 +6,10 @@ build/
 # Downloaded assets (see bootstrap.json / tools/bootstrap.py)
 assets/*
 !assets/.gitkeep
+# ...except the textures this project draws itself, which are committed so that a
+# fresh clone can run the texture chapters without fetching anything.
+# Regenerate with tools/make_textures.py.
+!assets/textures/
 
 # Site
 site/node_modules/

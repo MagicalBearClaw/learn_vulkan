@@ -116,6 +116,10 @@ int App::run() {
 bool App::poll_events() {
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
+        // Samples see every event first. Nothing here can suppress the window
+        // management below, which a chapter should never have to think about.
+        on_event(event);
+
         switch (event.type) {
             case SDL_EVENT_QUIT:
                 return false;

@@ -6,6 +6,8 @@
 #include "vkc/swapchain.hpp"
 #include "vkc/window.hpp"
 
+#include <SDL3/SDL_events.h>
+
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -52,6 +54,10 @@ protected:
     virtual void on_shutdown() {}
     // Called after the swapchain has been rebuilt at a new size.
     virtual void on_resize(VkExtent2D /*extent*/) {}
+
+    // Called for every SDL event, before App itself looks at it. Quit, Escape and
+    // resize are still handled by App regardless of what a sample does here.
+    virtual void on_event(const SDL_Event& /*event*/) {}
 
     [[nodiscard]] Context& context() noexcept { return *context_; }
     [[nodiscard]] Swapchain& swapchain() noexcept { return *swapchain_; }

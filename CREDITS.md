@@ -17,6 +17,19 @@ Where a figure from LearnOpenGL is used, it is reproduced under
 [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) with attribution to Joey de
 Vries in the caption, as that licence requires.
 
+## Assets
+
+`assets/textures/lvk_grid.png` is this project's own work, drawn by
+`tools/make_textures.py` and committed so that a fresh clone can run the texture
+chapters without fetching anything. Regenerate it with:
+
+```bash
+python3 tools/make_textures.py
+```
+
+Everything else under `assets/` is downloaded by `tools/bootstrap.py` from the sources
+listed in `bootstrap.json`, and each entry there records its licence.
+
 ## Libraries
 
 | Library | Used for | Licence |

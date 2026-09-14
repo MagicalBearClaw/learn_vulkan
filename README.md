@@ -61,9 +61,13 @@ cmake --build out/build/x64-debug
 
 ### Assets
 
+Part 1 needs nothing downloaded: the test texture the chapters from 1.11 onward use is
+drawn by this project and committed under `assets/textures/`.
+
 ```bash
 python3 tools/bootstrap.py          # fetch what the later chapters need
 python3 tools/bootstrap.py --list   # see what that is
+python3 tools/make_textures.py      # redraw the committed test textures
 ```
 
 ## Building the site
@@ -79,15 +83,15 @@ npm run build    # production build into site/dist
 
 ```bash
 # scaffold the article, the code directory and the build entry
-python3 tools/new_chapter.py 1.8.hello_triangle \
-    --title "Hello Triangle" --part getting-started \
-    --shaders triangle.vert triangle.frag
+python3 tools/new_chapter.py 2.1.colours \
+    --title "Colours" --part lighting \
+    --shaders lit.vert lit.frag
 
 (cd code && cmake --preset linux-debug)   # pick up the new target
 cmake --build code/out/build/linux-debug
 
 # capture the reference screenshot once the sample looks right
-python3 tools/capture.py --chapter hello_triangle --update
+python3 tools/capture.py --chapter 2.1 --update
 ```
 
 Every sample accepts `--frames N`, `--screenshot PATH`, `--width`, `--height` and

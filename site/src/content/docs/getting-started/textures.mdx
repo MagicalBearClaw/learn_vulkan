@@ -1,0 +1,361 @@
+---
+title: Textures
+description: Images, layouts, staging copies, mipmaps and samplers - putting a picture on a surface.
+sidebar:
+  order: 11
+---
+
+<figure>
+  <img src="/img/reference/1.11.textures.png" alt="Two textured quads: the left shows a grid texture once, the right tiles the same texture four times in each direction" />
+  <figcaption>Chapter 1.11: the same texture and the same sampler, drawn once and tiled four times.</figcaption>
+</figure>
+
+Per-vertex colours run out quickly. A texture attaches detail to a surface at a
+resolution that has nothing to do with how many triangles it has, and it is the single
+biggest step up in visual quality available.
+
+## Three objects, not one
+
+This is the framing worth carrying forward.
+
+**`VkImage`** is the pixels. It has a format, a size, a mip count, and a *layout* — an
+arrangement in memory that the driver chooses for speed and that changes depending on
+what you are about to do with it.
+
+**`VkImageView`** is how a shader interprets the image: which format to read it as, which
+mip levels, which array layers.
+
+**`VkSampler`** is how to read *between* texels: filtering, mip selection, and what
+happens outside 0…1.
+
+OpenGL merged all three into one texture object, which is why its sampler state was
+stuck to the texture and why using the same image with two different filters meant two
+copies of it. In Vulkan a sampler is an independent object, and a handful of them
+typically serve an entire scene.
+
+## Getting pixels in
+
+Loading is the buffer story from 1.8 with one extra idea, and `stb_image` does the file
+parsing:
+
+```cpp title="code/src/1.getting_started/textures/main.cpp"
+stbi_uc* pixels =
+    stbi_load(path.string().c_str(), &width, &height, &channels, STBI_rgb_alpha);
+```
+
+`STBI_rgb_alpha` forces 4 channels whatever the file has. Three-channel *image* formats
+are patchily supported across hardware — unlike three-channel vertex formats, which are
+universal — and one wasted byte per texel is a far better trade than a support matrix.
+
+The image itself:
+
+```cpp title="code/src/1.getting_started/textures/main.cpp"
+const VkImageCreateInfo image_info{
+    .imageType = VK_IMAGE_TYPE_2D,
+    .format = VK_FORMAT_R8G8B8A8_SRGB,
+    .extent = {width, height, 1},
+    .mipLevels = mip_levels_,
+    .arrayLayers = 1,
+    .samples = VK_SAMPLE_COUNT_1_BIT,
+    .tiling = VK_IMAGE_TILING_OPTIMAL,
+    .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+             VK_IMAGE_USAGE_SAMPLED_BIT,
+    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+};
+```
+
+Four fields deserve a note.
+
+`VK_IMAGE_TILING_OPTIMAL` lets the driver store the texels in whatever order its texture
+units prefer — usually some tiled or Morton ordering, never plain rows. That locality is
+why a texture fetch hits cache; `LINEAR` tiling keeps row order and is dramatically
+slower to sample. It exists for images the CPU must read directly, and almost nothing
+else.
+
+`TRANSFER_SRC` as well as `TRANSFER_DST`, because generating mipmaps reads level *n* to
+write level *n+1*.
+
+`initialLayout` must be `UNDEFINED` or `PREINITIALIZED`. `UNDEFINED` says the contents
+are not worth preserving, which is exactly true for a new image and lets the first
+transition be free.
+
+And `_SRGB` rather than `_UNORM`, which needs its own paragraph.
+
+:::note[Why the format ends in `_SRGB`]
+Image files store colour in sRGB: roughly, the square root of brightness, because that
+spends more bits where the eye is more sensitive. Adding or multiplying those values
+directly is meaningless — half of an sRGB value is not half the light.
+
+An `_SRGB` format makes the hardware convert to linear as each texel is sampled, for
+free. Our swapchain is also sRGB (chapter 1.4 chose it deliberately), so the conversion
+back happens on the way out, also free. Shading happens in linear space in between,
+which is the only place it is correct.
+
+Rule of thumb: **colour** textures are `_SRGB`; **data** textures — normal maps, roughness,
+height, masks — are `_UNORM`, because they were never colour and converting them would
+corrupt them. Chapter 5.2 takes this apart in full.
+:::
+
+### The copy, and the layouts
+
+Same staging pattern as a vertex buffer, with layout transitions around it:
+
+```cpp title="code/src/1.getting_started/textures/main.cpp"
+transition(cmd, VK_IMAGE_LAYOUT_UNDEFINED,
+           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, mip_levels_);
+
+vkCmdCopyBufferToImage(cmd, staging.handle(), texture_,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+```
+
+The layout is the new idea. A buffer is bytes and that is that; an image is arranged
+differently depending on what is about to touch it, and the arrangement that is fast to
+copy into is not the one that is fast to sample from. Chapter 1.5 met this already, for
+swapchain images. It is the same mechanism.
+
+The four layouts that cover most work:
+
+| Layout | For |
+|---|---|
+| `UNDEFINED` | contents not worth keeping — only ever a source |
+| `TRANSFER_DST_OPTIMAL` | being copied into |
+| `TRANSFER_SRC_OPTIMAL` | being copied out of |
+| `SHADER_READ_ONLY_OPTIMAL` | being sampled |
+
+`bufferRowLength` and `bufferImageHeight` of zero mean "tightly packed", which is what
+stb gives us. Non-zero values describe a sub-rectangle of a larger source image.
+
+## Mipmaps
+
+Here is the problem mipmaps solve. When a texture is minified — many texels falling
+inside one pixel — sampling picks one of them and ignores the rest. Move the camera
+slightly and it picks a different one. The result shimmers, and it is far more
+distracting in motion than a still screenshot suggests.
+
+A **mip chain** is the texture pre-filtered at successively half sizes: 512, 256, 128,
+down to 1×1. The hardware picks the level where one texel is about one pixel, so it is
+averaging over the right area instead of point-sampling a random texel.
+
+```cpp title="code/src/1.getting_started/textures/main.cpp"
+mip_levels_ = static_cast<uint32_t>(std::bit_width(static_cast<uint32_t>(
+                  std::max(width, height))));
+```
+
+It costs a third more memory, and it is faster than not having it, because the smaller
+levels fit in cache.
+
+Vulkan has **no `vkCmdGenerateMipmaps`**. That is deliberate — a box filter is rarely the
+best downsample, and production pipelines generate mips offline with something better.
+At load time, `vkCmdBlitImage` is the pragmatic answer, and writing it once is the best
+way to understand that a layout is per *mip level*, not per image:
+
+```cpp title="code/src/1.getting_started/textures/main.cpp"
+for (uint32_t level = 1; level < mip_levels_; ++level) {
+    transition(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, level - 1, 1);
+
+    vkCmdBlitImage(cmd, texture_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, texture_,
+                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                   VK_FILTER_LINEAR);
+
+    transition(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, level - 1, 1);
+}
+```
+
+Read the loop as a ladder. Level *n−1* has just been written, so move it to
+`TRANSFER_SRC` — the barrier both changes the layout *and* orders the write before the
+read. Blit it, halved, into level *n*. Level *n−1* is now finished forever, so move it
+to `SHADER_READ_ONLY` and never think about it again. The last level only ever was a
+blit destination, so it gets one transition after the loop.
+
+Notice the same image is both source and destination of the blit, at different mip
+levels. That is legal precisely because the levels are in different layouts and the
+barriers order them.
+
+:::caution[Linear blit is an optional feature]
+`VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT` is not guaranteed for every format.
+For 8-bit formats it is supported everywhere in practice — but "in practice" is not a
+guarantee, and the sample checks:
+
+```cpp title="code/src/1.getting_started/textures/main.cpp"
+vkGetPhysicalDeviceFormatProperties(context().physical_device(),
+                                    VK_FORMAT_R8G8B8A8_SRGB, &properties);
+```
+
+For compressed formats (BC7, ASTC) blitting is not available at all, and their mips must
+be generated offline — which is what you want anyway.
+:::
+
+## The sampler
+
+The sampler is where most of the visible quality decisions live:
+
+```cpp title="code/src/1.getting_started/textures/main.cpp"
+const VkSamplerCreateInfo sampler_info{
+    .magFilter = VK_FILTER_LINEAR,
+    .minFilter = VK_FILTER_LINEAR,
+    .mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+    .addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+    .addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+    .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+    .anisotropyEnable = VK_TRUE,
+    .maxAnisotropy = max_anisotropy,
+    .maxLod = VK_LOD_CLAMP_NONE,
+};
+```
+
+**`magFilter`** is magnification — one texel covering many pixels. `LINEAR` blends the
+four nearest; `NEAREST` gives crisp squares, which is right for pixel art and wrong for
+nearly everything else.
+
+**`minFilter`** is minification, which is where aliasing lives, and where mipmaps do
+their work.
+
+**`mipmapMode`** is how to blend *between* two mip levels. `LINEAR` gives trilinear
+filtering. `NEAREST` picks one level, and you can see the seam where it switches as a
+band across a floor.
+
+**`addressMode`** decides what `u` or `v` outside 0…1 means:
+
+| Mode | Behaviour |
+|---|---|
+| `REPEAT` | tiles — the right-hand quad in the screenshot |
+| `MIRRORED_REPEAT` | tiles, flipping alternate copies, so edges always match |
+| `CLAMP_TO_EDGE` | stretches the edge texel outwards |
+| `CLAMP_TO_BORDER` | uses `borderColor` |
+
+`CLAMP_TO_EDGE` is the right default for anything that is not meant to tile. `REPEAT` on
+a non-tiling texture produces a thin wrong-coloured line at the edges, from the filter
+blending the left edge with the right.
+
+**`anisotropyEnable`** is the best value for money in the whole struct. A surface seen at
+a glancing angle — a floor, a road, a wall — is compressed in one direction and not the
+other, and an ordinary mip lookup has to pick a level blurry enough for the worse axis.
+Anisotropic filtering takes several samples along the stretched direction instead. It
+costs little and it is very visible. It needs the `samplerAnisotropy` device feature,
+which `vkcommon` enables.
+
+**`maxLod = VK_LOD_CLAMP_NONE`** means no limit, which stays correct if a view later
+exposes a different number of levels. Setting it to `mip_levels_` also works and is one
+more thing to keep in step.
+
+## Reaching the shader
+
+A texture is bound through a descriptor, just as 1.10's uniform buffer was, with a
+different type:
+
+```cpp title="code/src/1.getting_started/textures/main.cpp"
+const VkDescriptorSetLayoutBinding binding{
+    .binding = 0,
+    .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+    .descriptorCount = 1,
+    .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+};
+```
+
+`COMBINED_IMAGE_SAMPLER` is one descriptor holding both a view and a sampler. Vulkan also
+offers `SAMPLED_IMAGE` and `SAMPLER` separately, which is how one image gets paired with
+several samplers without duplicating anything — but combined is simpler and is where to
+start.
+
+Note there is **one** descriptor set this time, not one per frame in flight. Nothing in
+it changes: it points at the same texture and sampler every frame. The per-frame
+duplication in 1.10 was needed because the *contents* of that buffer changed.
+
+In GLSL the type is `sampler2D`:
+
+```glsl title="code/src/1.getting_started/textures/textured.frag"
+layout(set = 0, binding = 0) uniform sampler2D tex;
+
+void main() {
+    out_colour = texture(tex, frag_uv);
+}
+```
+
+:::note[`texture()` does more than a memory read]
+The hardware compares this fragment's `uv` against its neighbours' — which is *why*
+fragment shaders run in groups of at least 2×2 — works out how fast the coordinate is
+changing across the screen, picks the mip level where one texel is about one pixel, and
+blends the two nearest levels. All of that is one instruction.
+
+It also means `texture()` inside non-uniform control flow is trouble: if some fragments
+in the group took the other branch, their `uv` is undefined and so is the derivative.
+Sample first, branch afterwards.
+:::
+
+## Texture coordinates
+
+```cpp title="code/src/1.getting_started/textures/main.cpp"
+{{-1.0F, -1.0F}, {0.0F, 0.0F}},  // top left
+{{1.0F, -1.0F}, {1.0F, 0.0F}},   // top right
+```
+
+`u` runs 0 to 1 left to right, `v` runs 0 to 1 **top to bottom**.
+
+:::caution[v points the other way from OpenGL]
+Vulkan's v is downward, consistent with its downward y, and it means an image loaded in
+the usual top-row-first order maps on the right way up with no flip at all.
+
+OpenGL's v points up, which is why so much OpenGL code calls
+`stbi_set_flip_vertically_on_load(true)`. Porting a shader or a mesh format across
+without accounting for it gives you upside-down textures — the reason the test texture
+has an asymmetric marker in it: if the triangle points down, your v is flipped.
+:::
+
+Tiling is just multiplication in the vertex shader:
+
+```glsl title="code/src/1.getting_started/textures/textured.vert"
+frag_uv = in_uv * push.uv_scale;
+```
+
+With `uv_scale` of 4 the coordinate runs 0…4 across the quad, and what happens past 1 is
+the sampler's address mode. That is the right-hand quad in the screenshot, and it is also
+where the mip chain earns its keep — the fine one-pixel grid lines in the texture stay
+clean instead of crawling.
+
+## Running it
+
+```bash
+./code/out/build/linux-debug/bin/1.11.textures
+```
+
+Two quads: the texture once, and the texture tiled four by four.
+
+The test texture is generated by `tools/make_textures.py` and committed, so there is
+nothing to download. It is built to make this chapter's topics visible: coarse squares
+for magnification, one-pixel lines for minification and mips, a border for the address
+modes, and a triangle so a flipped v is obvious.
+
+## What changed
+
+- `Vertex` gained a `vec2 uv`
+- a `VkImage`, `VkImageView` and `VkSampler` exist, plus the mip chain
+- the descriptor set holds a `COMBINED_IMAGE_SAMPLER`, and there is one of it, not two
+- layout transitions moved from the swapchain image to a texture, per mip level
+
+Added to `vkcommon` after this chapter: `vkc::Image` (image, allocation and view
+together), `vkc::load_texture` (the staging copy and the mip ladder above, start to
+finish) and `vkc::Sampler`. The sampler is deliberately a *separate* class, because in
+Vulkan it is a separate object, and the moment you want two filters on one image the
+convenience of bundling them turns into a copy of the texture.
+
+## Exercises
+
+1. Set `magFilter` to `VK_FILTER_NEAREST` and make the left quad much larger. Crisp
+   texel squares. Now set `minFilter` to `NEAREST` too and look at the right-hand quad.
+2. Set `mipmapMode` to `VK_SAMPLER_MIPMAP_MODE_NEAREST`, then set `minLod` to `3.0`.
+   You are now forcing a blurrier level than the hardware would choose, which is exactly
+   what a `mipLodBias` does — and what some games expose as a "texture quality" slider.
+3. Force `mip_levels_` to 1 and delete the `generate_mipmaps` call, keeping the one
+   transition to `SHADER_READ_ONLY_OPTIMAL`. The tiled quad starts to shimmer. Resize
+   the window slowly to see it move.
+4. Change both address modes to `VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE` and look at the
+   tiled quad. Then `MIRRORED_REPEAT`, and note the border lines now meet.
+5. Change the image format to `VK_FORMAT_R8G8B8A8_UNORM` in both `create_image` and
+   `create_texture_view`. Everything gets noticeably brighter and flatter, because the
+   sRGB-to-linear conversion is no longer happening and the values are being treated as
+   if they were already linear.
+6. Swap the `u` and `v` in `frag_uv` in the vertex shader. The triangle now points right.
+   That is what a transposed texture coordinate looks like, and recognising it saves
+   time later.

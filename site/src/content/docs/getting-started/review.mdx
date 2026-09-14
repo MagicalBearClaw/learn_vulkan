@@ -1,0 +1,197 @@
+---
+title: Review
+description: What Part 1 built, every Vulkan object you have met, and where each one is going next.
+sidebar:
+  order: 15
+---
+
+Fourteen chapters ago there was an empty directory. There is now a textured, lit-by-
+nothing, camera-navigable 3D scene, and — more usefully — there is no part of it you have
+not written.
+
+This chapter has no new code. It is a place to consolidate, and a reference to come back
+to when something in Part 2 assumes you remember where a descriptor set came from.
+
+## What you built
+
+| Chapter | Added |
+|---|---|
+| 1.1 | An SDL3 window and an event loop |
+| 1.2 | `VkInstance`, validation layers, the debug messenger |
+| 1.3 | Surface, physical device selection, logical device, queue, VMA |
+| 1.4 | Swapchain: format, present mode, extent, image views, recreation |
+| 1.5 | Command pools and buffers, image layout transitions, dynamic rendering |
+| 1.6 | Semaphores, fences, frames in flight |
+| 1.7 | Shader modules, the graphics pipeline, dynamic viewport, the first draw |
+| 1.8 | VMA buffers, staging uploads, vertex and index buffers |
+| 1.9 | GLSL and SPIR-V, the stage interface, specialisation constants |
+| 1.10 | Descriptor set layouts, pools, sets, uniform buffers, push constants |
+| 1.11 | Images, views, samplers, mip generation, layout transitions per level |
+| 1.12 | Matrices, glm, transform order |
+| 1.13 | Model/view/projection, the depth buffer, culling, the y flip |
+| 1.14 | A first-person camera |
+
+## Every object, and what it is for
+
+Worth reading once as a list, because Vulkan's object graph is the thing that makes the
+API feel large and it is actually quite small.
+
+**Set up once, and forgotten**
+
+| Object | What it is |
+|---|---|
+| `VkInstance` | the loader's handle on your application; where layers and instance extensions are enabled |
+| `VkPhysicalDevice` | a GPU, as reported. Not created — enumerated |
+| `VkDevice` | your connection to one GPU, with the features you asked for turned on |
+| `VkQueue` | where work is submitted. This series uses one for everything |
+| `VmaAllocator` | VMA's suballocator over `VkDeviceMemory` |
+
+**Tied to the window**
+
+| Object | What it is |
+|---|---|
+| `VkSurfaceKHR` | the window, as Vulkan sees it |
+| `VkSwapchainKHR` | the images the window system will display, and the queue to display them |
+| `VkImageView` | how a shader or an attachment interprets an image |
+
+**Per frame**
+
+| Object | What it is |
+|---|---|
+| `VkCommandPool` | memory that command buffers are recorded into |
+| `VkCommandBuffer` | a recorded list of GPU commands, submitted as a unit |
+| `VkSemaphore` | ordering between GPU operations. The CPU never waits on one |
+| `VkFence` | ordering from the GPU back to the CPU. The CPU does wait on these |
+
+**Resources**
+
+| Object | What it is |
+|---|---|
+| `VkBuffer` | a description of some bytes. Has no memory until one is bound |
+| `VkImage` | pixels, in a driver-chosen layout that changes with what touches them |
+| `VkSampler` | how to read between texels. Independent of any image |
+
+**Shaders and state**
+
+| Object | What it is |
+|---|---|
+| `VkShaderModule` | a SPIR-V blob. Consumed by pipeline creation and then disposable |
+| `VkDescriptorSetLayout` | the *shape* of a set: binding 0 is a uniform buffer, and so on |
+| `VkDescriptorPool` | where sets are allocated from. Fixed size, does not grow |
+| `VkDescriptorSet` | actual pointers to actual buffers and images |
+| `VkPipelineLayout` | everything the shaders can see: set layouts plus the push constant range |
+| `VkPipeline` | the entire configuration, compiled: shaders, blending, depth, vertex layout |
+
+## The four ideas that make Vulkan Vulkan
+
+If you remember nothing else from Part 1, these are the ones that keep paying off.
+
+**Nothing is implicit.** No allocation, no synchronisation, no layout transition and no
+state change happens unless you write it. That is why the first triangle took seven
+chapters, and it is also why there is nothing left to be surprised by: there is no
+driver heuristic to fight, because there is no driver heuristic.
+
+**State is compiled, not set.** A `VkPipeline` bakes the shaders, the blend mode, the
+depth function, the vertex layout and the primitive topology together. The cost is paid
+at creation. What OpenGL did at every draw call, guessing, Vulkan does once.
+
+**Data lives where you put it.** Device-local memory for things that never change, host-
+visible for things that change every frame, staging buffers to get between them. And one
+copy per frame in flight of anything the CPU writes while the GPU might still be reading.
+
+**Resources have layouts, and you move them.** A buffer is bytes. An image is arranged
+for whatever is about to touch it, and the arrangement that is fast to copy into is not
+the one that is fast to sample from. Every barrier in the series so far has been one of
+those moves.
+
+## Coming from OpenGL
+
+A short translation table. The appendix has a longer one.
+
+| OpenGL | Vulkan |
+|---|---|
+| `glGenBuffers` + `glBufferData` | `vmaCreateBuffer`, then a staging copy |
+| VAO | `VkVertexInputBindingDescription` + attributes, baked into the pipeline |
+| `glUniform4f` | a push constant, or a uniform buffer behind a descriptor |
+| texture object | `VkImage` + `VkImageView` + `VkSampler`, three separate things |
+| `glEnable(GL_DEPTH_TEST)` | a field in `VkPipelineDepthStencilStateCreateInfo` |
+| `glUseProgram` | `vkCmdBindPipeline` |
+| framebuffer object | attachments named directly in `VkRenderingInfo` |
+| `glGenerateMipmap` | a `vkCmdBlitImage` ladder you write yourself |
+| driver waits for you | semaphores, fences, and barriers you write yourself |
+| y up, z −1…1 | **y down, z 0…1** |
+
+That last row is the one to tattoo somewhere.
+
+## What is in `vkcommon` now
+
+Everything Part 1 taught, and nothing else:
+
+```
+window.cpp     1.1        SDL3 window and surface
+context.cpp    1.2, 1.3   instance, debug messenger, device, queue, allocator
+swapchain.cpp  1.4        swapchain and recreation
+frame.cpp      1.5, 1.6   command buffers, sync, frames in flight
+pipeline.cpp   1.7        shader modules and the pipeline builder
+buffer.cpp     1.8        VMA buffers, staging, immediate submit
+image.cpp      1.11       images, views, mip generation, samplers
+camera.cpp     1.14       a first-person camera
+app.cpp        —          the loop the chapters share, plus screenshot support
+```
+
+The rule has not been broken once: nothing entered that library before the chapter that
+wrote it out in full and explained every line. Any of it can be read at
+`code/common/scaffold/`, and the table above says which chapter to go back to.
+
+## Things Part 1 deliberately did badly
+
+Worth knowing, because each is a later chapter and none of them is a secret.
+
+**Every barrier uses `ALL_COMMANDS`.** `transition_image` waits for everything and blocks
+everything. It is always correct and it serialises work that could overlap. Chapter 4.1
+tightens the stage and access masks and measures the difference.
+
+**The swapchain rebuild waits for the device to go idle.** A visible hitch on resize.
+Chapter 9.6 does it without the stall.
+
+**One queue does everything.** Graphics, transfer and present on one queue removes a
+whole class of ownership-transfer barriers, which is the right trade while learning.
+Chapter 9.1 uses a dedicated transfer queue for uploads.
+
+**Uploads block.** `immediate_submit` creates a pool and a fence, submits, and waits. Fine
+at load time, hopeless for streaming. Chapter 7.2 overlaps them.
+
+**One descriptor set, written once.** Real scenes need sets per material and per object,
+and a pool that can grow. Chapter 2.3 organises them; chapter 3.4 goes bindless.
+
+**Mipmaps are generated at load with a box filter.** Offline, with a better filter, is
+what production does, and compressed formats require it.
+
+## Where Part 2 goes
+
+Everything so far has been *machinery*. Part 2 is the first part that is about how things
+**look**.
+
+It starts with the Phong reflection model — ambient, diffuse and specular — and the
+Vulkan lesson underneath it is descriptor set organisation: per-frame data, per-material
+data and per-object data want different lifetimes and different sets, and the scene you
+have been flying through is about to need all three.
+
+The shader mathematics ports from OpenGL almost unchanged. The structure around it does
+not.
+
+Before moving on, it is worth doing two things.
+
+**Read `code/common/scaffold/` end to end.** It is about 1 500 lines and you have written
+every one of them. It will not take long, and Part 2 gets much easier if `vkcommon` feels
+like your code rather than a library.
+
+**Diff two consecutive chapters.** It is the quickest way to see the shape of what each
+one actually added:
+
+```bash
+diff code/src/1.getting_started/coordinate_systems/main.cpp \
+     code/src/1.getting_started/camera/main.cpp
+```
+
+Then: chapter 2.1, colours and light — the first chapter of Part 2.

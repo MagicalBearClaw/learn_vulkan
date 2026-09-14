@@ -1,0 +1,291 @@
+---
+title: Coordinate Systems
+description: Model, view and projection; the depth buffer; and the two Vulkan-specific traps that make ported OpenGL code render upside down.
+sidebar:
+  order: 13
+---
+
+<figure>
+  <img src="/img/reference/1.13.coordinate_systems.png" alt="Three textured cubes at different depths and orientations, correctly occluding one another" />
+  <figcaption>Chapter 1.13: three cubes, a perspective projection and a depth buffer.</figcaption>
+</figure>
+
+Everything so far has been flat. This chapter adds the third dimension, and with it the
+two pieces that make 3D work: a **projection matrix**, which decides how a point in space
+lands on the screen, and a **depth buffer**, which decides which surface you actually see.
+
+It also contains the two most reliable ways to get Vulkan wrong, both of which produce a
+picture that is confidently, silently incorrect.
+
+## The chain of spaces
+
+A vertex passes through four coordinate systems on its way to a pixel, and each step is
+one matrix.
+
+| Space | Origin | What it is |
+|---|---|---|
+| **Model** | the object's own centre | what is in the vertex buffer |
+| **World** | the scene's origin | after the model matrix places the object |
+| **View** | the camera | after the view matrix, camera at the origin looking down −z |
+| **Clip** | — | after the projection, ready for the divide by `w` |
+
+```glsl title="code/src/1.getting_started/coordinate_systems/cube.vert"
+gl_Position = globals.projection * globals.view * push.model * vec4(in_position, 1.0);
+```
+
+Right to left, as always: model first, then view, then projection.
+
+After that the hardware divides all four components by `w` to get **normalised device
+coordinates**, and maps those onto the viewport. That divide is the whole of perspective:
+the projection matrix puts the distance to the camera into `w`, so a vertex twice as far
+away is divided by twice as much and lands twice as close to the centre of the screen.
+
+:::tip[Three multiplies per vertex, or one]
+Multiplying the three matrices on the CPU once per object and pushing the result saves
+the GPU two matrix multiplies per vertex. Worth doing when a model has 100 000 vertices.
+
+They are kept separate here because the separation is the lesson, and because the
+lighting chapters need world-space and view-space positions as well as the final one.
+:::
+
+## The projection
+
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+glm::mat4 projection = glm::perspective(glm::radians(45.0F), aspect, 0.1F, 100.0F);
+projection[1][1] *= -1.0F;
+```
+
+Four arguments: **vertical field of view**, **aspect ratio**, **near plane**, **far
+plane**. The aspect ratio is what replaces the hand-rolled `aspect_fix` from chapter 1.12
+— that was an orthographic projection all along, and this is the real thing.
+
+The near plane deserves more thought than it usually gets. Depth precision is
+concentrated near the camera, and the concentration is extreme: halving `near` costs
+precision *everywhere else*. When surfaces start flickering against each other at a
+distance, pushing the near plane out is the first thing to try, ahead of anything
+cleverer.
+
+### Trap one: y points down
+
+```cpp
+projection[1][1] *= -1.0F;
+```
+
+**Vulkan's clip-space y axis points down. OpenGL's points up.**
+
+glm produces an OpenGL projection, because glm was written for OpenGL. Negating the
+matrix entry that scales y turns one into the other. Leave it out and everything renders
+upside down — and because a rotating cube looks plausible either way, it is entirely
+possible not to notice until a letter of text appears.
+
+There is a second way to do it: give the viewport a **negative height**, with `y` set to
+the bottom of the image:
+
+```cpp
+const VkViewport viewport{
+    .y = static_cast<float>(extent.height),
+    .height = -static_cast<float>(extent.height),
+};
+```
+
+This is legal in core Vulkan (it came from `VK_KHR_maintenance1`, folded in at 1.1) and
+some codebases prefer it because it leaves the matrices exactly as an OpenGL port had
+them. Either works. Pick one and be consistent, because doing both gets you back where
+you started.
+
+### Trap two: z runs 0 to 1
+
+**Vulkan's clip-space z runs 0 to 1. OpenGL's runs −1 to 1.**
+
+An OpenGL projection maps the near plane to −1, and Vulkan clips anything below 0 — so
+the entire near half of the frustum is thrown away, and the far half has half its
+precision. The result is a scene with chunks missing and depth fighting in whatever
+survives.
+
+This one is handled once, project-wide, in `code/common/base/CMakeLists.txt`:
+
+```cmake title="code/common/base/CMakeLists.txt"
+GLM_FORCE_DEPTH_ZERO_TO_ONE   # Vulkan clip space is z in [0,1], not [-1,1]
+```
+
+With that defined, every glm projection emits 0…1 depth and there is nothing further to
+do. It must be defined for **every** translation unit that includes glm, which is why it
+is `PUBLIC` on `vkbase` rather than set per chapter — half a program with it and half
+without is a genuinely horrible bug to find.
+
+:::note[0 to 1 is also just better]
+Even setting compatibility aside, 0…1 is the right range. Depth values are stored with
+the precision of a float, and floats are dense near zero. OpenGL's −1…1 range wastes
+roughly half the representable values mapping them onto a symmetric range nobody needed.
+
+This is also why **reversed-z** — mapping near to 1 and far to 0, with a `GREATER` depth
+test — gives so much better precision with a floating-point depth buffer. It is a common
+technique and it is worth knowing the name now; chapter 4.1 works through it.
+:::
+
+## The depth buffer
+
+Three cubes overlap on screen. Without a depth buffer, whichever is drawn last wins,
+everywhere it covers — which is wrong roughly half the time.
+
+A depth buffer stores, per pixel, the depth of the nearest surface written so far. Each
+fragment compares its own depth against it, and is discarded if it loses. The comparison,
+the test and the write are fixed-function hardware, and they are close to free.
+
+### Creating it
+
+It is an image, with three things different from a texture:
+
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+depth_ = vkc::Image(context(), vkc::ImageDesc{
+                                   .format = depth_format_,
+                                   .extent = extent,
+                                   .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                                   .mip_levels = 1,
+                                   .aspect = VK_IMAGE_ASPECT_DEPTH_BIT,
+                               });
+```
+
+A **depth format**, **`DEPTH_STENCIL_ATTACHMENT` usage** instead of `SAMPLED`, and a
+**`DEPTH` aspect** instead of `COLOR`. The aspect is the one that gets forgotten, and it
+must match everywhere — in the view, in every barrier, in every copy.
+
+Depth formats are not all mandatory, so the sample asks:
+
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+constexpr std::array candidates{
+    VK_FORMAT_D32_SFLOAT,
+    VK_FORMAT_D32_SFLOAT_S8_UINT,
+    VK_FORMAT_D24_UNORM_S8_UINT,
+};
+```
+
+`D32_SFLOAT` is what to want: full float precision and no stencil bits to pay for.
+`D24_UNORM_S8_UINT` is the traditional alternative and what some older hardware prefers.
+`D16_UNORM` is mandatory everywhere and is genuinely too coarse for a scene of any depth
+— it is where a lot of z-fighting comes from.
+
+### Attaching it
+
+Dynamic rendering takes a depth attachment beside the colour one:
+
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+const VkClearValue depth_clear{.depthStencil = {1.0F, 0}};
+
+const VkRenderingAttachmentInfo depth_attachment{
+    .imageView = depth_.view(),
+    .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+    .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+    .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+    .clearValue = depth_clear,
+};
+```
+
+Cleared to **1.0**, the far plane, because the test keeps the *smaller* value and
+everything must start out further away than "infinitely far".
+
+`storeOp` is `DONT_CARE`, and that is a real optimisation rather than tidiness. Nothing
+reads the depth buffer after the frame ends, so the driver can skip writing it back to
+memory. On a tile-based GPU — every phone, and Apple silicon — the depth buffer can then
+live entirely in tile memory and never touch RAM at all. One word, a large saving.
+
+Compare that with `VkRenderPass`, where expressing the same thing meant a `storeOp` on an
+attachment description, a subpass dependency, and a framebuffer object built to match.
+
+### Turning the test on
+
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+.depth(depth_format_, /*test=*/true, /*write=*/true, VK_COMPARE_OP_LESS)
+```
+
+Test and write are separate switches, and the combination matters:
+
+- **test on, write on** — opaque geometry. The default.
+- **test on, write off** — transparent geometry. It must be hidden by things in front of
+  it, but must not hide the things behind it.
+- **test off, write off** — UI drawn over everything.
+
+`VK_COMPARE_OP_LESS` keeps the nearer fragment. With a reversed-z depth buffer this
+becomes `GREATER`, and with an equal-depth pre-pass it becomes `EQUAL`.
+
+The pipeline is also told the depth *format*, for the same reason it is told the colour
+format: there is no render pass to describe the attachments, so
+`VkPipelineRenderingCreateInfo` carries it.
+
+## Back-face culling
+
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+.cull(VK_CULL_MODE_BACK_BIT, VK_FRONT_FACE_COUNTER_CLOCKWISE)
+```
+
+Half the triangles of a closed object face away from the camera and are entirely hidden
+by the half that do not. Culling throws them out before rasterisation, for free.
+
+Which winding counts as "front" is the fiddly part, and it is worth being precise about
+because the reasoning is not obvious.
+
+The cube is wound counter-clockwise when seen from outside. The y flip in the projection
+is a mirror, and a mirror reverses apparent winding — so you would expect to need
+`CLOCKWISE`. You do not, because there are **two** mirrors: `glm::perspective` is
+right-handed and negates z on the way to clip space as well. Two reflections compose to a
+rotation, and the winding on screen comes out unchanged.
+
+:::tip[Do not reason about this — look]
+The failure is subtle. A cube with the wrong winding still renders as a cube-shaped
+thing; it is the *inside* you are seeing, and it reads as an open box with a concave
+corner rather than a solid one.
+
+Set `cullMode` to `VK_CULL_MODE_NONE` and it always looks right, which makes culling a
+good thing to turn off when geometry is behaving strangely and a bad thing to leave off.
+:::
+
+## Resizing
+
+The depth buffer must be exactly the size of the colour attachment, so it follows the
+swapchain:
+
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+void on_resize(VkExtent2D extent) override { create_depth_buffer(extent); }
+```
+
+The projection follows too, because the aspect ratio changed — that happens for free,
+since `update_globals` rebuilds it from the current extent every frame.
+
+## Running it
+
+```bash
+./code/out/build/linux-debug/bin/1.13.coordinate_systems
+```
+
+Three cubes, turning on different axes at different distances, each correctly hiding
+whatever is behind it. Resize the window and the proportions stay right.
+
+## What changed
+
+- vertices are `vec3`, and the mesh is a 24-vertex cube
+- a view matrix and a projection matrix, in a per-frame uniform buffer
+- a depth image, recreated on resize, attached through `pDepthAttachment`
+- the pipeline has a depth test, a depth format, and back-face culling
+- the descriptor set has two bindings: matrices for the vertex stage, texture for the
+  fragment stage
+
+Nothing new in `vkcommon` — `vkc::Image` already covered a depth image, which is why it
+takes a `format`, a `usage` and an `aspect` rather than assuming a texture.
+
+## Exercises
+
+1. Delete `projection[1][1] *= -1.0F`. The scene turns upside down. Now instead give the
+   viewport a negative height and check you get the original image back.
+2. Set `storeOp` on the depth attachment to `VK_ATTACHMENT_STORE_OP_STORE`. Nothing
+   changes on screen, which is the point: you have just asked the GPU to write several
+   megabytes per frame that nobody reads.
+3. Set the near plane to `0.0001F`. Look for flickering where the cubes intersect, and
+   then read the note about reversed-z again.
+4. Set `depthCompareOp` to `VK_COMPARE_OP_GREATER` via the pipeline builder. You are now
+   seeing the *back* of every cube — the depth test is keeping the furthest surface.
+5. Turn culling off with `VK_CULL_MODE_NONE` and set the front face to `CLOCKWISE`.
+   Nothing changes, because nothing is being culled. Now turn culling back on and watch
+   the cubes turn inside out.
+6. Remove the depth attachment entirely and set `depth_test` to `false`. The cubes still
+   draw, in the order the loop submits them, and it is immediately obvious why sorting by
+   hand is not a plan.

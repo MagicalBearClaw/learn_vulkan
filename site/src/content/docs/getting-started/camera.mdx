@@ -1,0 +1,223 @@
+---
+title: Camera
+description: A first-person fly camera - the view matrix, spherical angles, frame-rate independent movement, and why the pitch is clamped.
+sidebar:
+  order: 14
+---
+
+<figure>
+  <img src="/img/reference/1.14.camera.png" alt="Ten textured cubes scattered in depth, seen from a camera positioned back from the scene" />
+  <figcaption>Chapter 1.14: ten cubes and somewhere to stand.</figcaption>
+</figure>
+
+There is **no Vulkan in this chapter**. That is worth saying plainly, because "camera" is
+not a Vulkan concept and there is no `VkCamera` to go looking for. The view matrix was
+already a uniform in 1.13; the only change is that its contents now come from a position
+and two angles that the keyboard and mouse update.
+
+```bash
+WASD      move
+mouse     look (right-click to capture, right-click again to release)
+space     up          ctrl   down
+shift     sprint      Escape quit
+```
+
+## The view matrix is an inverse
+
+There is no camera in a rendering pipeline. There is an origin, and there is geometry.
+"Moving the camera one unit right" and "moving the entire world one unit left" produce
+identical pixels, and the second is what actually happens.
+
+So the view matrix is the **inverse** of the camera's own transform. If the camera sits
+at `(0, 0, 4)`, the view matrix translates everything by `(0, 0, −4)`.
+
+`glm::lookAt` builds it from three vectors:
+
+```cpp title="code/src/1.getting_started/camera/main.cpp"
+[[nodiscard]] glm::mat4 view() const {
+    return glm::lookAt(position, position + front(), glm::vec3{0.0F, 1.0F, 0.0F});
+}
+```
+
+Where the camera is, what it is looking **at** (not a direction — a point, which is why
+`front()` is added to the position), and which way is up.
+
+Inverting a general 4×4 matrix is expensive. `lookAt` never does: for a matrix that is
+only a rotation and a translation, the inverse is the transpose of the rotation part plus
+a negated, rotated translation, which is a handful of multiplies. Worth knowing because
+it is the reason a view matrix is cheap to rebuild every frame.
+
+## Two angles, not a matrix
+
+```cpp title="code/src/1.getting_started/camera/main.cpp"
+struct Camera {
+    glm::vec3 position{0.0F, 0.0F, 4.0F};
+    float yaw = -90.0F;
+    float pitch = 0.0F;
+};
+```
+
+The tempting alternative is to keep a matrix and multiply a small rotation into it each
+frame. Do not. Floating-point error accumulates in a matrix that is repeatedly
+multiplied, and after a few thousand frames the rotation part is no longer quite a
+rotation — the view shears, subtly, and it gets worse the longer the program runs.
+
+Storing the angles and rebuilding the matrix from scratch every frame cannot drift, and
+it costs nothing.
+
+Two angles is also exactly the right number for a camera that should never roll, which is
+what you want for anything standing on ground. Add roll and you need a third angle, and
+then you meet gimbal lock, and then you want quaternions — which is a later appendix and
+not something a first-person camera needs.
+
+`yaw = -90` because yaw is measured from the +x axis, and −90° points down −z, which is
+the conventional "forward".
+
+## Angles to a direction
+
+```cpp title="code/src/1.getting_started/camera/main.cpp"
+[[nodiscard]] glm::vec3 front() const {
+    const float yaw_radians = glm::radians(yaw);
+    const float pitch_radians = glm::radians(pitch);
+    return glm::normalize(glm::vec3{
+        std::cos(yaw_radians) * std::cos(pitch_radians),
+        std::sin(pitch_radians),
+        std::sin(yaw_radians) * std::cos(pitch_radians),
+    });
+}
+```
+
+This is spherical coordinates. Yaw sweeps around the vertical axis; pitch lifts out of
+the horizontal plane. The `cos(pitch)` factor on x and z is what keeps the vector unit
+length as it tilts — look straight up and the horizontal component is zero.
+
+The sideways direction comes from a cross product:
+
+```cpp title="code/src/1.getting_started/camera/main.cpp"
+[[nodiscard]] glm::vec3 right() const {
+    return glm::normalize(glm::cross(front(), glm::vec3{0.0F, 1.0F, 0.0F}));
+}
+```
+
+**World up, not the camera's own up.** That is the detail that makes a fly camera feel
+controllable: strafing stays horizontal no matter how far up or down you are looking. A
+camera that uses its own up drifts sideways and upwards at once when you look up, and it
+feels broken even if you cannot say why.
+
+:::caution[Why the pitch is clamped]
+```cpp title="code/src/1.getting_started/camera/main.cpp"
+camera_.pitch = std::clamp(camera_.pitch, -89.0F, 89.0F);
+```
+
+At exactly ±90° the facing direction is parallel to world up. The cross product of two
+parallel vectors is the zero vector, `normalize` divides by zero, and the view matrix
+becomes `NaN`. On screen the camera flips over or the world vanishes.
+
+89 degrees is close enough that nobody notices the limit, and far enough that the cross
+product stays well-conditioned. Every first-person camera you have ever used does this.
+:::
+
+## Keyboard state, not key events
+
+```cpp title="code/src/1.getting_started/camera/main.cpp"
+const bool* keys = SDL_GetKeyboardState(nullptr);
+
+if (keys[SDL_SCANCODE_W]) {
+    camera_.position += front * distance;
+}
+```
+
+A key *event* fires once when the key goes down, once when it comes up, and then at
+whatever repeat rate the OS is configured for. That is exactly right for typing and
+exactly wrong for movement — holding W would produce one step, a pause, then a stutter.
+
+What movement needs is "is this key held down right now", which is what the keyboard
+state array answers. This is the single most common beginner mistake in game input, and
+it looks like a bug in the camera rather than a bug in the input.
+
+Mouse *motion* is the opposite case: it genuinely is a stream of deltas, so it belongs in
+the event handler.
+
+```cpp title="code/src/1.getting_started/camera/main.cpp"
+camera_.yaw += event.motion.xrel * camera_.sensitivity;
+camera_.pitch -= event.motion.yrel * camera_.sensitivity;
+```
+
+Subtracted, not added, on the y axis: SDL's y grows downwards, and moving the mouse up
+should raise the pitch.
+
+`SDL_SetWindowRelativeMouseMode` hides the cursor and reports motion as deltas with no
+screen edges to run into, which is what a look control needs. It is toggled with the
+right mouse button here so the window stays usable.
+
+## Multiply by the frame time
+
+```cpp title="code/src/1.getting_started/camera/main.cpp"
+float distance = camera_.speed * delta_time();
+```
+
+`speed` is in world units per **second**, and multiplying by the time since the last
+frame gives units for **this** frame. Without it, movement speed is tied to frame rate:
+the same code moves four times as fast on a 240 Hz monitor as on a 60 Hz one, and it
+speeds up and slows down as the scene load changes.
+
+This is why a number of older games run at absurd speed on modern hardware — their
+movement was measured in units per *frame*, and nobody expected the frame to get 20 times
+shorter.
+
+`vkc::App` measures the frame time and exposes it as `delta_time()`.
+
+:::note[One new thing in `vkcommon`]
+`vkc::App` gained an `on_event` hook:
+
+```cpp title="code/common/scaffold/include/vkc/app.hpp"
+virtual void on_event(const SDL_Event& event) {}
+```
+
+It is called for every SDL event before `App` looks at it. Window close, Escape and
+resize are still handled by `App` regardless of what a sample does, so a chapter can
+never accidentally make the window unclosable.
+:::
+
+## Running it
+
+```bash
+./code/out/build/linux-debug/bin/1.14.camera
+```
+
+Ten cubes at various depths, turning at various rates. Right-click, then fly.
+
+Fly up and look down at the scene from above — that is the moment where the depth buffer,
+the projection and the view matrix stop being three separate things you implemented and
+start being one thing that works.
+
+## What changed
+
+- a `Camera` struct: position, yaw, pitch, and the three vectors derived from them
+- `on_event` handles mouse look and the capture toggle
+- `move_camera` reads the keyboard state each frame, scaled by `delta_time()`
+- the view matrix comes from the camera instead of being a fixed translation
+- ten cubes instead of three
+
+Added to `vkcommon` after this chapter: `vkc::Camera`, which is this code with the SDL
+handling folded in. The first chapter to use it is 2.1, where the subject is lighting and
+a camera is something you want to already have.
+
+## Exercises
+
+1. Remove the `delta_time()` multiplication and run the sample with `--frames 2000` while
+   dragging the window over a heavy background. The speed changes as the frame rate does.
+2. Remove the pitch clamp and look straight up. Note that the failure is not a crash —
+   it is `NaN` propagating through the view matrix, and the screen goes blank.
+3. Pass the camera's *own* up — `glm::cross(right(), front())` — to `lookAt` instead of
+   world up, then look steeply upward while strafing. Everything still works, and it
+   feels subtly wrong; that is what a camera that can roll feels like when you did not
+   ask it to.
+4. Add roll: a third angle, applied about the facing direction, bound to Q and E. Then
+   pitch up 90 degrees and try to yaw. That is gimbal lock, and it is why quaternions
+   exist.
+5. Make the camera ease into motion rather than starting instantly: keep a velocity
+   vector, accelerate it toward the desired direction, and damp it. Three lines, and it
+   is the difference between a debug camera and one that feels good.
+6. Print the camera position and angles each second. Fly somewhere interesting, then
+   paste the values in as the starting state.

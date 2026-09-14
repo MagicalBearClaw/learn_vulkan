@@ -1,0 +1,378 @@
+---
+title: Memory and Buffers
+description: VMA, staging uploads, vertex and index buffers - getting geometry out of the shader and into GPU memory.
+sidebar:
+  order: 8
+---
+
+<figure>
+  <img src="/img/reference/1.8.memory_and_buffers.png" alt="A quad filling the centre of the window, with red, green, blue and yellow corners blending across it" />
+  <figcaption>Chapter 1.8: four vertices in GPU memory, drawn as two triangles through an index buffer.</figcaption>
+</figure>
+
+Chapter 1.7's triangle had its vertices written into the shader. That works for exactly
+one triangle. Everything you will ever draw after this lives in GPU memory, and this
+chapter is about how it gets there.
+
+## First, the scaffold
+
+This is the chapter the last seven have been building towards. From here on the samples
+link `vkcommon`, and `main.cpp` starts like this:
+
+```cpp title="code/src/1.getting_started/memory_and_buffers/main.cpp"
+class QuadApp : public vkc::App {
+protected:
+    void on_start() override { /* create resources */ }
+    void on_render(const vkc::FrameInfo& frame) override { /* record one frame */ }
+    void on_shutdown() override { /* destroy resources */ }
+};
+```
+
+`vkc::App` owns the window, the instance, the device, the swapchain and the frame loop.
+`on_render` is handed an open command buffer with a swapchain image already transitioned
+to `COLOR_ATTACHMENT_OPTIMAL`.
+
+:::note[Nothing in `vkcommon` is new]
+Every line of it is code from chapters 1.1 to 1.7, moved rather than written. `window.cpp`
+is 1.1, `context.cpp` is 1.2 and 1.3, `swapchain.cpp` is 1.4, `frame.cpp` is 1.5 and 1.6,
+`pipeline.cpp` is 1.7. You can read the lot at `code/common/scaffold/`, and if any of it
+looks unfamiliar, the chapter that wrote it is the place to go.
+
+From now on each chapter says explicitly what it added to the scaffold and what it took
+out of `main.cpp`.
+:::
+
+## A buffer is not memory
+
+This is the idea the whole chapter rests on, and it is the one that surprises people
+coming from OpenGL, where `glBufferData` allocates and uploads in a single call.
+
+In Vulkan, `vkCreateBuffer` gives you a `VkBuffer` that has **no memory behind it at
+all**. It is a description: this many bytes, used in these ways. Getting memory attached
+takes three more steps:
+
+1. ask the buffer what its memory requirements are — size, alignment, and which memory
+   types are acceptable
+2. look through the physical device's memory types for one that is both acceptable *and*
+   has the properties you need, such as being visible to the CPU
+3. `vkAllocateMemory`, then `vkBindBufferMemory` to attach it
+
+And then there is a trap waiting. `maxMemoryAllocationCount` is commonly **4096**. One
+`vkAllocateMemory` per buffer runs out of allocations on a scene of any size, so a real
+program allocates a few large blocks and hands out slices of them — writing a memory
+allocator, complete with alignment and free-list management, before drawing anything.
+
+## Which is why we use VMA
+
+The [Vulkan Memory Allocator](https://gpuopen.com/vulkan-memory-allocator/) is AMD's
+library that does all of the above, and it is close to universal in Vulkan code. It
+suballocates from large blocks, picks the memory type, respects alignment, and hands
+back a single call:
+
+```cpp title="code/src/1.getting_started/memory_and_buffers/main.cpp"
+VK_CHECK(vmaCreateBuffer(context().allocator(), &buffer_info, &alloc_info,
+                         &buffer.handle, &buffer.allocation, &buffer.info));
+```
+
+Two handles come back, and both must be kept. The `VkBuffer` is what Vulkan commands
+take; the `VmaAllocation` is VMA's record of which block the memory came from, needed to
+free it again.
+
+The buffer side is ordinary Vulkan:
+
+```cpp title="code/src/1.getting_started/memory_and_buffers/main.cpp"
+const VkBufferCreateInfo buffer_info{
+    .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+    .size = size,
+    .usage = usage,
+    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+};
+```
+
+`usage` is a promise about what the buffer is for, and the driver picks memory and
+alignment to suit it. It is also enforced: binding a buffer as a vertex buffer without
+`VK_BUFFER_USAGE_VERTEX_BUFFER_BIT` is a validation error, not a silent slowdown.
+
+The allocation side is where you say what you want from the *memory*:
+
+```cpp title="code/src/1.getting_started/memory_and_buffers/main.cpp"
+const VmaAllocationCreateInfo alloc_info{
+    .flags = flags,
+    .usage = memory_usage,
+};
+```
+
+`VMA_MEMORY_USAGE_AUTO` means "you work it out from the buffer usage", which is the
+modern VMA style and almost always right. The `flags` are where the interesting choice
+is, and to make it we need to know what kinds of memory exist.
+
+## Host-visible and device-local
+
+Chapter 1.3 printed the memory heaps of your GPU. On a discrete card they look roughly
+like this:
+
+```
+heap 0: 16376 MiB (device local)
+heap 1: 23868 MiB
+heap 2:   246 MiB (device local)
+```
+
+Heap 0 is the memory on the card. The GPU reads it at hundreds of gigabytes per second.
+The CPU cannot see it at all.
+
+Heap 1 is ordinary system RAM. The CPU writes it directly; the GPU reaches it across
+PCIe at maybe a thirtieth of the speed.
+
+Heap 2 is the small device-local heap the CPU *can* write — a window into video memory
+opened by the BIOS. With Resizable BAR enabled this one grows to cover the whole card.
+
+So memory the CPU can write and memory the GPU likes best are, on a discrete GPU,
+usually different memory. Data that never changes belongs in device-local memory, and
+the CPU cannot put it there directly. It has to be copied.
+
+## Staging
+
+The pattern is called a **staging upload** and it is three steps.
+
+First, a buffer the CPU can write, whose only purpose is to be the source of a copy:
+
+```cpp title="code/src/1.getting_started/memory_and_buffers/main.cpp"
+const Buffer staging =
+    create_buffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                  VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                      VMA_ALLOCATION_CREATE_MAPPED_BIT,
+                  VMA_MEMORY_USAGE_AUTO);
+
+std::memcpy(staging.info.pMappedData, data, static_cast<size_t>(size));
+```
+
+`HOST_ACCESS_SEQUENTIAL_WRITE` says we will write this front to back and never read it
+back. That is not a formality: it lets VMA choose **write-combined** memory, which is
+fast to write in order and catastrophically slow to read. If you ever need to read from a
+mapped buffer, ask for `HOST_ACCESS_RANDOM` instead.
+
+`MAPPED_BIT` asks VMA to keep the allocation permanently mapped and hand back the
+pointer in `pMappedData`, so there is no `vkMapMemory`/`vkUnmapMemory` pair to balance.
+
+Second, the real buffer, in device-local memory, with `TRANSFER_DST` added to whatever
+it is actually for:
+
+```cpp title="code/src/1.getting_started/memory_and_buffers/main.cpp"
+const Buffer result = create_buffer(size, usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                    0, VMA_MEMORY_USAGE_AUTO);
+```
+
+No host-access flag this time, so VMA is free to put it where the GPU wants it.
+
+Third, a copy — which is GPU work, so it needs a command buffer:
+
+```cpp title="code/src/1.getting_started/memory_and_buffers/main.cpp"
+immediate_submit([&](VkCommandBuffer cmd) {
+    const VkBufferCopy region{.srcOffset = 0, .dstOffset = 0, .size = size};
+    vkCmdCopyBuffer(cmd, staging.handle, result.handle, 1, &region);
+});
+
+vmaDestroyBuffer(context().allocator(), staging.handle, staging.allocation);
+```
+
+The ordering matters. `immediate_submit` waits on a fence before it returns, so by the
+time the staging buffer is destroyed the GPU has definitely finished reading it.
+Destroying it earlier would free memory a queued copy is about to read, and that is the
+kind of bug that works fine on your machine and corrupts geometry on someone else's.
+
+### One-off GPU work
+
+`immediate_submit` is a command buffer recorded, submitted, and waited on:
+
+```cpp title="code/src/1.getting_started/memory_and_buffers/main.cpp"
+VK_CHECK(vkQueueSubmit2(context().queue(), 1, &submit, fence));
+VK_CHECK(vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX));
+```
+
+Blocking on a fence is exactly what chapter 1.6 spent its length getting rid of — but
+that was about the *frame loop*, where a stall costs you frames. This runs once at load
+time with nothing to overlap it with, so the simple version is also the honest one.
+
+The pool is created with `VK_COMMAND_POOL_CREATE_TRANSIENT_BIT`, which tells the driver
+these command buffers are recorded once and discarded.
+
+:::note[Integrated GPUs, and `vkCmdUpdateBuffer`]
+On an integrated GPU there is only one pool of memory and the staging copy is pure
+overhead; VMA will usually return host-visible device-local memory and the copy becomes
+a memcpy across the same RAM. It costs little enough to be worth keeping one code path.
+
+For very small uploads — 64 KiB or less — `vkCmdUpdateBuffer` writes data straight into
+a command buffer with no staging buffer at all. Handy for a one-off constant.
+:::
+
+## Describing a vertex
+
+The data is on the GPU. Now the pipeline has to be told how to read it.
+
+The C++ side is a plain struct with no Vulkan in it:
+
+```cpp title="code/src/1.getting_started/memory_and_buffers/main.cpp"
+struct Vertex {
+    glm::vec2 position;
+    glm::vec3 colour;
+};
+```
+
+Two structures turn that into something a pipeline understands. The **binding** says how
+to step through the buffer:
+
+```cpp title="code/src/1.getting_started/memory_and_buffers/main.cpp"
+const VkVertexInputBindingDescription binding{
+    .binding = 0,
+    .stride = sizeof(Vertex),
+    .inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
+};
+```
+
+`stride` is how far apart consecutive vertices are, and `VK_VERTEX_INPUT_RATE_VERTEX`
+means advance once per vertex. The alternative, `_INSTANCE`, advances once per instance
+instead and is how per-instance data reaches the shader — that is chapter 4.8.
+
+The **attributes** say where each shader input lives inside one vertex:
+
+```cpp title="code/src/1.getting_started/memory_and_buffers/main.cpp"
+const std::array<VkVertexInputAttributeDescription, 2> attributes{{
+    {
+        .location = 0,
+        .binding = 0,
+        .format = VK_FORMAT_R32G32_SFLOAT,
+        .offset = offsetof(Vertex, position),
+    },
+    {
+        .location = 1,
+        .binding = 0,
+        .format = VK_FORMAT_R32G32B32_SFLOAT,
+        .offset = offsetof(Vertex, colour),
+    },
+}};
+```
+
+Three things to notice.
+
+`format` uses image-format vocabulary for vertex data, which looks strange the first
+time. It is the same vocabulary, though, and it reads directly: `R32G32_SFLOAT` is two
+32-bit signed floats, `R32G32B32_SFLOAT` is three.
+
+`offset` comes from `offsetof`. Adding up `sizeof` by hand works until a struct has
+padding in it, and then it silently does not.
+
+`location` is the pairing with the shader, and it is the whole contract:
+
+```glsl title="code/src/1.getting_started/memory_and_buffers/quad.vert"
+layout(location = 0) in vec2 in_position;
+layout(location = 1) in vec3 in_colour;
+```
+
+:::caution[The one mistake validation cannot fully catch]
+If the `location` numbers or the formats disagree between C++ and GLSL, the shader reads
+the wrong bytes. The validation layers catch some cases — a missing attribute, a
+mismatched type — but they cannot know that you meant to swap position and colour. The
+symptom is geometry in the wrong place or colours that make no sense, with no error
+message anywhere.
+
+When something looks wrong in a way that suggests garbage input, check these two blocks
+against each other first.
+:::
+
+## Index buffers
+
+The quad is two triangles. Drawn as six vertices, two of them would be exact duplicates.
+Instead there are four vertices and a list of six indices into them:
+
+```cpp title="code/src/1.getting_started/memory_and_buffers/main.cpp"
+constexpr std::array<uint16_t, 6> kIndices{0, 1, 2, 2, 3, 0};
+```
+
+On a quad that saves two vertices. On a real mesh the saving is much larger: a cube has
+8 distinct corners and 36 triangle vertices, and typical models reuse each vertex six
+times or more. The GPU also keeps a small cache of recently transformed vertices keyed by
+index, so a shared vertex may run the vertex shader only once no matter how many
+triangles use it.
+
+`uint16_t` indices are half the bandwidth of `uint32_t` and enough for any mesh under
+65 536 vertices. Which one a buffer holds is stated at bind time, not in the pipeline.
+
+## Binding and drawing
+
+```cpp title="code/src/1.getting_started/memory_and_buffers/main.cpp"
+const VkDeviceSize offset = 0;
+vkCmdBindVertexBuffers(frame.cmd, 0, 1, &vertex_buffer_.handle, &offset);
+vkCmdBindIndexBuffer(frame.cmd, index_buffer_.handle, 0, VK_INDEX_TYPE_UINT16);
+
+vkCmdDrawIndexed(frame.cmd, static_cast<uint32_t>(kIndices.size()), 1, 0, 0, 0);
+```
+
+Binding a vertex buffer supplies only the memory — binding index 0, this buffer, starting
+at this byte offset. The stride and the attribute layout are already baked into the
+pipeline.
+
+`vkCmdDrawIndexed` takes an index count where `vkCmdDraw` took a vertex count. The vertex
+shader still runs per vertex; which vertex it runs on now comes from the index buffer.
+
+The shader itself barely changed. `gl_VertexIndex` and the constant array are gone,
+replaced by two `in` declarations:
+
+```glsl title="code/src/1.getting_started/memory_and_buffers/quad.vert"
+void main() {
+    gl_Position = vec4(in_position, 0.0, 1.0);
+    frag_colour = in_colour;
+}
+```
+
+The fragment shader is untouched. It never knew where the colour came from.
+
+## Running it
+
+```bash
+./code/out/build/linux-debug/bin/1.8.memory_and_buffers
+```
+
+A quad with red, green, blue and yellow corners. Two details in that image are worth a
+second look, because both get fixed later.
+
+**There is a visible seam along the diagonal.** Colours are interpolated across each
+triangle independently, and the shared edge is where two independent interpolations meet.
+Nothing is wrong; this is what per-vertex interpolation does, and it is the same
+phenomenon that makes low-polygon Gouraud-shaded models look faceted. Chapter 2.2 does
+the lighting equivalent per pixel instead, and the artefact disappears.
+
+**The quad is not square.** Its coordinates run −0.5 to 0.5 in both axes, which is square
+in clip space, but clip space is stretched to fill whatever shape the window is. Resize
+the window and watch it distort. A projection matrix is what corrects for that, and it
+arrives in chapter 1.13.
+
+## What changed
+
+Compared to 1.7:
+
+- `main.cpp` lost around 900 lines to `vkcommon` and gained buffers
+- vertices moved from a constant array in the shader into device-local GPU memory
+- the pipeline gained a vertex input description
+- `vkCmdDraw` became `vkCmdDrawIndexed`
+
+Added to `vkcommon` this chapter: **nothing yet**. `create_buffer`, `upload_to_device_local`
+and `immediate_submit` are written out in full in `main.cpp` because they are what this
+chapter teaches. Chapter 1.9 is the first that gets to use them from the scaffold.
+
+## Exercises
+
+1. Delete `VK_BUFFER_USAGE_TRANSFER_DST_BIT` from the device-local buffer and run it.
+   Read the validation message carefully — it is a good example of the layers catching a
+   promise you broke.
+2. Change the index array to `{0, 1, 2}` and drop the count to 3. You get one triangle,
+   and the vertex buffer is unchanged. Indices and vertices really are independent.
+3. Add a fourth `float` to `Vertex` — say a brightness — pass it through to the fragment
+   shader, and multiply the colour by it. You will need a third attribute, a new
+   location, and `VK_FORMAT_R32_SFLOAT`.
+4. Skip the staging buffer entirely: create the vertex buffer with
+   `VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT`
+   and `memcpy` straight into it. It works, and for four vertices you will not measure a
+   difference. Now consider a million-vertex model read across PCIe every frame.
+5. Call `vmaDestroyBuffer` on the staging buffer *before* `immediate_submit` rather than
+   after. On most drivers it will still draw correctly, which is precisely why the
+   validation layers exist — run it with them on and see what they say.

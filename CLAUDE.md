@@ -13,7 +13,15 @@ chapter in `code/src/`, shared scaffolding in `code/common/` (`vkcommon`).
 LearnOpenGL; the writing and the code are not. Never adapt LearnOpenGL's text
 sentence by sentence, and never port its C++. Write each explanation from the Vulkan
 specification and the graphics literature. Assets must be openly licensed (Khronos
-glTF samples, CC0 textures); record every one in `bootstrap.json` and `CREDITS.md`.
+glTF samples, CC0 textures) or drawn by this project; record every one in
+`bootstrap.json` and `CREDITS.md`. `assets/textures/` is ours and is committed
+(see `tools/make_textures.py`); the rest of `assets/` is fetched and gitignored.
+
+**Verify claims about behaviour before writing them down.** Several article passages
+assert what the validation layers say, or what a change looks like on screen. Run the
+change and look. Two claims in M2 were written from reasoning and were wrong -- the
+front-face winding in 1.13 and a validation message in 1.9 -- and both were caught only
+by testing them.
 
 **The vkcommon rule.** Nothing enters `code/common/` until the chapter that teaches it
 has been written. Chapter N writes the code out in full and explains every line; from
@@ -47,6 +55,9 @@ python3 tools/new_chapter.py <part>.<n>.<slug> --title "..." --part <part-slug>
 
 # Screenshot regression across every chapter
 python3 tools/capture.py --all
+
+# Regenerate the committed test textures (rarely needed)
+python3 tools/make_textures.py
 
 # Site
 cd site && npm run dev
