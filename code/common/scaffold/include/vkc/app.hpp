@@ -1,5 +1,6 @@
 #pragma once
 
+#include "vkc/capture.hpp"
 #include "vkc/context.hpp"
 #include "vkc/frame.hpp"
 #include "vkc/swapchain.hpp"
@@ -20,17 +21,11 @@ namespace vkc {
 // What a chapter does with that command buffer is the entire subject of the chapter.
 class App {
 public:
-    struct Options {
+    // Everything in Args (size, frame limit, screenshot path, validation) plus the
+    // window title. Args is shared with the hand-written chapters so that
+    // tools/capture.py can drive every sample in the book identically.
+    struct Options : Args {
         std::string title = "LearnVulkan";
-        uint32_t width = 1280;
-        uint32_t height = 720;
-        bool validation = true;
-
-        // Run this many frames then exit. Zero means "until the user closes the
-        // window". tools/capture.py uses this to render deterministic screenshots.
-        uint64_t frame_limit = 0;
-        // Write the contents of the last rendered frame here as a PNG, then exit.
-        std::filesystem::path screenshot;
     };
 
     explicit App(Options options);
@@ -45,6 +40,7 @@ public:
     // --no-validation, --width N, --height N.
     [[nodiscard]] static Options parse_args(int argc, char** argv, Options defaults);
 
+    // Runs the loop. Returns a process exit code.
     int run();
 
 protected:
@@ -69,26 +65,13 @@ private:
     bool poll_events();
     void rebuild_swapchain();
 
-    // Screenshots are taken inside the frame, not after it. A swapchain image may
-    // only be touched between vkAcquireNextImageKHR and vkQueuePresentKHR, so the
-    // copy has to be recorded into the same command buffer that just drew it.
-    void create_capture_buffer(VkExtent2D extent);
-    void record_capture(const FrameInfo& frame);
-    void write_capture();
-    void destroy_capture_buffer() noexcept;
-
     Options options_;
     std::unique_ptr<Window> window_;
     std::unique_ptr<Context> context_;
     std::unique_ptr<Swapchain> swapchain_;
     std::unique_ptr<FrameContext> frames_;
 
-    VkBuffer capture_buffer_ = VK_NULL_HANDLE;
-    VmaAllocation capture_allocation_ = VK_NULL_HANDLE;
-    VmaAllocationInfo capture_allocation_info_{};
-    VkExtent2D capture_extent_{};
-    VkFormat capture_format_ = VK_FORMAT_UNDEFINED;
-    bool capture_ready_ = false;
+    Capture capture_;
 
     bool swapchain_dirty_ = false;
     bool running_ = true;

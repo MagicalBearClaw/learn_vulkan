@@ -1,0 +1,295 @@
+---
+title: Hello Triangle
+description: Shader modules, the graphics pipeline object, dynamic state, and finally a draw call.
+sidebar:
+  order: 7
+---
+
+<figure>
+  <img src="/img/reference/1.7.hello_triangle.png" alt="A triangle with red, green and blue vertices blending smoothly across its surface" />
+  <figcaption>Chapter 1.7: the traditional first triangle, with colours interpolated across its surface.</figcaption>
+</figure>
+
+Everything so far has been preparation. This chapter adds shaders, a pipeline, and one
+`vkCmdDraw`.
+
+## Shaders are compiled ahead of time
+
+Vulkan does not accept GLSL. It accepts **SPIR-V**, a binary intermediate
+representation, and you compile your shaders into it as part of your build.
+
+This is a real improvement over runtime GLSL compilation. Syntax errors surface at
+build time rather than on a user's machine; there is no per-driver GLSL dialect to
+trip over; and startup is faster because the driver receives something much closer to
+machine code.
+
+Our build does it automatically:
+
+```cmake title="code/src/1.getting_started/hello_triangle/CMakeLists.txt"
+add_chapter(1.7.hello_triangle
+    SOURCES main.cpp
+    SHADERS triangle.vert triangle.frag
+    NO_SCAFFOLD
+)
+```
+
+Each shader is compiled by `glslangValidator` into a `.spv` file next to the binary.
+
+## The vertex shader
+
+```glsl title="code/src/1.getting_started/hello_triangle/triangle.vert"
+#version 450
+
+layout(location = 0) out vec3 frag_colour;
+
+const vec2 positions[3] = vec2[](
+    vec2( 0.0, -0.5),   // top
+    vec2( 0.5,  0.5),   // bottom right
+    vec2(-0.5,  0.5)    // bottom left
+);
+
+const vec3 colours[3] = vec3[](
+    vec3(1.0, 0.0, 0.0),
+    vec3(0.0, 1.0, 0.0),
+    vec3(0.0, 0.0, 1.0)
+);
+
+void main() {
+    gl_Position = vec4(positions[gl_VertexIndex], 0.0, 1.0);
+    frag_colour = colours[gl_VertexIndex];
+}
+```
+
+The vertices are in the shader. There is no vertex buffer in this chapter, deliberately:
+buffers, GPU memory and staging uploads are chapter 1.8's subject, and meeting them
+here would mean learning two large things at once.
+
+`gl_VertexIndex` counts 0, 1, 2 across the three vertices we asked for, so it can index
+a constant array directly.
+
+:::caution[Vulkan's y axis points down]
+In clip space, x and y run -1 to 1 with **y pointing down** the screen, and z runs
+**0 to 1**. OpenGL has y pointing up and z running -1 to 1.
+
+So `-0.5` in y is the *top* of the screen here. A shader or projection matrix copied
+from OpenGL material renders upside down, and a depth buffer set up for OpenGL's range
+produces results that look almost right, which is worse.
+
+This project sets `GLM_FORCE_DEPTH_ZERO_TO_ONE` globally to deal with the depth half.
+The y flip is handled where it arises, and flagged each time.
+:::
+
+## The fragment shader
+
+```glsl title="code/src/1.getting_started/hello_triangle/triangle.frag"
+#version 450
+
+layout(location = 0) in vec3 frag_colour;
+layout(location = 0) out vec4 out_colour;
+
+void main() {
+    out_colour = vec4(frag_colour, 1.0);
+}
+```
+
+One invocation per pixel the triangle covers.
+
+`frag_colour` is not the value any single vertex wrote. The hardware **interpolates**
+the three vertex outputs across the triangle, weighted by how close the pixel is to
+each corner, which is why the result is a smooth gradient rather than three flat
+regions. That interpolation is free, it is done by fixed-function hardware, and it is
+the basis of nearly everything in the lighting chapters — normals, texture coordinates
+and world positions all reach the fragment shader the same way.
+
+The `location` numbers are what connect the two stages. Vertex output 0 becomes
+fragment input 0; the names are irrelevant.
+
+## Shader modules
+
+```cpp title="code/src/1.getting_started/hello_triangle/main.cpp"
+const VkShaderModuleCreateInfo info{
+    .codeSize = code.size() * sizeof(uint32_t),  // in bytes
+    .pCode = code.data(),
+};
+```
+
+A shader module is just the SPIR-V blob handed to the driver. It is *not* compiled to
+machine code here — that happens at pipeline creation, when the driver finally knows
+the rest of the state the shader will run under.
+
+Note `codeSize` is in **bytes** while `pCode` is a `const uint32_t*`. SPIR-V is a stream
+of 32-bit words and must be 4-byte aligned, which is why `read_spirv` returns a
+`std::vector<uint32_t>` — a `vector<char>` gives no such guarantee.
+
+## The pipeline
+
+Here is the idea that defines Vulkan's approach to state.
+
+In OpenGL you set state one call at a time — bind a shader, enable blending, set a depth
+function — and the driver works out what that combination means at draw time, every
+draw. Vulkan makes you declare the whole configuration up front and compiles it into an
+immutable `VkPipeline`.
+
+That is why pipeline creation is a large function and why it is a one-off cost:
+expensive at creation, nearly free to bind.
+
+The pieces, briefly:
+
+| Struct | Decides |
+|---|---|
+| `pStages` | Which shaders, and their entry points |
+| `pVertexInputState` | Vertex buffer layout — empty here |
+| `pInputAssemblyState` | How vertices form primitives |
+| `pViewportState` | How many viewports and scissors |
+| `pRasterizationState` | Fill mode, culling, winding order |
+| `pMultisampleState` | Anti-aliasing sample count |
+| `pColorBlendState` | How output combines with what is there |
+| `pDynamicState` | Which state is *not* baked in |
+
+A few fields deserve comment.
+
+```cpp title="code/src/1.getting_started/hello_triangle/main.cpp"
+.cullMode = VK_CULL_MODE_NONE,
+.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
+```
+
+No culling yet. Face culling gets its own chapter; turning it on now would silently
+discard the triangle if its winding happened to be the other way, and "nothing is drawn
+and nothing is wrong" is a poor place to start debugging.
+
+```cpp title="code/src/1.getting_started/hello_triangle/main.cpp"
+.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                  VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+```
+
+Even with blending disabled, the write mask still has to list the channels to write.
+Leave it at zero — which is what value-initialising the struct gives you — and you get a
+black screen with no error at all.
+
+## Dynamic state
+
+```cpp title="code/src/1.getting_started/hello_triangle/main.cpp"
+const VkDynamicState dynamic_states[2]{
+    VK_DYNAMIC_STATE_VIEWPORT,
+    VK_DYNAMIC_STATE_SCISSOR,
+};
+```
+
+Almost everything is baked in, which would mean rebuilding the pipeline every time the
+window resized. Declaring the viewport and scissor dynamic means supplying them per
+frame instead:
+
+```cpp title="code/src/1.getting_started/hello_triangle/main.cpp"
+vkCmdSetViewport(frame.cmd, 0, 1, &viewport);
+vkCmdSetScissor(frame.cmd, 0, 1, &scissor);
+```
+
+The counts in `pViewportState` still matter even though the pointers are null: the
+pipeline needs to know there is one of each.
+
+The viewport's `minDepth` and `maxDepth` of 0 to 1 are Vulkan's depth range again.
+
+## The pipeline layout
+
+```cpp title="code/src/1.getting_started/hello_triangle/main.cpp"
+const VkPipelineLayoutCreateInfo layout_info{
+    .setLayoutCount = 0,
+    .pushConstantRangeCount = 0,
+};
+```
+
+The layout declares what external data the shaders can see — descriptor sets and push
+constants. This shader reads nothing at all, so the layout is empty. It still has to
+exist, and it comes into its own in chapter 1.10.
+
+## No render pass
+
+```cpp title="code/src/1.getting_started/hello_triangle/main.cpp"
+const VkPipelineRenderingCreateInfo rendering_info{
+    .colorAttachmentCount = 1,
+    .pColorAttachmentFormats = &format_,
+    .depthAttachmentFormat = VK_FORMAT_UNDEFINED,
+};
+
+const VkGraphicsPipelineCreateInfo pipeline_info{
+    .pNext = &rendering_info,
+    // ...
+    .renderPass = VK_NULL_HANDLE,
+};
+```
+
+With dynamic rendering there is no `VkRenderPass` for the pipeline to be compatible
+with, so it is told the attachment formats directly.
+
+:::caution[These must match]
+The formats here must match the `VkRenderingInfo` used at draw time. A mismatch means
+nothing is drawn, and validation's complaint about render pass compatibility is not
+obvious the first time you read it.
+:::
+
+Once the pipeline exists, the shader modules have been consumed and can be destroyed
+immediately.
+
+## The draw
+
+```cpp title="code/src/1.getting_started/hello_triangle/main.cpp"
+vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
+vkCmdSetViewport(frame.cmd, 0, 1, &viewport);
+vkCmdSetScissor(frame.cmd, 0, 1, &scissor);
+vkCmdDraw(frame.cmd, 3, 1, 0, 0);
+```
+
+Three vertices, one instance, starting at vertex 0 and instance 0. The vertex shader
+runs three times, the triangle is rasterised, and the fragment shader runs once per
+covered pixel.
+
+After six chapters of setup, that is the draw call.
+
+## Running it
+
+```bash
+./code/out/build/linux-debug/bin/1.7.hello_triangle
+```
+
+A triangle with a red apex, green bottom-right and blue bottom-left, blending smoothly
+between them. Resize the window — the triangle scales with it, because the viewport is
+dynamic and no pipeline rebuild is needed.
+
+## What you have built
+
+Worth taking stock. The program now:
+
+- opens a window and handles its events
+- creates an instance with validation layers and a debug messenger
+- selects a GPU and creates a device with the features it needs
+- builds a swapchain and rebuilds it when the window changes
+- records command buffers, transitions image layouts, and renders
+- keeps the CPU and GPU working simultaneously with correct synchronisation
+- compiles shaders, builds a pipeline, and draws
+
+That is the foundation. Everything from here — textures, lighting, shadows, PBR — is
+built on exactly this.
+
+:::note[From the next chapter, `vkcommon`]
+Chapters 1.1 to 1.7 each built all of this by hand. From 1.8 onward the samples use a
+shared library, `vkcommon`, which contains precisely the code you have just read:
+`Window`, `Context`, `Swapchain` and `FrameContext`.
+
+Nothing new is hidden in it. Each chapter states exactly which helper replaced the code
+it taught, and you can read any of it at `code/common/scaffold/`.
+:::
+
+## Exercises
+
+1. Change the vertex positions so the triangle is upside down. Convince yourself which
+   way y points.
+2. Make all three vertices the same colour and watch the gradient disappear — the
+   interpolation is still happening, between three identical values.
+3. Set `cullMode` to `VK_CULL_MODE_BACK_BIT`. The triangle vanishes or does not,
+   depending on its winding. Then reverse the vertex order and watch it flip.
+4. Add a second `vkCmdDraw` after the first. Nothing changes, because it draws the same
+   three vertices in the same place. Making the second one useful is what push
+   constants are for, in 1.10.
+5. Set `polygonMode` to `VK_POLYGON_MODE_LINE` for a wireframe. Note this needs the
+   `fillModeNonSolid` feature enabled at device creation — validation will tell you so
+   if you forget, which is a good demonstration of why features are opt-in.

@@ -46,8 +46,11 @@ function(_lvk_compile_shaders target chapter_id)
     add_dependencies(${target} ${target}_shaders)
 endfunction()
 
+# NO_SCAFFOLD marks a chapter that builds Vulkan by hand rather than using vkcommon.
+# Chapters 1.1 to 1.7 all pass it: they are the chapters that write the scaffold, so
+# linking it would be circular and would hide the very code the article is about.
 function(add_chapter chapter_id)
-    cmake_parse_arguments(ARG "" "" "SOURCES;SHADERS;LIBS" ${ARGN})
+    cmake_parse_arguments(ARG "NO_SCAFFOLD" "" "SOURCES;SHADERS;LIBS" ${ARGN})
 
     if(NOT ARG_SOURCES)
         message(FATAL_ERROR "add_chapter(${chapter_id}) requires SOURCES")
@@ -61,7 +64,11 @@ function(add_chapter chapter_id)
         OUTPUT_NAME "${chapter_id}"
         FOLDER "chapters")
 
-    target_link_libraries(${target} PRIVATE vkcommon ${ARG_LIBS})
+    if(ARG_NO_SCAFFOLD)
+        target_link_libraries(${target} PRIVATE vkbase ${ARG_LIBS})
+    else()
+        target_link_libraries(${target} PRIVATE vkcommon ${ARG_LIBS})
+    endif()
 
     # Each sample knows its own id so it can locate its compiled shaders.
     target_compile_definitions(${target} PRIVATE LVK_CHAPTER_ID="${chapter_id}")

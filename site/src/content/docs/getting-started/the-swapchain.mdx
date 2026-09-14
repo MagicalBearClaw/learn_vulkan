@@ -1,0 +1,207 @@
+---
+title: The Swapchain
+description: Negotiating format, present mode and size with the window system, and handling the fact that swapchains expire.
+sidebar:
+  order: 4
+---
+
+The swapchain is the set of images the window system will actually display, plus the
+rules for passing them back and forth. You do not create the images — the presentation
+engine owns them and lends them to you one at a time.
+
+Three decisions define it, and each is a negotiation with what the surface genuinely
+supports rather than a preference you can simply state.
+
+## Why images are borrowed
+
+If the program drew straight into the image being scanned out to the display, you would
+see it being drawn — the top of the screen showing the new frame while the bottom still
+shows the old one. That is tearing.
+
+So there are several images. You draw into one while another is displayed, then swap.
+Two images is double buffering; three is triple buffering. The swapchain is the object
+that owns that set and the swapping policy, and because the display hardware is
+involved, *it* decides when you may have an image back.
+
+## Choosing a format
+
+```cpp title="code/src/1.getting_started/the_swapchain/main.cpp"
+for (const VkSurfaceFormatKHR& candidate : available) {
+    const bool wanted = candidate.format == VK_FORMAT_B8G8R8A8_SRGB ||
+                        candidate.format == VK_FORMAT_R8G8B8A8_SRGB;
+    if (wanted && candidate.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+        return candidate;
+    }
+}
+return available.front();
+```
+
+We want eight bits per channel in an **sRGB** format. This matters more than it looks.
+
+Monitors do not respond linearly to pixel values: 128 is not half as bright as 255, it
+is closer to a fifth. Lighting mathematics, on the other hand, only works in linear
+space — adding two lights together means adding their actual energies. So a correct
+renderer computes in linear space and converts to sRGB on the way out.
+
+Choosing an `_SRGB` format makes the hardware do that conversion automatically as it
+writes. Choosing `_UNORM` instead means writing linear values straight to the display,
+and every image in this series would come out noticeably too dark. The gamma chapter
+returns to this properly; for now, it is the right default and it is free.
+
+`colorSpace` is a separate field describing how the *display* should interpret the
+values, and pairing sRGB-nonlinear with an sRGB format is the ordinary case. HDR output
+is where the two start to diverge.
+
+## Choosing a present mode
+
+This decides what happens when frames are produced faster than the display consumes
+them.
+
+| Mode | Behaviour | Tearing | Latency |
+|---|---|---|---|
+| `FIFO` | Frames queue; one shown per refresh | No | Highest |
+| `FIFO_RELAXED` | As FIFO, but a late frame is shown immediately | If late | High |
+| `MAILBOX` | A waiting frame is *replaced* by a newer one | No | Low |
+| `IMMEDIATE` | Shown the instant it is ready | Yes | Lowest |
+
+```cpp title="code/src/1.getting_started/the_swapchain/main.cpp"
+const bool has_mailbox =
+    std::ranges::find(available, VK_PRESENT_MODE_MAILBOX_KHR) != available.end();
+return has_mailbox ? VK_PRESENT_MODE_MAILBOX_KHR : VK_PRESENT_MODE_FIFO_KHR;
+```
+
+`FIFO` is the only mode every implementation is required to support — it is the safe
+fallback and it is what "v-sync on" means. `MAILBOX` gives the same no-tearing
+guarantee with lower latency, at the cost of rendering frames that are then thrown
+away. On a desktop that is a good trade; on a laptop running on battery it is wasted
+power, which is why a real application makes this a setting.
+
+## Choosing a size
+
+```cpp title="code/src/1.getting_started/the_swapchain/main.cpp"
+if (caps.currentExtent.width != UINT32_MAX) {
+    return caps.currentExtent;
+}
+return VkExtent2D{
+    .width = std::clamp(window_size.width, caps.minImageExtent.width,
+                        caps.maxImageExtent.width),
+    // ...
+};
+```
+
+A `currentExtent` of `0xFFFFFFFF` is the window system saying "you decide"; anything
+else is it saying "this is the size, take it". When we do get to choose, the window's
+**pixel** size — from chapter 1.1 — is clamped into the supported range.
+
+## How many images
+
+```cpp title="code/src/1.getting_started/the_swapchain/main.cpp"
+uint32_t image_count = caps.minImageCount + 1;
+if (caps.maxImageCount > 0 && image_count > caps.maxImageCount) {
+    image_count = caps.maxImageCount;
+}
+```
+
+One more than the minimum, so the CPU always has an image to draw into while the
+presentation engine is busy with another. Asking for exactly the minimum can mean
+blocking in `vkAcquireNextImageKHR` every single frame.
+
+A `maxImageCount` of `0` means there is no upper limit — not that zero images are
+allowed. This trips people up.
+
+## Usage flags
+
+```cpp title="code/src/1.getting_started/the_swapchain/main.cpp"
+.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+              VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+              VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+```
+
+You must declare every use in advance. `COLOR_ATTACHMENT` to render into them,
+`TRANSFER_DST` so a later chapter can blit a finished offscreen image on instead of
+rendering directly, and `TRANSFER_SRC` so a screenshot can be copied back out.
+
+Omitting a flag and then using the image that way is a validation error — and it is one
+this project hit while being written. The screenshot tooling failed with *"requires
+`VK_IMAGE_USAGE_2_TRANSFER_SRC_BIT`"* until the flag was added here.
+
+## Image views
+
+```cpp title="code/src/1.getting_started/the_swapchain/main.cpp"
+const VkImageViewCreateInfo view_info{
+    .image = images_[i],
+    .viewType = VK_IMAGE_VIEW_TYPE_2D,
+    .format = format_,
+    .subresourceRange = {
+        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+        .baseMipLevel = 0, .levelCount = 1,
+        .baseArrayLayer = 0, .layerCount = 1,
+    },
+};
+```
+
+A `VkImage` cannot be used directly. A **view** says which part of it to use and how to
+interpret the bits — which mip levels, which array layers, which format. Here it is
+all of a simple 2D colour image, so the view looks like pure ceremony, but views are
+what make one image usable as several things: a cubemap read as six 2D layers, one mip
+level of a chain, a depth image read as a texture.
+
+The images belong to the swapchain and are freed with it. The views belong to us and
+must be destroyed.
+
+## Swapchains expire
+
+This is the part that catches people out. A swapchain is **not permanent**. Resize the
+window, move it to a monitor with a different scale factor, or change display settings,
+and it becomes invalid. Vulkan reports this as `VK_ERROR_OUT_OF_DATE_KHR` from
+`vkAcquireNextImageKHR` or `vkQueuePresentKHR`.
+
+`VK_SUBOPTIMAL_KHR` is the softer version: it still works, but no longer matches the
+surface properly.
+
+```cpp title="code/src/1.getting_started/the_swapchain/main.cpp"
+void recreate_swapchain() {
+    VK_CHECK(vkDeviceWaitIdle(device_));
+    destroy_swapchain();
+    create_swapchain();
+}
+```
+
+Rebuilding is a normal part of running, not an error path — which is why it is built in
+from the chapter the swapchain first appears in rather than bolted on later.
+
+`vkDeviceWaitIdle` is the blunt instrument: nothing may be destroyed while the GPU might
+still be reading it, and waiting for the entire device is the simplest way to guarantee
+that. It also stalls completely. A later chapter does it without the stall, using the
+`oldSwapchain` field we are currently leaving null.
+
+## Running it
+
+```
+[info] Swapchain:
+[info]   3 images at 1712x1389
+[info]   format: VK_FORMAT_R8G8B8A8_SRGB
+[info]   present mode: MAILBOX
+```
+
+Three images, not the two we asked for — the driver gave us more, which it is entitled
+to do. Still nothing on screen: the images exist but nothing has been recorded into
+them.
+
+Resize the window and watch the swapchain rebuild each time. On a Wayland compositor
+with fractional scaling you will often see two rebuilds in quick succession at
+start-up, as the compositor settles on a final size.
+
+## Exercises
+
+1. Print every supported format and present mode. Most surfaces support four or five
+   modes and a surprising number of formats.
+2. Force `VK_PRESENT_MODE_IMMEDIATE_KHR`. There is nothing animated yet, so save this
+   one for chapter 1.5 — then you can watch it tear.
+3. Request `caps.minImageCount` exactly instead of one more, and note the image count
+   in the log. The consequence only becomes visible once there is a frame loop.
+4. Pick a `_UNORM` format instead of `_SRGB`. Nothing appears to change yet — but make
+   a note, because in chapter 1.5 the clear colour will be visibly wrong.
+
+Next: [command buffers](/getting-started/command-buffers/) — and the first thing you
+will actually see.

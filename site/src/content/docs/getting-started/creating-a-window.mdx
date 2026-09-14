@@ -1,0 +1,142 @@
+---
+title: Creating a Window
+description: Opening a window with SDL3 and running an event loop - the foundation every later chapter sits on.
+sidebar:
+  order: 1
+---
+
+No Vulkan in this chapter. Before anything can be drawn there has to be somewhere to
+draw it and a way to know when the user wants to stop, and it is worth getting that
+out of the way on its own rather than tangled up with the API we are here to learn.
+
+## Why a library at all
+
+Creating a window is an operating system job, and every operating system disagrees
+about how. Win32 wants a registered window class and a message pump. X11 wants a
+display connection and an event mask. Wayland wants a compositor handshake. None of
+this is graphics, and all of it is tedious.
+
+We use **SDL3**, which covers all three behind one interface and knows how to hand
+Vulkan a surface later. The alternative in most Vulkan material is GLFW, which would
+work equally well; SDL3 is chosen here because the later chapters want its audio and
+gamepad support for the 2D game, and one dependency is better than two.
+
+## Starting SDL
+
+```cpp title="code/src/1.getting_started/creating_a_window/main.cpp"
+if (!SDL_Init(SDL_INIT_VIDEO)) {
+    throw std::runtime_error(std::format("SDL_Init failed: {}", SDL_GetError()));
+}
+```
+
+We ask only for video. SDL3 returns `true` on success — note that this is the opposite
+of SDL2, which returned `0`, and it is an easy thing to get backwards when adapting
+older examples.
+
+## Creating the window
+
+```cpp title="code/src/1.getting_started/creating_a_window/main.cpp"
+window_ = SDL_CreateWindow("LearnVulkan - Creating a Window",
+                           static_cast<int>(args.width),
+                           static_cast<int>(args.height),
+                           SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
+```
+
+Two flags matter.
+
+`SDL_WINDOW_VULKAN` tells SDL to load the Vulkan loader and prepare the window so a
+`VkSurfaceKHR` can be created from it in chapter 1.3. Nothing Vulkan happens yet, but
+asking now saves recreating the window later — the flag cannot be added afterwards.
+
+`SDL_WINDOW_RESIZABLE` is a decision with consequences. A resizable window means the
+swapchain can be invalidated at any moment, and every chapter from 1.4 onward has to
+cope with that. It would be easier to leave it out. It would also mean building a
+renderer that falls over the first time someone drags a corner, so we handle it
+properly from the start.
+
+## Pixels are not points
+
+```cpp
+int width = 0, height = 0;
+SDL_GetWindowSizeInPixels(window_, &width, &height);
+```
+
+On a display with a scale factor — a HiDPI laptop, or a Wayland compositor applying
+fractional scaling — the window's *size* and its *drawable size in pixels* are
+different numbers. A window 1280 points wide might be 1712 pixels wide.
+
+The swapchain needs **pixels**. Using `SDL_GetWindowSize` instead of
+`SDL_GetWindowSizeInPixels` gives an image at the wrong resolution that the compositor
+then rescales, and the result looks slightly soft in a way that is genuinely hard to
+diagnose later. Use the pixel size, always.
+
+## The event loop
+
+```cpp title="code/src/1.getting_started/creating_a_window/main.cpp"
+SDL_Event event;
+while (SDL_PollEvent(&event)) {
+    switch (event.type) {
+        case SDL_EVENT_QUIT:
+        case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+            running = false;
+            break;
+        case SDL_EVENT_KEY_DOWN:
+            if (event.key.key == SDLK_ESCAPE) {
+                running = false;
+            }
+            break;
+        default:
+            break;
+    }
+}
+```
+
+The inner `while` matters. Events queue up while the program is busy, and draining the
+entire queue every frame — rather than handling one and moving on — is what keeps the
+window responsive. Leave events in the queue and the compositor eventually decides the
+application has hung.
+
+`SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED` is only logged here. From chapter 1.4 it becomes
+the signal to rebuild the swapchain, which is why it is wired up now.
+
+## Destruction order
+
+```cpp title="code/src/1.getting_started/creating_a_window/main.cpp"
+~WindowApp() {
+    if (window_ != nullptr) {
+        SDL_DestroyWindow(window_);
+    }
+    SDL_Quit();
+}
+```
+
+Destroy in the reverse of the order things were created. SDL is forgiving about this.
+Vulkan is not even slightly forgiving about it, and by chapter 1.6 the destructor has
+nine things in it that must be released in exactly the right order. Forming the habit
+here costs nothing.
+
+## Running it
+
+```bash
+cmake --build code/out/build/linux-debug
+./code/out/build/linux-debug/bin/1.1.creating_a_window
+```
+
+You get a window containing garbage — whatever the compositor last had in that memory.
+That is correct. Nothing has drawn anything, so nothing has defined what should be
+there. The first chapter that puts a known colour on screen is 1.5.
+
+Resize it and watch the log report the new pixel size.
+
+## Exercises
+
+1. Print the window size *and* the pixel size side by side. On a HiDPI display they
+   differ; on a 1:1 display they do not. Knowing which you have will save confusion in
+   1.4.
+2. Handle `SDL_EVENT_WINDOW_FOCUS_LOST` and `SDL_EVENT_WINDOW_FOCUS_GAINED`, logging
+   each. Later, a real application would throttle rendering while unfocused.
+3. Make <kbd>F11</kbd> toggle fullscreen with `SDL_SetWindowFullscreen`. Watch how many
+   pixel-size-changed events one toggle produces — more than you would guess, which is
+   why swapchain recreation has to be cheap and idempotent.
+
+Next: [the instance](/getting-started/the-instance/), where Vulkan finally starts.

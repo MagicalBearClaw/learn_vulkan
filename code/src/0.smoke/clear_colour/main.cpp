@@ -29,7 +29,9 @@ protected:
         // Two sine waves a third of a cycle apart give a slow, obvious colour
         // cycle -- obvious enough that a frozen frame is easy to spot.
         constexpr float kTwoThirdsPi = 2.0F * std::numbers::pi_v<float> / 3.0F;
-        const float t = elapsed();
+        // Driven by the frame counter rather than the clock, so frame N always has
+        // the same colour and tools/capture.py can diff screenshots meaningfully.
+        const float t = static_cast<float>(frame.frame_number) / 50.0F;
 
         const VkClearValue clear{
             .color = {{0.5F + 0.5F * std::sin(t),

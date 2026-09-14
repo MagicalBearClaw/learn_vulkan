@@ -1,0 +1,226 @@
+---
+title: Synchronisation
+description: Semaphores, fences and frames in flight - making the CPU and GPU work at the same time instead of taking turns.
+sidebar:
+  order: 6
+---
+
+Chapter 1.5 ended every frame by waiting for the GPU to go completely idle. Correct,
+and slow: the CPU sat still while the GPU worked, then the GPU sat still while the CPU
+worked.
+
+```
+CPU  [record][wait............][record][wait............]
+GPU  [......][execute.........][......][execute.........]
+```
+
+This chapter fixes that. Nothing on screen changes — the improvement is entirely in how
+the two halves of the machine share the work.
+
+## Stop asking, start ordering
+
+The wait in 1.5 was the CPU asking *"has the GPU finished?"*. The fix is to stop asking
+and instead say *"do this after that"*, so the ordering happens on the GPU with the CPU
+never involved.
+
+Vulkan gives two tools, and the difference between them is **who waits**:
+
+| | Orders | Can the CPU wait on it? |
+|---|---|---|
+| **`VkSemaphore`** | GPU work against other GPU work | No — and it cannot read its state either |
+| **`VkFence`** | GPU work against the CPU | Yes, that is its entire purpose |
+
+A frame needs both. Semaphores chain acquire → render → present without the CPU
+participating. A fence tells the CPU when a frame's command buffer is free to be
+re-recorded.
+
+## Frames in flight
+
+If there is one command buffer, the CPU must wait for the GPU before recording the next
+frame — because re-recording a buffer the GPU is still reading is a data race.
+
+The answer is more than one of everything:
+
+```cpp title="code/src/1.getting_started/synchronisation/main.cpp"
+constexpr uint32_t kFramesInFlight = 2;
+
+struct PerFrame {
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    VkSemaphore image_available = VK_NULL_HANDLE;
+    VkFence in_flight = VK_NULL_HANDLE;
+};
+```
+
+With two sets, the CPU records frame N+1 while the GPU still works on frame N:
+
+```
+CPU  [record N][record N+1][record N+2][record N+3]
+GPU           [execute N  ][execute N+1][execute N+2]
+```
+
+Why two? One means the CPU waits every frame, which is chapter 1.5. Three or more adds
+latency — an input is a further frame old by the time it is displayed — without buying
+throughput on a v-synced target. Two is the usual answer.
+
+## The signalled fence trick
+
+```cpp title="code/src/1.getting_started/synchronisation/main.cpp"
+const VkFenceCreateInfo fence_info{
+    .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+    .pNext = nullptr,
+    .flags = VK_FENCE_CREATE_SIGNALED_BIT,
+};
+```
+
+The frame loop begins by waiting on this fence. On the very first frame nothing has
+been submitted, so an unsignalled fence would mean waiting forever for something that
+never happened. Creating it already signalled makes the first wait pass straight
+through.
+
+This is a small detail that causes a total hang, with no error message, if you miss it.
+
+## One semaphore per image, not per frame
+
+```cpp title="code/src/1.getting_started/synchronisation/main.cpp"
+std::vector<VkSemaphore> render_finished_;  // one per swapchain image
+```
+
+The `image_available` semaphore belongs to the frame slot. The `render_finished` one
+belongs to the **swapchain image**, and mixing this up is a genuinely easy mistake.
+
+The semaphore a present operation waits on must stay untouched until that present has
+actually happened. Presents complete in swapchain-image order, not in frame-slot order,
+and the counts differ — we have two frame slots and three images. Reusing a frame's
+semaphore therefore lets you signal one that a pending present is still waiting on.
+
+The validation layers catch it, but only sometimes, and typically only under load. It
+is worth getting right by construction.
+
+This is also why swapchain recreation has to rebuild them:
+
+```cpp title="code/src/1.getting_started/synchronisation/main.cpp"
+destroy_swapchain();
+create_swapchain();
+destroy_image_semaphores();
+create_image_semaphores();
+```
+
+The image count can change when the swapchain is rebuilt.
+
+## The frame
+
+```cpp title="code/src/1.getting_started/synchronisation/main.cpp"
+PerFrame& frame = frames_[frame_number_ % kFramesInFlight];
+
+VK_CHECK(vkWaitForFences(device_, 1, &frame.in_flight, VK_TRUE, UINT64_MAX));
+```
+
+This waits for the GPU to finish the *previous frame that used this slot* — not the
+frame immediately before this one. With two slots that is two frames ago, which is
+exactly why it usually does not block at all.
+
+```cpp title="code/src/1.getting_started/synchronisation/main.cpp"
+vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX,
+                      frame.image_available, VK_NULL_HANDLE, &image_index);
+```
+
+Acquire signals a **semaphore** this time, not a fence. The CPU does not need to know
+when the image is ready — the GPU does, and it will wait on this semaphore before
+writing any colour.
+
+### Reset only once a submit is certain
+
+```cpp title="code/src/1.getting_started/synchronisation/main.cpp"
+if (acquired == VK_ERROR_OUT_OF_DATE_KHR) {
+    recreate_swapchain();
+    return;
+}
+// ...
+VK_CHECK(vkResetFences(device_, 1, &frame.in_flight));
+```
+
+The reset comes *after* the early return, and the order is load-bearing. Reset the fence
+and then return without submitting, and the fence is left unsignalled with no work
+pending to signal it — the next frame in this slot waits forever.
+
+This is a real deadlock that is easy to introduce by tidying the code.
+
+### Wait at the right stage
+
+```cpp title="code/src/1.getting_started/synchronisation/main.cpp"
+const VkSemaphoreSubmitInfo wait{
+    .semaphore = frame.image_available,
+    .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+};
+```
+
+The GPU waits on the acquire semaphore, but only at `COLOR_ATTACHMENT_OUTPUT` — the
+stage that actually writes colour. Vertex shading and everything earlier in the
+pipeline can proceed before the image is ready.
+
+Waiting at `ALL_COMMANDS` instead would be correct and would needlessly serialise the
+frame. Choosing the narrowest stage that is still correct is what these masks are for.
+
+### Submit and present
+
+```cpp title="code/src/1.getting_started/synchronisation/main.cpp"
+VK_CHECK(vkQueueSubmit2(queue_, 1, &submit, frame.in_flight));
+
+const VkPresentInfoKHR present{
+    .waitSemaphoreCount = 1,
+    .pWaitSemaphores = &render_finished_[image_index],
+    // ...
+};
+vkQueuePresentKHR(queue_, &present);
+```
+
+The submission waits on `image_available`, signals `render_finished`, and signals the
+fence when it completes. Present waits on `render_finished` — on the GPU side.
+
+The CPU blocks nowhere in this sequence. It goes straight back to the event loop and
+starts recording the next frame.
+
+## The complete picture
+
+```
+acquire ──signals──> image_available ──waited by──> submit
+                                                      │
+                                                      ├─signals─> render_finished ──waited by──> present
+                                                      │
+                                                      └─signals─> in_flight fence ──waited by──> CPU, two frames later
+```
+
+Three dependencies. Two live entirely on the GPU; only the third involves the CPU, and
+it is the one that usually does not block.
+
+## Running it
+
+```bash
+./code/out/build/linux-debug/bin/1.6.synchronisation
+```
+
+Visually identical to 1.5. That is the point — the same image, with both halves of the
+machine working at once.
+
+:::note[Measuring the difference]
+On a v-synced swapchain both versions sit at the refresh rate, so the gain is invisible
+until you look for it. Run with `--present-mode immediate` if you added that exercise,
+or put a deliberately heavy workload in the frame, and the difference becomes obvious.
+Profiling properly is its own chapter in part 7.
+:::
+
+## Exercises
+
+1. Set `kFramesInFlight` to `1` and confirm you have rebuilt chapter 1.5's behaviour —
+   the CPU waits on the fence it just submitted.
+2. Remove `VK_FENCE_CREATE_SIGNALED_BIT` and run. The program hangs immediately on the
+   first frame, with no error. Worth seeing once so you recognise it.
+3. Make `render_finished_` per-frame rather than per-image. It will probably appear to
+   work. Resize the window repeatedly and watch for validation complaints — this is the
+   kind of bug that only shows up under load, which is why it is worth avoiding by
+   construction.
+4. Widen the submit's `stageMask` to `VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT`. Still
+   correct, slightly more serialised.
+
+Next: [Hello Triangle](/getting-started/hello-triangle/) — at last.

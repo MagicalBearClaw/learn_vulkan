@@ -30,12 +30,13 @@ except the appendix that explains why older code has them.
 ## Commands
 
 ```bash
-# Build (Linux, system packages)
-cmake --preset linux-debug
+# Build (Linux, system packages). CMakePresets.json lives in code/, so the
+# configure step must run from there; the build path is relative to it.
+cd code && cmake --preset linux-debug
 cmake --build code/out/build/linux-debug
 
 # Build (Windows, vcpkg)
-cmake --preset x64-debug
+cd code && cmake --preset x64-debug
 cmake --build code/out/build/x64-debug
 
 # Run a sample

@@ -1,0 +1,240 @@
+---
+title: Devices and Queues
+description: Finding a GPU, choosing a queue family, creating a logical device, and setting up memory allocation.
+sidebar:
+  order: 3
+---
+
+Three new ideas here, and they are the ones that make Vulkan feel genuinely different
+from what came before.
+
+| | |
+|---|---|
+| **`VkPhysicalDevice`** | A GPU that exists in the machine. You do not create it; you enumerate it and ask it questions. |
+| **Queue family** | A group of queues that can do the same kinds of work. Commands are never "executed" — they are submitted to a queue. |
+| **`VkDevice`** | Your connection to one physical device, with exactly the features you asked for switched on and nothing else. |
+
+## The surface comes first
+
+```cpp title="code/src/1.getting_started/devices_and_queues/main.cpp"
+if (!SDL_Vulkan_CreateSurface(window_, instance_, nullptr, &surface_)) {
+    throw std::runtime_error(
+        std::format("SDL_Vulkan_CreateSurface failed: {}", SDL_GetError()));
+}
+```
+
+A `VkSurfaceKHR` is the bridge between Vulkan and the window system. It belongs to the
+*instance*, not to a device, and it has to exist before we pick a GPU — because "can
+this GPU present to this surface?" is one of the questions we are about to ask.
+
+In a machine with a discrete GPU and integrated graphics, it is entirely possible for
+one of them to be unable to present to a given window. Vulkan makes you check.
+
+## Enumerating GPUs
+
+```cpp title="code/src/1.getting_started/devices_and_queues/main.cpp"
+uint32_t count = 0;
+VK_CHECK(vkEnumeratePhysicalDevices(instance_, &count, nullptr));
+std::vector<VkPhysicalDevice> devices(count);
+VK_CHECK(vkEnumeratePhysicalDevices(instance_, &count, devices.data()));
+```
+
+This two-call pattern is everywhere in Vulkan: call once with a null pointer to learn
+the count, size your storage, call again to fill it. You will write it a dozen more
+times before the series is out.
+
+A `VkPhysicalDevice` is a handle to something that already exists. There is no
+`vkCreatePhysicalDevice`, and you never destroy one.
+
+## Deciding which GPU is suitable
+
+Suitability is not a single answer — it depends on what your program needs. Ours needs
+three things:
+
+```cpp title="code/src/1.getting_started/devices_and_queues/main.cpp"
+if (props.apiVersion < VK_API_VERSION_1_3) { /* reject */ }
+if (!device_supports_extensions(candidate)) { /* reject */ }
+const std::optional<uint32_t> family = find_universal_queue_family(candidate, surface_);
+if (!family.has_value()) { /* reject */ }
+```
+
+Vulkan 1.3 for dynamic rendering and `synchronization2`; `VK_KHR_swapchain` to present
+at all; and a queue family that can do the work. Among the survivors we prefer a
+discrete GPU over an integrated one.
+
+Note that the rejections are collected into a message rather than discarded. "No
+suitable GPU found" is a maddening error; "your GPU reports Vulkan 1.2, needs 1.3" is
+one you can act on.
+
+## Queue families
+
+This is the part with no OpenGL equivalent.
+
+A GPU exposes one or more **queue families**. Each family supports some combination of
+graphics, compute, transfer and sparse operations, and contains some number of
+individual queues. Work is submitted to a queue and executes asynchronously; the queue
+is the unit of execution, and there is no "current" one.
+
+Real hardware typically offers something like: one general family that does
+everything, a compute-only family, and a transfer-only family backed by a dedicated
+DMA engine. Using the specialised ones is a genuine optimisation — a texture upload on
+the transfer queue does not compete with rendering.
+
+It also means **queue family ownership transfers**: a resource written by one family
+and read by another needs explicit barriers handing it over, and getting those wrong
+produces corruption that appears only on some hardware.
+
+```cpp title="code/src/1.getting_started/devices_and_queues/main.cpp"
+constexpr VkQueueFlags wanted = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT;
+if ((families[i].queueFlags & wanted) != wanted) {
+    continue;
+}
+VkBool32 can_present = VK_FALSE;
+VK_CHECK(vkGetPhysicalDeviceSurfaceSupportKHR(gpu, i, surface, &can_present));
+```
+
+So this series uses **one queue that does everything**. Every desktop GPU offers such a
+family, and it removes an entire category of bug from the next fifty chapters. Multiple
+queues get their own chapter much later, once there is something worth optimising.
+
+Notice that presentation support is queried separately. A family that can draw does not
+necessarily have any way to get pixels onto *this* surface; they are independent
+questions and Vulkan makes you ask both.
+
+:::note[`VK_QUEUE_TRANSFER_BIT` is implied]
+Any family with graphics or compute support can do transfers, whether or not it
+advertises the bit. Only transfer-*only* families are required to set it.
+:::
+
+## Creating the logical device
+
+The `VkDevice` is where you state what you actually want.
+
+```cpp title="code/src/1.getting_started/devices_and_queues/main.cpp"
+VkPhysicalDeviceVulkan13Features features13{};
+features13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+features13.synchronization2 = VK_TRUE;
+features13.dynamicRendering = VK_TRUE;
+
+VkPhysicalDeviceVulkan12Features features12{};
+features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+features12.pNext = &features13;
+features12.bufferDeviceAddress = VK_TRUE;
+features12.descriptorIndexing = VK_TRUE;
+
+VkPhysicalDeviceFeatures2 features2{};
+features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+features2.pNext = &features12;
+features2.features.samplerAnisotropy = VK_TRUE;
+```
+
+That is the `pNext` chain from 1.2, used in anger: three structs linked together and
+passed as one.
+
+**Features are opt-in, and using one you did not enable is undefined behaviour rather
+than an error.** These structs have dozens of fields each, so they are value-initialised
+to all-false and only the wanted ones switched on. Asking for everything would be a
+mistake: some features cost performance merely by being enabled, and some drivers will
+refuse device creation over a feature the hardware cannot provide.
+
+The four enabled here are exactly what the series is built on:
+
+- `dynamicRendering` — no `VkRenderPass` or `VkFramebuffer`, ever
+- `synchronization2` — the barrier form used from 1.5
+- `bufferDeviceAddress` — shaders can hold raw GPU pointers, used from part 4
+- `descriptorIndexing` — bindless textures, used from part 3
+
+```cpp title="code/src/1.getting_started/devices_and_queues/main.cpp"
+const VkDeviceCreateInfo create_info{
+    .pNext = &features2,
+    // ...
+    .pEnabledFeatures = nullptr,   // must be null when features2 is chained
+};
+```
+
+:::caution[`pEnabledFeatures` must be null]
+If you chain a `VkPhysicalDeviceFeatures2` onto `pNext`, the older `pEnabledFeatures`
+pointer must be null. Setting both is invalid, and it is a mistake worth knowing about
+because half the Vulkan examples online use the older field.
+:::
+
+Also note `enabledLayerCount = 0`. Device-level layers stopped existing in Vulkan
+1.0.13; the instance layer covers the device too. Plenty of older tutorials still set
+this, harmlessly but pointlessly.
+
+## Loading device functions — the trap
+
+```cpp title="code/src/1.getting_started/devices_and_queues/main.cpp"
+VK_CHECK(vkCreateDevice(gpu_, &create_info, nullptr, &device_));
+
+volkLoadDevice(device_);
+
+vkGetDeviceQueue(device_, queue_family_, 0, &queue_);
+```
+
+The order of those three lines is not stylistic. `vkGetDeviceQueue` is a device-level
+function, and every device-level function pointer is null until `volkLoadDevice` runs.
+Call it first and you jump to address zero — a segfault with an empty stack trace and
+no clue as to the cause.
+
+Beyond making the call legal, `volkLoadDevice` also switches every function to the
+device's own entry points, skipping the loader's dispatch-table indirection on every
+call for the rest of the program's life.
+
+Queues are not created individually. You ask a family for a number of them and Vulkan
+hands them over as part of the device; `vkGetDeviceQueue` just retrieves a handle to
+one that already exists.
+
+## Memory allocation
+
+```cpp title="code/src/1.getting_started/devices_and_queues/main.cpp"
+VmaVulkanFunctions functions{};
+functions.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
+functions.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
+```
+
+Vulkan's memory API will allocate a block when asked. It will not decide which *kind*
+of memory a texture belongs in, sub-allocate out of that block, or reorganise when you
+run out. Drivers also permit relatively few large allocations — often around 4096 —
+so allocating per-resource is not viable.
+
+The [Vulkan Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator)
+solves this properly and is what most shipping engines use. Writing one yourself
+teaches you about allocators, not about graphics.
+
+VMA has to be told where the entry points live, because volk has taken them out of the
+global namespace. This is the one piece of wiring the combination requires.
+
+## Running it
+
+```
+[info] Found 1 physical device(s):
+[info]   NVIDIA GeForce RTX 4080 (discrete GPU)
+[info] Chose NVIDIA GeForce RTX 4080 (discrete GPU)
+[info]   driver Vulkan 1.4.341
+[info]   universal queue family: 0
+[info]   memory heaps:
+[info]     heap 0: 16376 MiB (device local)
+[info]     heap 1: 23868 MiB
+[info]     heap 2: 246 MiB (device local)
+```
+
+Those heaps are worth a look. Heap 0 is GPU memory — fast for the GPU, invisible to the
+CPU. Heap 1 is system RAM the GPU can reach over PCIe, slower but writable directly by
+the CPU. Heap 2, small and device-local, is the resizable BAR window: GPU memory the
+CPU *can* write to. Which heap a resource belongs in is the decision VMA makes for us,
+and it is the subject of chapter 1.8.
+
+## Exercises
+
+1. Print every queue family with its flags and queue count. Compare a discrete GPU with
+   integrated graphics if you have both.
+2. Deliberately request a feature your GPU lacks — `sparseBinding`, say, or
+   `shaderFloat64` — and watch `vkCreateDevice` fail. Then use
+   `vkGetPhysicalDeviceFeatures2` to check first, which is what a real application does.
+3. Change `score_device` to prefer integrated graphics and confirm the selection
+   changes. On a laptop this is a real decision: integrated is slower but much kinder
+   to the battery.
+
+Next: [the swapchain](/getting-started/the-swapchain/) — the images we will actually
+draw into.

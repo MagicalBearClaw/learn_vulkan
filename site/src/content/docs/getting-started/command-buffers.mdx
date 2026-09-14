@@ -1,0 +1,237 @@
+---
+title: Command Buffers
+description: Recording commands, image layout transitions, dynamic rendering, and the first pixels on screen.
+sidebar:
+  order: 5
+---
+
+Something finally appears on screen in this chapter.
+
+<figure>
+  <img src="/img/reference/1.5.command_buffers.png" alt="A window filled with a single flat colour" />
+  <figcaption>Chapter 1.5: a cleared window. Not much to look at, but every piece of machinery behind it is now in place.</figcaption>
+</figure>
+
+## Vulkan has no draw call
+
+There is no function that draws something now. You record commands into a
+`VkCommandBuffer`, then submit the whole buffer to a queue, and the GPU gets to it when
+it gets to it.
+
+Recording is ordinary CPU work: `vkCmdBeginRendering` and friends write bytes into a
+buffer and return. Nothing touches the GPU. **Submission** is the moment work crosses
+over, and from then on your program and the GPU are running independently.
+
+This gap is the biggest adjustment coming from OpenGL, where `glDrawArrays` at least
+pretends to draw. It is also the entire reason Vulkan scales across threads: recording
+has no shared state, so sixteen threads can record sixteen command buffers at once and
+one thread submits them.
+
+## Pools own the memory
+
+```cpp title="code/src/1.getting_started/command_buffers/main.cpp"
+const VkCommandPoolCreateInfo pool_info{
+    .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+    .queueFamilyIndex = queue_family_,
+};
+```
+
+A command buffer does not own its storage; a `VkCommandPool` does. Pools are tied to a
+queue family — a buffer recorded from a graphics pool cannot be submitted to a
+transfer-only queue.
+
+**Pools are not thread-safe.** Recording into two buffers from the same pool on two
+threads is a data race that Vulkan will not protect you from. The rule in a threaded
+renderer is one pool per thread; we have one thread and therefore one pool.
+
+`RESET_COMMAND_BUFFER_BIT` lets an individual buffer be reset and re-recorded rather
+than requiring the whole pool to be reset at once. We re-record the same buffer every
+frame, so that is what we want.
+
+```cpp title="code/src/1.getting_started/command_buffers/main.cpp"
+.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+```
+
+`PRIMARY` buffers can be submitted to a queue. `SECONDARY` ones cannot — they are
+called from a primary buffer, and exist so that several threads can record pieces of
+one render pass in parallel.
+
+## Image layouts
+
+This is the concept that produces more beginner validation errors than anything else in
+Vulkan.
+
+The arrangement of pixels in memory that is fast to *render into* is not the one that
+is fast to *sample from*, nor the one the display hardware wants to scan out. GPUs
+swizzle and compress image data, and the optimal scheme differs per use.
+
+Vulkan exposes this as **image layout**, and images never change layout on their own.
+You insert a barrier that says so.
+
+```cpp title="code/src/1.getting_started/command_buffers/main.cpp"
+const VkImageMemoryBarrier2 barrier{
+    .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+    .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+    .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+    .dstAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT,
+    .oldLayout = from,
+    .newLayout = to,
+    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+    .image = image,
+    // ...
+};
+```
+
+A barrier says two things at once:
+
+- **A layout transition** — rearrange the memory from `oldLayout` to `newLayout`.
+- **An execution and memory dependency** — the work described by `srcStageMask` and
+  `srcAccessMask` must finish, and be visible, before the work in `dstStageMask` and
+  `dstAccessMask` begins.
+
+`ALL_COMMANDS` on both sides is the sledgehammer: it means "everything before, then
+everything after", which is always correct and slower than necessary. A later chapter
+narrows these masks and measures the difference. Starting broad and tightening later is
+the right order — starting tight means debugging subtle race conditions while also
+learning the API.
+
+The two frames of a swapchain image look like this:
+
+```cpp title="code/src/1.getting_started/command_buffers/main.cpp"
+transition_image(command_buffer_, images_[image_index],
+                 VK_IMAGE_LAYOUT_UNDEFINED,
+                 VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+// ... render ...
+transition_image(command_buffer_, images_[image_index],
+                 VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                 VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+```
+
+:::tip[`UNDEFINED` means "discard"]
+Using `VK_IMAGE_LAYOUT_UNDEFINED` as the *source* layout tells the driver you do not
+care about the existing contents, which makes the transition free — no data has to be
+rearranged. Whatever was in a returned swapchain image is not ours to keep anyway, and
+we are about to clear it.
+
+Transitioning *from* the real old layout instead would preserve contents you are about
+to overwrite. It is a common and invisible waste.
+:::
+
+## Dynamic rendering
+
+```cpp title="code/src/1.getting_started/command_buffers/main.cpp"
+const VkRenderingAttachmentInfo colour_attachment{
+    .imageView = views_[image_index],
+    .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+    .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+    .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+    .clearValue = clear,
+};
+
+vkCmdBeginRendering(command_buffer_, &rendering);
+vkCmdEndRendering(command_buffer_);
+```
+
+This is where Vulkan 1.3 saves an enormous amount of work. You describe what you are
+rendering into at the point of use, and that is all.
+
+In Vulkan 1.0 this required a `VkRenderPass` describing attachments, subpasses and
+their dependencies, created up front; and a `VkFramebuffer` binding actual image views
+to it, recreated every time the swapchain changed. Both objects had to be kept
+consistent with each other and with every pipeline. Older tutorials spend two or three
+chapters here. We spend one struct.
+
+`loadOp` and `storeOp` are worth understanding rather than copying:
+
+| `loadOp` | What happens at the start |
+|---|---|
+| `CLEAR` | Fill with `clearValue` — essentially free, it happens as part of starting the pass |
+| `LOAD` | Preserve existing contents — costs bandwidth on tiled GPUs |
+| `DONT_CARE` | Contents become undefined — cheapest when you will overwrite every pixel |
+
+`VK_ATTACHMENT_LOAD_OP_CLEAR` is why there is no `vkCmdClearColorImage` here. Clearing
+as part of beginning the pass costs nothing; clearing as a separate command is a full
+pass over every pixel.
+
+## The frame, end to end
+
+```cpp title="code/src/1.getting_started/command_buffers/main.cpp"
+vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, VK_NULL_HANDLE,
+                      acquire_fence_, &image_index);
+```
+
+`vkAcquireNextImageKHR` returns an index immediately, but the image is **not
+necessarily ready to use**. The presentation engine may still be displaying it. That is
+why the function insists on a semaphore or a fence — it will not let you ignore the
+question of when the image becomes usable.
+
+Here we pass a fence, because a fence is the thing the CPU can wait on directly:
+
+```cpp title="code/src/1.getting_started/command_buffers/main.cpp"
+VK_CHECK(vkWaitForFences(device_, 1, &acquire_fence_, VK_TRUE, UINT64_MAX));
+VK_CHECK(vkResetFences(device_, 1, &acquire_fence_));
+```
+
+Then record, submit, wait for the GPU to finish, and present:
+
+```cpp title="code/src/1.getting_started/command_buffers/main.cpp"
+VK_CHECK(vkQueueSubmit2(queue_, 1, &submit, submit_fence_));
+
+VK_CHECK(vkWaitForFences(device_, 1, &submit_fence_, VK_TRUE, UINT64_MAX));
+VK_CHECK(vkResetFences(device_, 1, &submit_fence_));
+```
+
+## This version is deliberately slow
+
+That wait is the problem with this chapter, and it is there on purpose.
+
+The CPU submits a frame and then stops, doing nothing, until the GPU has completely
+finished. Then the GPU stops, doing nothing, while the CPU records the next frame.
+**Half the machine is always idle.**
+
+```
+CPU  [record][wait............][record][wait............]
+GPU  [......][execute.........][......][execute.........]
+```
+
+It is correct — and correctness first is the right order. Deleting the wait would not
+be an optimisation, it would be a bug: the command buffer would be re-recorded while
+the GPU was still reading it.
+
+The actual fix is to stop asking *"has the GPU finished?"* and start saying *"do this
+after that"*, which is what [chapter 1.6](/getting-started/synchronisation/) is about.
+
+## Running it
+
+```bash
+./code/out/build/linux-debug/bin/1.5.command_buffers
+```
+
+A window cycling slowly through colours. The cycle is driven by the frame counter
+rather than the clock, so that frame N always has the same colour — the screenshot
+tooling diffs captures against reference images, and a time-based cycle would differ
+every run.
+
+:::note[If the colours look wrong]
+If you changed the swapchain format to `_UNORM` in the last chapter's exercises, the
+colours will be visibly brighter and more washed out than they should be. That is the
+sRGB conversion you switched off.
+:::
+
+## Exercises
+
+1. Comment out the first `transition_image` call and run with validation on. Read the
+   error carefully — this is the error you will see most often in your Vulkan career,
+   so it is worth meeting it deliberately once.
+2. Change `loadOp` to `VK_ATTACHMENT_LOAD_OP_DONT_CARE`. On most desktop drivers the
+   previous contents happen to persist, giving a stale or garbage image. "Undefined"
+   means the driver may do anything, including nothing.
+3. Remove the `vkWaitForFences` on `submit_fence_` and see what validation says. It
+   will object to the command buffer being reset while still in use — which is the
+   precise thing chapter 1.6 solves properly.
+4. Switch the present mode to `IMMEDIATE` from the last chapter's exercise. Now there
+   is animation, you can watch it tear.
+
+Next: [synchronisation](/getting-started/synchronisation/) — making both halves of the
+machine work at once.

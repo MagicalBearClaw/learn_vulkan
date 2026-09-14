@@ -1,0 +1,81 @@
+---
+title: Vulkan for OpenGL Programmers
+description: A concept-by-concept map from OpenGL to Vulkan, and the traps that catch people porting code.
+sidebar:
+  order: 90
+---
+
+If you have written OpenGL, most of what you know transfers — the mathematics entirely,
+the pipeline stages almost entirely. What changes is who is responsible for what.
+
+## Concept map
+
+| OpenGL | Vulkan | Note |
+|---|---|---|
+| Context | `VkInstance` + `VkDevice` | No global state; everything takes an explicit handle |
+| — | `VkPhysicalDevice` | You enumerate and choose the GPU yourself |
+| — | Queue + queue family | Work is submitted, never executed directly |
+| `glDrawArrays` | `vkCmdDraw` into a command buffer | Recorded now, executed later |
+| Bound state | `VkPipeline` | Compiled up front and immutable |
+| `glGenBuffers` | `VkBuffer` + a VMA allocation | Memory is allocated separately from the object |
+| `glGenTextures` | `VkImage` + `VkImageView` | Images also have a *layout* |
+| Texture unit | Descriptor set | Bound as a group, not one slot at a time |
+| Uniform | Push constant or uniform buffer | Push constants for small, frequently changed data |
+| `glUseProgram` | Baked into the pipeline | Changing shader means a different pipeline |
+| FBO | `VkRenderingInfo` (dynamic rendering) | No object at all in Vulkan 1.3 |
+| `glEnable(GL_DEPTH_TEST)` | `pDepthStencilState` on the pipeline | Fixed at creation |
+| `glfwSwapBuffers` | Swapchain + `vkQueuePresentKHR` | You own the images |
+| `glGetError` | Validation layers | Not on in release builds |
+| GLSL, compiled at run time | SPIR-V, compiled at build time | `glslangValidator` or `slangc` |
+
+## What the driver used to do for you
+
+Everything in this list is now your responsibility:
+
+- Deciding which memory type a resource belongs in, and sub-allocating from it
+- Knowing when a buffer is safe to overwrite
+- Inserting synchronisation between passes
+- Transitioning images between layouts
+- Recreating swapchain-sized resources when the window changes
+- Checking that any of your arguments make sense
+
+## Traps when porting
+
+:::caution[Clip space differs in two ways]
+**y points down** in Vulkan and **z runs 0 to 1**, against OpenGL's y-up and z from -1
+to 1.
+
+A projection matrix copied from OpenGL gives an upside-down image, and a depth setup
+copied from OpenGL gives results that look nearly right — which is harder to spot.
+Define `GLM_FORCE_DEPTH_ZERO_TO_ONE` before including glm, as this project does
+globally, and negate the y scale of your projection (or flip the viewport height).
+:::
+
+:::caution[Texture coordinates have a different origin]
+OpenGL puts (0,0) at the bottom left of a texture; Vulkan puts it at the top left.
+Images loaded without accounting for this appear vertically flipped.
+:::
+
+:::caution[Features must be enabled]
+Using a feature you did not request at device creation is undefined behaviour, not an
+error. `fillModeNonSolid` for wireframe, `samplerAnisotropy` for anisotropic filtering,
+`geometryShader` for geometry shaders — all opt-in.
+:::
+
+:::caution[Nothing is checked unless you ask]
+There is no `glGetError`. Turn on `VK_LAYER_KHRONOS_validation` and treat every message
+it produces as a bug.
+:::
+
+## What is genuinely better
+
+It is not all extra work:
+
+- **Threading.** Command buffers are recorded independently, so recording scales across
+  cores. OpenGL never could.
+- **Predictability.** No driver heuristics deciding to recompile a shader mid-frame.
+- **Error messages.** The validation layers name the exact struct member and quote the
+  rule you broke, which is a great deal more than `GL_INVALID_OPERATION`.
+- **Debugging tools.** RenderDoc and Nsight can inspect every object, and
+  `VK_EXT_debug_utils` lets you name them so captures are readable.
+- **Compute is a first-class citizen**, not an afterthought bolted on in 4.3.

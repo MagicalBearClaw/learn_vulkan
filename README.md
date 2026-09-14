@@ -37,9 +37,10 @@ VMA and stb are header-only and are fetched automatically by CMake if they are n
 already installed.
 
 ```bash
+cd code
 cmake --preset linux-debug
-cmake --build code/out/build/linux-debug
-./code/out/build/linux-debug/bin/0.smoke.clear_colour
+cmake --build out/build/linux-debug
+./out/build/linux-debug/bin/0.smoke.clear_colour
 ```
 
 ### Windows
@@ -48,8 +49,9 @@ Needs Visual Studio 2022 with the C++ workload, the Vulkan SDK, and vcpkg with
 `VCPKG_ROOT` set.
 
 ```powershell
+cd code
 cmake --preset x64-debug
-cmake --build code/out/build/x64-debug
+cmake --build out/build/x64-debug
 ```
 
 > **vcpkg and spaces:** several vcpkg ports build through autotools, which mishandles
@@ -81,7 +83,7 @@ python3 tools/new_chapter.py 1.8.hello_triangle \
     --title "Hello Triangle" --part getting-started \
     --shaders triangle.vert triangle.frag
 
-cmake --preset linux-debug           # pick up the new target
+(cd code && cmake --preset linux-debug)   # pick up the new target
 cmake --build code/out/build/linux-debug
 
 # capture the reference screenshot once the sample looks right

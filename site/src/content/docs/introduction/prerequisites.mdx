@@ -1,0 +1,164 @@
+---
+title: Prerequisites
+description: The tools, libraries and knowledge you need before chapter 1.
+sidebar:
+  order: 3
+---
+
+## What you should already know
+
+**C++.** Classes, references, RAII, `std::vector`, destructors running in reverse
+order of construction. The code uses C++23 but stays conservative — no template
+metaprogramming, no coroutines. If you can read a constructor that acquires a resource
+and a destructor that releases it, you can read all of it.
+
+**A terminal.** Enough to run CMake and a compiler.
+
+**No graphics experience.** Where a chapter needs mathematics it derives what it needs,
+and the appendices cover vectors, matrices and coordinate spaces from the beginning.
+
+## What you need installed
+
+### A GPU that supports Vulkan 1.3
+
+Any discrete GPU from roughly 2016 onward, and most integrated graphics from 2019
+onward. Check with:
+
+```bash
+vulkaninfo --summary
+```
+
+If that reports an instance version of 1.3 or higher and lists your GPU, you are fine.
+If the command is missing, the Vulkan tools are not installed yet — see below.
+
+:::note[If your driver is older than 1.3]
+The features this series relies on — dynamic rendering and `synchronization2` — exist
+as extensions on 1.2 drivers (`VK_KHR_dynamic_rendering`, `VK_KHR_synchronization2`).
+The code would need to request them explicitly and use the `KHR`-suffixed names. Every
+sample would still work, but none of the samples here do that, so updating your driver
+is by far the easier path.
+:::
+
+### Linux
+
+Everything comes from your distribution. On Arch and derivatives:
+
+```bash
+sudo pacman -S base-devel cmake ninja clang git python \
+               vulkan-headers vulkan-validation-layers vulkan-tools \
+               volk sdl3 glm spdlog glslang
+```
+
+On Debian and Ubuntu the equivalents are `build-essential cmake ninja-build clang
+libvulkan-dev vulkan-validationlayers vulkan-tools libsdl3-dev libglm-dev
+libspdlog-dev glslang-tools`. You will also need your GPU vendor's driver, which is
+usually already present.
+
+Two libraries are header-only and rarely packaged: the Vulkan Memory Allocator and
+`stb`. CMake downloads those automatically if it cannot find them, so there is nothing
+to do.
+
+### Windows
+
+1. **Visual Studio 2022** with the *Desktop development with C++* workload.
+2. **The [Vulkan SDK](https://vulkan.lunarg.com/)**, which supplies the validation
+   layers, the shader compiler and `vulkaninfo`.
+3. **[vcpkg](https://vcpkg.io/)**, with the `VCPKG_ROOT` environment variable pointing
+   at it. The rest of the dependencies come from `code/vcpkg.json`.
+
+:::caution[Avoid spaces in the path]
+Several vcpkg ports build through autotools, which mishandles paths containing spaces.
+Put the checkout somewhere like `C:\dev\learn_vulkan` rather than under a folder with
+a space in its name.
+:::
+
+### A shader compiler
+
+`glslangValidator` turns GLSL into SPIR-V, which is the only shader format Vulkan
+accepts. It ships with the Vulkan SDK on Windows and in the `glslang` package on
+Linux. CMake finds it and compiles every shader automatically as part of the build.
+
+## Building the samples
+
+```bash
+git clone <this repository>
+cd learn_vulkan_com
+
+# Linux
+cmake --preset linux-debug
+cmake --build code/out/build/linux-debug
+
+# Windows
+cmake --preset x64-debug
+cmake --build code/out/build/x64-debug
+```
+
+Then run the smoke test, which exists purely to prove the toolchain works before any
+chapter asks you to learn something:
+
+```bash
+./code/out/build/linux-debug/bin/0.smoke.clear_colour
+```
+
+A window with a slowly cycling colour means the compiler, the loader, your driver, the
+validation layers and the swapchain are all working. Press <kbd>Escape</kbd> to close
+it.
+
+Every sample in the series accepts the same options:
+
+| Option | Effect |
+|---|---|
+| `--frames N` | Render N frames, then exit |
+| `--screenshot PATH` | Write the last frame as a PNG |
+| `--width N`, `--height N` | Initial window size |
+| `--no-validation` | Turn the validation layers off |
+
+## Turn on validation and leave it on
+
+Vulkan itself checks nothing. The validation layers are a separate piece of software
+that sits between your calls and the driver and tells you, in plain language, exactly
+which rule you broke.
+
+They are on by default in these samples. If you see this at start-up:
+
+```
+[warning] Validation layers requested but VK_LAYER_KHRONOS_validation is not installed.
+```
+
+stop and install them. Developing Vulkan without validation means debugging blank
+screens by guesswork.
+
+:::tip[Treat warnings as errors]
+Every sample in this series runs with **zero validation messages**. If one of your own
+experiments starts producing them, fix it before moving on — a validation message is
+nearly always a real bug that happens to work on your machine today.
+:::
+
+## Getting the assets
+
+The early chapters need nothing. From the model-loading chapter onward:
+
+```bash
+python3 tools/bootstrap.py
+```
+
+This downloads openly licensed models and textures into `assets/`, which is not
+committed to the repository.
+
+## A note on how to read the code
+
+Each chapter is a single self-contained `main.cpp`. Chapter 1.5 contains everything
+chapter 1.4 had, plus command buffers. That means duplication between chapters, and it
+is intentional: you can read any chapter top to bottom without jumping between files,
+and you can diff one against the previous to see exactly what changed.
+
+```bash
+diff code/src/1.getting_started/the_swapchain/main.cpp \
+     code/src/1.getting_started/command_buffers/main.cpp
+```
+
+From chapter 1.8 onward, once everything in these chapters has been explained, the
+samples switch to a shared library called `vkcommon` that contains precisely the code
+you have already read.
+
+Ready. [Chapter 1.1: creating a window](/getting-started/creating-a-window/).

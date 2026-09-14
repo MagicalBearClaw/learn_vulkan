@@ -171,10 +171,16 @@ def main() -> int:
             failures.append(name)
             continue
 
-        if result.returncode != 0 or not destination.exists():
+        if result.returncode != 0:
             print(f"  FAILED (exit {result.returncode})")
             print(result.stdout[-2000:] or result.stderr[-2000:])
             failures.append(name)
+            continue
+
+        # Chapters before the swapchain exists (1.1 to 1.3) have nothing to draw and
+        # write no file. That is correct behaviour, not a failure.
+        if not destination.exists():
+            print("  no visual output yet; skipped")
             continue
 
         if args.update:
