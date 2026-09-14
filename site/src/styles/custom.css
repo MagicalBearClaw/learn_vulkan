@@ -25,20 +25,26 @@
   text-wrap: pretty;
 }
 
-/* Figures: centred, bounded, with a small caption underneath. */
-.sl-markdown-content figure {
+/* Figures: centred, bounded, with a small caption underneath.
+ *
+ * Scoped with :not(.not-content) on purpose. Expressive Code renders every code block
+ * as <figure class="frame not-content"> with a <figcaption> holding the file name, so
+ * an unscoped `.sl-markdown-content figure` rule centres all the code on the site and
+ * restyles the file-name headers into image captions. `.not-content` is Starlight's
+ * marker for "this is a component, not prose" -- excluding it is the fix. */
+.sl-markdown-content figure:not(.not-content) {
   margin: 2rem auto;
   text-align: center;
 }
 
-.sl-markdown-content figure img {
+.sl-markdown-content figure:not(.not-content) img {
   border-radius: 0.4rem;
   border: 1px solid var(--sl-color-gray-5);
   max-width: 100%;
   height: auto;
 }
 
-.sl-markdown-content figcaption {
+.sl-markdown-content figure:not(.not-content) figcaption {
   margin-top: 0.6rem;
   font-size: 0.85rem;
   color: var(--sl-color-gray-3);

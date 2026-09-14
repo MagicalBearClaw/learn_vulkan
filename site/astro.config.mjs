@@ -13,6 +13,11 @@ export default defineConfig({
       description:
         "A complete, beginner-oriented course in modern Vulkan: from opening a window to physically based rendering.",
       customCss: ["./src/styles/custom.css"],
+      // Shiki has no Slang grammar. Slang's syntax is HLSL's, so borrow that one:
+      // without this every line of every .slang block renders as one unstyled span.
+      expressiveCode: {
+        shiki: { langAlias: { slang: "hlsl" } },
+      },
       credits: false,
       tableOfContents: { minHeadingLevel: 2, maxHeadingLevel: 3 },
       lastUpdated: true,
