@@ -21,55 +21,77 @@ vertex_buffer_ = vkc::upload_to_device_local(
 
 The subject this time is the shading language itself.
 
-## The build compiles them
+## The program compiles them
 
 Vulkan does not take shader source. It takes **SPIR-V**: a binary intermediate
 representation, already parsed, with names stripped and control flow made explicit.
-Somebody has to do the translation, and the choice is whether that happens on your
-machine or on your user's.
+Somebody has to do the translation, and the interesting question is *when*.
 
-This project does it at build time, in `add_chapter`:
+There are two answers and both are legitimate.
 
-```cmake title="code/cmake/AddChapter.cmake"
-COMMAND "${LVK_SLANGC}" "${CMAKE_CURRENT_SOURCE_DIR}/${shader}"
-        -target spirv -profile ${LVK_SPIRV_PROFILE}
-        -emit-spirv-directly -fvk-use-entrypoint-name -g2
-        -o "${spv}"
+**Ahead of time** is what a shipping game does. Compile every shader during the build,
+put the SPIR-V in a pack file, and the program never contains a compiler. Syntax errors
+fail your build rather than a user's launch, startup is fast, and the binary is smaller.
+
+**At startup** is what this project does. The samples link `libslang` and hand it the
+`.slang` file that sits next to the executable. Chapter 1.7 wrote the code out in full;
+from here it is one call:
+
+```cpp title="code/src/1.getting_started/shaders/main.cpp"
+const VkShaderModule shader =
+    vkc::load_shader(device, LVK_CHAPTER_ID, "quad.slang");
 ```
 
-Three things fall out of that.
+The reason is that this is a course, and half the exercises end with "change this and
+run it again". The file beside the binary *is* the shader. There is no `.spv` anywhere,
+no build step between editing and seeing, and no stale artefact that can lie to you. It
+is also how a tool with hot reload works, and how an engine that compiles shader
+permutations on demand works, so it is not a toy arrangement.
 
-A shader with a syntax error **fails your build**, not your user's launch. Anyone who
-has shipped a shader bug that only fired on one vendor's driver will recognise what that
-is worth.
+What it costs, honestly: `libslang` is about 30 MB beside the binary, and the whole
+program — window, device, buffers and the shader compile together — takes roughly a
+third of a second to reach its first frame. Neither matters for a tutorial. Both would
+matter for something you ship, and the answer there is to cache the SPIR-V the first
+time and skip the compiler afterwards.
 
-There is **one compiler**, so there is one dialect. OpenGL's GLSL front end was each
-vendor's own, and they disagreed — about whether an implicit conversion was allowed,
-about how aggressive an optimisation could be, occasionally about what a loop meant.
-SPIR-V moves that stage out of the driver.
-
-**Startup is faster**, because the driver receives something much closer to machine code
-than to text.
-
-The flags, briefly. `-profile spirv_1_6` picks the SPIR-V version — 1.6 is what Vulkan
-1.3 consumes. `-emit-spirv-directly` uses Slang's own SPIR-V backend rather than routing
-through generated GLSL, which older versions did. `-fvk-use-entrypoint-name` keeps the
-SPIR-V entry points named after the Slang functions, which is what lets one module carry
-both stages. `-g2` keeps debug information in the module, which is what lets RenderDoc
-show you the original Slang beside the disassembly; release builds drop it.
+Either way, **one compiler, one dialect**. OpenGL's GLSL front end was each vendor's own,
+and they disagreed — about whether an implicit conversion was allowed, about how
+aggressive an optimisation could be, occasionally about what a loop meant. SPIR-V moves
+that stage out of the driver, whichever side of the build you do it on.
 
 :::tip[Look at the SPIR-V]
-`spirv-dis` prints a module in a readable assembly form, and it is the fastest way to
-answer "did the compiler really keep that branch?" or "which location did that end up
-at?".
+There is no `.spv` file to inspect, but the Slang your build downloaded includes the
+command-line compiler, so you can make one:
 
 ```bash
-spirv-dis code/out/build/linux-debug/bin/shaders/1.9.shaders/quad.slang.spv | head -40
+SLANGC=code/out/build/linux-debug/_deps/slang_bindist-src/bin/slangc
+$SLANGC code/src/1.getting_started/shaders/quad.slang \
+    -target spirv -profile spirv_1_6 -matrix-layout-column-major \
+    -emit-spirv-directly -fvk-use-entrypoint-name -o /tmp/quad.spv
+
+spirv-dis /tmp/quad.spv | head -40
+spirv-val --target-env vulkan1.3 /tmp/quad.spv
 ```
 
-`spirv-val --target-env vulkan1.3` on the same file tells you whether the module is
-legal before a driver ever sees it.
+`spirv-dis` prints a module in readable assembly, and it is the fastest way to answer
+"did the compiler really keep that branch?" or "which location did that end up at?".
+`spirv-val` tells you whether the module is legal before a driver ever sees it.
 :::
+
+:::caution[The API's defaults are not the command line's defaults]
+Two of the options `load_shader` sets exist because the two disagree.
+
+`VulkanUseEntryPointName` keeps the SPIR-V entry points named after the Slang functions.
+Without it, a module with a single entry point gets it renamed to `main` and `pName`
+stops matching.
+
+`defaultMatrixLayoutMode` is the one that costs people an afternoon. The API defaults to
+row-major, `glm` is column-major, and the mismatch transposes every transform silently —
+it still draws. `load_shader` sets `SLANG_MATRIX_LAYOUT_COLUMN_MAJOR`, which is what
+`slangc`'s command line does by default. That is why the snippet above passes
+`-matrix-layout-column-major`: so that what you disassemble is what the program runs.
+:::
+
 
 ## Why Slang
 
@@ -292,6 +314,10 @@ to "where did `glUniform` go".
 code, with a destructor attached. `PipelineBuilder` gained
 `fragment_specialisation()`, which does nothing but carry the two structures above
 through to the shader stage.
+
+`vkc::load_shader` is chapter 1.7's Slang compiler code, unchanged except that the
+global session is now created once and cached rather than per shader. It is in
+`code/common/scaffold/src/pipeline.cpp` if you want to read it again.
 :::
 
 ## A shader style note
@@ -337,9 +363,14 @@ The quad from 1.8, with a screen-fixed checkerboard darkening alternate squares.
    from the vertex positions — mapping −0.6…0.6 to 0…1 — and use that instead of
    `input.position.xy`. Resize the window and watch the difference. You have just
    invented texture coordinates.
-4. Run `spirv-dis` on `quad.slang.spv` and find `OpSpecConstant`. Those are the two
-   constants sitting in the module with their default values, waiting to be overridden.
-   While you are there, find the two `OpEntryPoint` lines and the `Flat` decoration.
+4. Produce a `.spv` with the `slangc` command above and run `spirv-dis` on it. Find
+   `OpSpecConstant`: those are the two constants sitting in the module with their
+   default values, waiting to be overridden. While you are there, find the two
+   `OpEntryPoint` lines and the `Flat` decoration.
+
+   Then drop `-matrix-layout-column-major` and diff the two disassemblies. The only
+   difference is `RowMajor` becoming `ColMajor` — and that one word is the entire bug
+   the caution above describes.
 5. Break the stage interface on purpose, which takes a little work now that both stages
    share `VSOutput`. Copy it to a second struct, `PSInput`, and make `fragmentMain` take
    that instead. Now delete `flat_colour` from `VSOutput` (and the line that writes it),

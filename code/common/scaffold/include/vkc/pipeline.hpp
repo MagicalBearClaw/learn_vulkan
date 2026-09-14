@@ -11,15 +11,17 @@
 
 namespace vkc {
 
-// Reads the SPIR-V the build produced for this chapter and wraps it in a shader
+// Compiles one of this chapter's Slang shaders to SPIR-V and wraps it in a shader
 // module. Chapter 1.7 wrote this out by hand; nothing here is new.
 //
-// One Slang file compiles to one SPIR-V module holding every stage, so `shader_name`
-// is the .slang file the chapter's CMakeLists lists ("quad.slang"), and one call here
-// covers the whole pipeline.
+// The compile happens now, at run time, not during the build -- libslang is linked into
+// the sample. One Slang file becomes one SPIR-V module holding every stage, so
+// `shader_name` is the .slang file the chapter's CMakeLists lists ("quad.slang"), and
+// one call here covers the whole pipeline.
 //
-// The module is a throwaway: it is consumed by pipeline creation and can be destroyed
-// as soon as the pipeline exists.
+// A compile error throws, with Slang's diagnostics in the message. The returned module
+// is a throwaway: it is consumed by pipeline creation and can be destroyed as soon as
+// the pipeline exists.
 [[nodiscard]] VkShaderModule load_shader(VkDevice device, std::string_view chapter_id,
                                          std::string_view shader_name);
 

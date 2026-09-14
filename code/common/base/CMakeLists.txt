@@ -23,7 +23,17 @@ target_link_libraries(vkbase
         glm::glm
         spdlog::spdlog
         lvk_stb
+        # Slang is a link-time dependency because the samples compile their shaders
+        # at startup rather than at build time. Chapter 1.7 calls this API by hand;
+        # from 1.8 it is behind vkc::load_shader.
+        slang::slang
 )
+
+# Slang's headers are third-party and are not written to our warning settings.
+get_target_property(_slang_includes slang::slang INTERFACE_INCLUDE_DIRECTORIES)
+if(_slang_includes)
+    target_include_directories(vkbase SYSTEM PUBLIC ${_slang_includes})
+endif()
 
 # volk owns the Vulkan entry points, so the static prototypes must stay out of the
 # headers. Every translation unit in the project needs this, hence PUBLIC.

@@ -140,10 +140,12 @@ a lot of it:
 ## Going back the other way
 
 `slangc` can emit GLSL as well as SPIR-V, which is occasionally useful for seeing what a
-piece of Slang means:
+piece of Slang means. The samples compile their shaders through `libslang` rather than
+the command line, but the Slang your build downloaded ships `slangc` too:
 
 ```bash
-slangc quad.slang -target glsl -entry fragmentMain -stage fragment
+code/out/build/linux-debug/_deps/slang_bindist-src/bin/slangc \
+    quad.slang -target glsl -entry fragmentMain -stage fragment
 ```
 
 For the reverse direction — reading someone's GLSL — `glslangValidator -H` prints the

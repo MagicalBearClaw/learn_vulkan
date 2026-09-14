@@ -26,7 +26,7 @@ the pipeline stages almost entirely. What changes is who is responsible for what
 | `glEnable(GL_DEPTH_TEST)` | `pDepthStencilState` on the pipeline | Fixed at creation |
 | `glfwSwapBuffers` | Swapchain + `vkQueuePresentKHR` | You own the images |
 | `glGetError` | Validation layers | Not on in release builds |
-| GLSL, compiled at run time | SPIR-V, compiled at build time | This series writes Slang and compiles it with `slangc` |
+| GLSL, compiled by the driver | SPIR-V, compiled by a compiler you choose | This series writes Slang and compiles it with `libslang` at startup |
 
 ## What the driver used to do for you
 

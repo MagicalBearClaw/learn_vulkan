@@ -36,16 +36,10 @@ sudo pacman -S cmake ninja clang vulkan-headers vulkan-validation-layers \
 VMA and stb are header-only and are fetched automatically by CMake if they are not
 already installed.
 
-Shaders are written in **Slang**, so the build needs `slangc`. It ships with the Vulkan
-SDK (1.3.296 and newer), is packaged as `shader-slang` on some distributions, and is
-available as a standalone release from
-[github.com/shader-slang/slang/releases](https://github.com/shader-slang/slang/releases).
-CMake looks in `$VULKAN_SDK/bin`, `$SLANG_ROOT/bin`, the vcpkg tree and `PATH`; failing
-all of those, point it at the binary:
-
-```bash
-cd code && cmake --preset linux-debug -DLVK_SLANGC=/path/to/slangc
-```
+Shaders are written in **Slang** and are compiled to SPIR-V by the samples themselves,
+at startup, through `libslang` — there is no shader build step and no `.spv` anywhere.
+Nothing to install: `find_package(slang CONFIG)` picks up an existing Slang (the Vulkan
+SDK bundles one) and CMake downloads a pinned official release if there is none.
 
 ```bash
 cd code

@@ -54,11 +54,9 @@ libvulkan-dev vulkan-validationlayers vulkan-tools libsdl3-dev libglm-dev
 libspdlog-dev spirv-tools`. You will also need your GPU vendor's driver, which is
 usually already present.
 
-The shader compiler needs one more step; see below.
-
-Two libraries are header-only and rarely packaged: the Vulkan Memory Allocator and
-`stb`. CMake downloads those automatically if it cannot find them, so there is nothing
-to do.
+Three dependencies are not in that list because CMake fetches them if it cannot find
+them: the Vulkan Memory Allocator and `stb`, which are header-only and rarely packaged,
+and Slang, which is discussed below.
 
 ### Windows
 
@@ -74,37 +72,28 @@ Put the checkout somewhere like `C:\dev\learn_vulkan` rather than under a folder
 a space in its name.
 :::
 
-### A shader compiler
+### The shader compiler
 
 SPIR-V is the only shader format Vulkan accepts, and this series writes its shaders in
-**Slang**, so you need `slangc` to turn one into the other. CMake finds it and compiles
-every shader automatically as part of the build.
+**Slang**. Unlike every other dependency, you do not have to do anything about this one:
+the samples link Slang's compiler as a library and call it when they start, and CMake
+fetches a pinned official release if it cannot find Slang already installed.
 
-There are three ways to get it:
+So there is nothing to install. If you *do* have Slang — the Vulkan SDK bundles it from
+version 1.3.296 onward — `find_package(slang CONFIG)` picks it up and the download is
+skipped.
 
-- **The [Vulkan SDK](https://vulkan.lunarg.com/)** bundles `slangc` from version
-  1.3.296 onward. This is the path of least resistance on Windows, and it is what
-  `VULKAN_SDK` points CMake at.
-- **A release binary** from
-  [github.com/shader-slang/slang/releases](https://github.com/shader-slang/slang/releases).
-  Unpack it anywhere and either put its `bin` on your `PATH` or set `SLANG_ROOT` to the
-  unpacked directory.
-- **Your distribution's package**, if it has one — `shader-slang` on Arch's AUR, for
-  instance. Note that Arch's `slang` package is an unrelated interpreted language.
-
-On Windows, vcpkg supplies it too: `shader-slang` is in `code/vcpkg.json`.
-
-If CMake cannot find it, it says so and tells you how to point at it directly:
-
-```bash
-cmake --preset linux-debug -DLVK_SLANGC=/path/to/slangc
-```
-
-:::note[Why Slang and not GLSL]
+:::note[Why Slang, and why at startup]
 GLSL still works, and `glslangValidator` is still in every SDK. Slang gives us one file
 per pipeline instead of one per stage, a shared struct for the interface between stages,
 and a real module system for the shader code that Part 2 onward reuses across many
-pipelines. Chapter 1.9 goes into it properly; the appendix
+pipelines.
+
+Compiling at startup rather than during the build means the `.slang` file beside the
+binary is the shader: edit it, run again, done. A shipping application would compile
+ahead of time and cache the result instead — chapter 1.9 weighs both.
+
+Chapter 1.9 goes into the language properly; the appendix
 [Slang for GLSL programmers](/appendices/slang-for-glsl-programmers/) is the translation
 table.
 :::

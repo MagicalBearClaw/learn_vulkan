@@ -13,15 +13,22 @@ sidebar:
 Everything so far has been preparation. This chapter adds shaders, a pipeline, and one
 `vkCmdDraw`.
 
-## Shaders are compiled ahead of time
+## Vulkan takes SPIR-V, not source
 
 Vulkan does not accept shader source. It accepts **SPIR-V**, a binary intermediate
-representation, and you compile your shaders into it as part of your build.
+representation, so something has to do the translation.
 
-This is a real improvement over the OpenGL model, where you handed the driver a string
-of GLSL at runtime and hoped. Syntax errors surface at build time rather than on a
-user's machine; there is no per-driver dialect to trip over; and startup is faster
-because the driver receives something much closer to machine code.
+That is already a real improvement over the OpenGL model, where you handed the driver a
+string of GLSL and every vendor's front end understood it slightly differently. SPIR-V
+moves parsing out of the driver: there is one compiler, one dialect, and the driver
+receives something much closer to machine code.
+
+*When* the translation happens is a separate question, and you have a choice. Shipping
+engines do it offline and load the binary. This series does it **when the program
+starts**: the samples link Slang's compiler as a library and hand it the `.slang` file
+sitting beside the binary. The file next to the executable *is* the shader — edit it,
+run again, and the change is there, with no build step in between. The cost is a
+library to link and a few milliseconds at startup; chapter 1.9 weighs that properly.
 
 Several languages compile to SPIR-V. This series uses **Slang** — an open-source
 shading language stewarded by Khronos, shipped in the Vulkan SDK, with a syntax
@@ -38,7 +45,7 @@ If you know GLSL, nothing here will be unfamiliar for long: the types are spelle
 `float3` instead of `vec3`, `mix` is `lerp`, and the layout qualifiers become
 attributes. Appendix *Slang for GLSL programmers* is the full table.
 
-Our build compiles it automatically:
+Declaring it takes one line:
 
 ```cmake title="code/src/1.getting_started/hello_triangle/CMakeLists.txt"
 add_chapter(1.7.hello_triangle
@@ -48,8 +55,15 @@ add_chapter(1.7.hello_triangle
 )
 ```
 
-One shader file, not two. `slangc` turns it into a single `triangle.slang.spv` next to
-the binary.
+One shader file, not two. The build does not compile it — it copies it to
+`bin/shaders/1.7.hello_triangle/`, where the running program will find it. There is no
+`.spv` file anywhere in this project.
+
+:::note[Where Slang comes from]
+CMake looks for an installed Slang and, not finding one, downloads the official release
+build and uses that. Nothing to install by hand on either platform. The Vulkan SDK ships
+Slang too, and is picked up if you have it.
+:::
 
 ## The vertex shader
 
@@ -149,24 +163,82 @@ regions. That interpolation is free, it is done by fixed-function hardware, and 
 the basis of nearly everything in the lighting chapters — normals, texture coordinates
 and world positions all reach the fragment shader the same way.
 
+## Compiling the shader
+
+`load_shader` is longer than anything else in this chapter that is not the pipeline, and
+almost all of it is Slang's compiler API rather than Vulkan. The shape is four steps:
+
+```cpp title="code/src/1.getting_started/hello_triangle/main.cpp"
+// 1. The compiler itself, and its standard library.
+Slang::ComPtr<slang::IGlobalSession> global;
+slang::createGlobalSession(global.writeRef());
+
+// 2. What to generate, and where to look for source.
+slang::TargetDesc target{};
+target.format = SLANG_SPIRV;
+target.profile = global->findProfile("spirv_1_6");
+// ... session_desc.searchPaths points at bin/shaders/1.7.hello_triangle/
+
+// 3. Load the file and collect its entry points.
+slang::IModule* module = session->loadModule("triangle", diagnostics.writeRef());
+
+// 4. Compose, link, and ask for the bytes.
+composed->link(linked.writeRef(), diagnostics.writeRef());
+linked->getTargetCode(0, spirv.writeRef(), diagnostics.writeRef());
+```
+
+The global session is the expensive object — it loads the standard module and sets up
+the compiler — and it is meant to be created once and shared. There is one shader here
+so it hardly matters; from 1.8, `vkcommon` caches it.
+
+Step 3 is where the "one file, both stages" property becomes concrete.
+`getDefinedEntryPointCount()` reports how many `[shader("...")]` functions the file has,
+and composing those with the module before linking is what produces a single SPIR-V
+binary containing all of them.
+
+Every call takes a `diagnostics` blob rather than returning an error string, and if you
+skip checking them you get a null module and no idea why. Break the shader on purpose
+and you get Slang's own diagnostics, with the line and a caret:
+
+```
+error[E30027]: member not found
+  --> quad.slang:67:12
+   |
+67 | output.flat_colour = input.colour;
+   |        ^^^^^^^^^^^ 'flat_colour' is not a member of 'VSOutput'.
+```
+
+:::caution[The matrix layout default is wrong for glm]
+`SessionDesc::defaultMatrixLayoutMode` defaults to row-major, and a `glm::mat4` is
+sixteen floats stored **column** by column. Leave the default and every transform comes
+out transposed — it still draws, nothing errors, it is simply wrong.
+
+Setting `SLANG_MATRIX_LAYOUT_COLUMN_MAJOR` fixes it, and confusingly makes Slang emit a
+`RowMajor` decoration in the SPIR-V. That is not a contradiction: Slang pairs that
+decoration with `OpVectorTimesMatrix`, and the two conventions cancel. `slangc`'s command
+line defaults to column-major; the API does not. This does not matter until chapter
+1.12, which is exactly when it will cost you an afternoon if you have not read this.
+:::
+
 ## Shader modules
 
 ```cpp title="code/src/1.getting_started/hello_triangle/main.cpp"
 const VkShaderModuleCreateInfo info{
-    .codeSize = code.size() * sizeof(uint32_t),  // in bytes
-    .pCode = code.data(),
+    .codeSize = spirv->getBufferSize(),
+    .pCode = static_cast<const uint32_t*>(spirv->getBufferPointer()),
 };
 ```
 
-A shader module is just the SPIR-V blob handed to the driver. It is *not* compiled to
-machine code here — that happens at pipeline creation, when the driver finally knows
-the rest of the state the shader will run under.
+After all that, the Vulkan part is six lines. A shader module is just the SPIR-V blob
+handed to the driver. It is *not* compiled to machine code here — that happens at
+pipeline creation, when the driver finally knows the rest of the state the shader will
+run under.
 
 Note `codeSize` is in **bytes** while `pCode` is a `const uint32_t*`. SPIR-V is a stream
-of 32-bit words and must be 4-byte aligned, which is why `read_spirv` returns a
-`std::vector<uint32_t>` — a `vector<char>` gives no such guarantee.
+of 32-bit words and must be 4-byte aligned; Slang's blob already is, and that is worth
+checking if you ever change where the bytes come from.
 
-There is **one** module here, not two, because `triangle.slang` compiled to one binary.
+There is **one** module here, not two, because `triangle.slang` compiles to one binary.
 Both pipeline stages point at it and pick their entry point by name:
 
 ```cpp title="code/src/1.getting_started/hello_triangle/main.cpp"

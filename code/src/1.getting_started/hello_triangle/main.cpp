@@ -21,6 +21,9 @@
 #include <vkc/check.hpp>
 #include <vkc/paths.hpp>
 
+#include <slang-com-ptr.h>
+#include <slang.h>
+
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 #include <spdlog/spdlog.h>
@@ -33,6 +36,7 @@
 #include <format>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -789,28 +793,170 @@ private:
         render_finished_.clear();
     }
 
-    // A shader module is just a SPIR-V blob handed to the driver. It is not compiled
-    // to machine code here -- that happens when the pipeline is created, which is
-    // when the driver finally knows the rest of the state the shader runs under.
-    [[nodiscard]] VkShaderModule load_shader(const char* name) const {
-        const std::vector<uint32_t> code =
-            vkc::read_spirv(vkc::shader_path(LVK_CHAPTER_ID, name));
+    // Slang reports what went wrong through a blob rather than a return code, so the
+    // calls below all pass one in and this turns it into something printable.
+    [[nodiscard]] static std::string blob_text(slang::IBlob* blob) {
+        if (blob == nullptr || blob->getBufferSize() == 0) {
+            return {};
+        }
+        return std::string(static_cast<const char*>(blob->getBufferPointer()),
+                           blob->getBufferSize());
+    }
 
+    // Compiles a .slang file to SPIR-V and hands the result to the driver.
+    //
+    // Vulkan will not take shader source -- it takes SPIR-V -- so something has to do
+    // the translation. This project links libslang and does it here, when the program
+    // starts, which means the .slang file beside the binary is the shader: edit it, run
+    // again, see the change, with no build step in between.
+    //
+    // Everything from createGlobalSession down to getTargetCode is Slang's compiler
+    // API. The last six lines are the Vulkan part, and they are the same six lines they
+    // would be if the bytes had come from a .spv file on disk.
+    [[nodiscard]] VkShaderModule load_shader(const char* name) const {
+        // The global session owns the compiler and its standard library. It is the
+        // expensive object -- create it once and share it. One shader here, so one
+        // session; vkcommon caches it from 1.8 onward.
+        Slang::ComPtr<slang::IGlobalSession> global;
+        if (SLANG_FAILED(slang::createGlobalSession(global.writeRef()))) {
+            throw std::runtime_error("slang::createGlobalSession failed");
+        }
+
+        // What to generate: SPIR-V 1.6, which is the version Vulkan 1.3 consumes.
+        slang::TargetDesc target{};
+        target.format = SLANG_SPIRV;
+        target.profile = global->findProfile("spirv_1_6");
+
+        const slang::CompilerOptionEntry options[]{
+            // Slang's own SPIR-V backend, rather than routing through generated GLSL.
+            {slang::CompilerOptionName::EmitSpirvDirectly,
+             {slang::CompilerOptionValueKind::Int, 1, 0, nullptr, nullptr}},
+            // Keep the entry points named after the Slang functions. Without this, a
+            // module gets its entry point renamed to "main" and the names stop matching
+            // what VkPipelineShaderStageCreateInfo::pName asks for below.
+            {slang::CompilerOptionName::VulkanUseEntryPointName,
+             {slang::CompilerOptionValueKind::Int, 1, 0, nullptr, nullptr}},
+            // Debug info, so RenderDoc can show the Slang source beside the SPIR-V.
+            {slang::CompilerOptionName::DebugInformation,
+             {slang::CompilerOptionValueKind::Int, SLANG_DEBUG_INFO_LEVEL_STANDARD, 0,
+              nullptr, nullptr}},
+        };
+
+        // Where to look for the file. The build staged it next to the binary.
+        const std::string search_path = vkc::shader_dir(LVK_CHAPTER_ID).string();
+        const char* search_paths[]{search_path.c_str()};
+
+        slang::SessionDesc session_desc{};
+        session_desc.targets = &target;
+        session_desc.targetCount = 1;
+        session_desc.searchPaths = search_paths;
+        session_desc.searchPathCount = 1;
+        session_desc.compilerOptionEntries = options;
+        session_desc.compilerOptionEntryCount = 3;
+
+        // Matrix layout, and this is the one that will bite you.
+        //
+        // The session default is SLANG_MATRIX_LAYOUT_ROW_MAJOR, which does not match
+        // glm -- a glm::mat4 is sixteen floats stored column by column, and it is
+        // memcpy'd into a uniform buffer or a push constant with no transpose on the
+        // way. Leave the default and every transform comes out transposed: the image
+        // still draws, so nothing errors, it is just wrong.
+        //
+        // Setting COLUMN_MAJOR makes Slang emit a RowMajor decoration in the SPIR-V,
+        // which looks like the opposite of what was asked for and is not. Slang pairs
+        // that decoration with OpVectorTimesMatrix, and storing transposed while
+        // multiplying on the other side is the same arithmetic as storing plainly and
+        // multiplying normally. The two conventions cancel. What matters is that this
+        // line makes mul(M, v) mean "apply M to v" for a matrix whose bytes came from
+        // glm.
+        //
+        // slangc's command line defaults to this; the API does not.
+        session_desc.defaultMatrixLayoutMode = SLANG_MATRIX_LAYOUT_COLUMN_MAJOR;
+
+        Slang::ComPtr<slang::ISession> session;
+        if (SLANG_FAILED(global->createSession(session_desc, session.writeRef()))) {
+            throw std::runtime_error("slang::IGlobalSession::createSession failed");
+        }
+
+        // Slang names a file by module, without the extension: triangle.slang on disk
+        // is the module "triangle", found by walking the search paths.
+        std::string module_name(name);
+        if (module_name.ends_with(".slang")) {
+            module_name.resize(module_name.size() - 6);
+        }
+
+        Slang::ComPtr<slang::IBlob> diagnostics;
+        slang::IModule* module =
+            session->loadModule(module_name.c_str(), diagnostics.writeRef());
+        if (module == nullptr) {
+            throw std::runtime_error(
+                std::format("Could not compile '{}' from '{}'.\n{}", module_name,
+                            search_path, blob_text(diagnostics)));
+        }
+
+        // Each [shader("...")] function in the file is an entry point. Composing them
+        // with the module and linking is what produces one SPIR-V binary holding the
+        // whole pipeline -- both stages, one module.
+        std::vector<slang::IComponentType*> components{module};
+        const SlangInt entry_point_count = module->getDefinedEntryPointCount();
+        std::vector<Slang::ComPtr<slang::IEntryPoint>> entry_points(
+            static_cast<size_t>(entry_point_count));
+        for (SlangInt i = 0; i < entry_point_count; ++i) {
+            const auto index = static_cast<size_t>(i);
+            if (SLANG_FAILED(
+                    module->getDefinedEntryPoint(i, entry_points[index].writeRef()))) {
+                throw std::runtime_error("slang::IModule::getDefinedEntryPoint failed");
+            }
+            components.push_back(entry_points[index]);
+        }
+
+        Slang::ComPtr<slang::IComponentType> composed;
+        diagnostics = nullptr;
+        if (SLANG_FAILED(session->createCompositeComponentType(
+                components.data(), static_cast<SlangInt>(components.size()),
+                composed.writeRef(), diagnostics.writeRef()))) {
+            throw std::runtime_error(std::format("Composing '{}' failed.\n{}",
+                                                 module_name, blob_text(diagnostics)));
+        }
+
+        Slang::ComPtr<slang::IComponentType> linked;
+        diagnostics = nullptr;
+        if (SLANG_FAILED(composed->link(linked.writeRef(), diagnostics.writeRef()))) {
+            throw std::runtime_error(std::format("Linking '{}' failed.\n{}",
+                                                 module_name, blob_text(diagnostics)));
+        }
+
+        Slang::ComPtr<slang::IBlob> spirv;
+        diagnostics = nullptr;
+        if (SLANG_FAILED(
+                linked->getTargetCode(0, spirv.writeRef(), diagnostics.writeRef()))) {
+            throw std::runtime_error(std::format("Generating SPIR-V for '{}' failed.\n{}",
+                                                 module_name, blob_text(diagnostics)));
+        }
+
+        // From here it is ordinary Vulkan. A shader module is just a SPIR-V blob handed
+        // to the driver; it is not compiled to machine code here -- that happens when
+        // the pipeline is created, which is when the driver finally knows the rest of
+        // the state the shader runs under.
+        //
+        // codeSize is in bytes while pCode is a uint32_t*, because SPIR-V is a stream of
+        // 32-bit words and must be 4-byte aligned. Slang's blob already is.
         const VkShaderModuleCreateInfo info{
             .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
             .pNext = nullptr,
             .flags = 0,
-            .codeSize = code.size() * sizeof(uint32_t),  // in bytes
-            .pCode = code.data(),
+            .codeSize = spirv->getBufferSize(),
+            .pCode = static_cast<const uint32_t*>(spirv->getBufferPointer()),
         };
-        VkShaderModule module = VK_NULL_HANDLE;
-        VK_CHECK(vkCreateShaderModule(device_, &info, nullptr, &module));
-        return module;
+        VkShaderModule shader_module = VK_NULL_HANDLE;
+        VK_CHECK(vkCreateShaderModule(device_, &info, nullptr, &shader_module));
+        return shader_module;
     }
 
     void create_pipeline() {
         // One module for both stages. triangle.slang declares a vertexMain and a
-        // fragmentMain, and slangc compiled the pair into this single SPIR-V binary.
+        // fragmentMain, and the compile above produced a single SPIR-V binary holding
+        // both of them.
         const VkShaderModule shader = load_shader("triangle.slang");
 
         const VkPipelineShaderStageCreateInfo stages[2]{

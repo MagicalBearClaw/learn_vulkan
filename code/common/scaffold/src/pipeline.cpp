@@ -3,27 +3,192 @@
 #include "vkc/check.hpp"
 #include "vkc/paths.hpp"
 
+#include <slang-com-ptr.h>
+#include <slang.h>
+
+#include <cstddef>
+#include <format>
+#include <iterator>
 #include <stdexcept>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace vkc {
+namespace {
+
+// SPIR-V 1.6 is the version Vulkan 1.3 consumes, and 1.3 is this project's baseline.
+constexpr const char* kSpirvProfile = "spirv_1_6";
+
+// Slang reports errors and warnings through a blob rather than a return code, so every
+// call that can produce diagnostics gets checked through here.
+[[nodiscard]] std::string blob_text(slang::IBlob* blob) {
+    if (blob == nullptr || blob->getBufferSize() == 0) {
+        return {};
+    }
+    return std::string(static_cast<const char*>(blob->getBufferPointer()),
+                       blob->getBufferSize());
+}
+
+// One global session for the life of the process.
+//
+// Creating it is the expensive part of using Slang -- it loads the standard module and
+// sets up the compiler -- and it is designed to be created once and shared. Everything
+// after it is cheap enough to do per shader.
+[[nodiscard]] slang::IGlobalSession& global_session() {
+    static Slang::ComPtr<slang::IGlobalSession> session = [] {
+        Slang::ComPtr<slang::IGlobalSession> created;
+        if (SLANG_FAILED(slang::createGlobalSession(created.writeRef()))) {
+            throw std::runtime_error("slang::createGlobalSession failed");
+        }
+        return created;
+    }();
+    return *session;
+}
+
+}  // namespace
 
 VkShaderModule load_shader(VkDevice device, std::string_view chapter_id,
                            std::string_view shader_name) {
-    const std::vector<uint32_t> code =
-        read_spirv(shader_path(chapter_id, shader_name));
+    // Chapter 1.7 wrote all of this out by hand and explained it line by line; this is
+    // that code with the error handling filled in and the global session cached.
+    slang::IGlobalSession& global = global_session();
 
+    slang::TargetDesc target{};
+    target.format = SLANG_SPIRV;
+    target.profile = global.findProfile(kSpirvProfile);
+    if (target.profile == SLANG_PROFILE_UNKNOWN) {
+        throw std::runtime_error(
+            std::format("Slang does not know the profile '{}'", kSpirvProfile));
+    }
+
+    const slang::CompilerOptionEntry options[]{
+        // Use Slang's own SPIR-V backend rather than routing through generated GLSL.
+        {slang::CompilerOptionName::EmitSpirvDirectly,
+         {slang::CompilerOptionValueKind::Int, 1, 0, nullptr, nullptr}},
+        // Keep the SPIR-V entry points named after the Slang functions. Without
+        // this, a module with one entry point gets it renamed to "main" and the
+        // names stop matching what pName asks for.
+        {slang::CompilerOptionName::VulkanUseEntryPointName,
+         {slang::CompilerOptionValueKind::Int, 1, 0, nullptr, nullptr}},
+        // Debug info, so RenderDoc can show the original Slang beside the disassembly.
+        {slang::CompilerOptionName::DebugInformation,
+         {slang::CompilerOptionValueKind::Int, SLANG_DEBUG_INFO_LEVEL_STANDARD, 0,
+          nullptr, nullptr}},
+    };
+
+    const std::string search_path = shader_dir(chapter_id).string();
+    const char* search_paths[]{search_path.c_str()};
+
+    slang::SessionDesc session_desc{};
+    session_desc.targets = &target;
+    session_desc.targetCount = 1;
+    session_desc.searchPaths = search_paths;
+    session_desc.searchPathCount = 1;
+    session_desc.compilerOptionEntries = options;
+    session_desc.compilerOptionEntryCount =
+        static_cast<uint32_t>(std::size(options));
+
+    // Matrix layout, and this is the one that will bite you.
+    //
+    // The session default is SLANG_MATRIX_LAYOUT_ROW_MAJOR, which does not match glm --
+    // a glm::mat4 is sixteen floats stored column by column, and it is memcpy'd into a
+    // uniform buffer or a push constant with no transpose on the way. Leave the default
+    // and every transform comes out transposed: the image still draws, so nothing
+    // errors, it is just wrong.
+    //
+    // Setting COLUMN_MAJOR makes Slang emit a RowMajor decoration in the SPIR-V, which
+    // looks like the opposite of what was asked for and is not. Slang pairs that
+    // decoration with OpVectorTimesMatrix, and storing transposed while multiplying on
+    // the other side is the same arithmetic as storing plainly and multiplying
+    // normally. The two conventions cancel. What matters is that this line makes mul(M,
+    // v) mean "apply M to v" for a matrix whose bytes came from glm.
+    //
+    // slangc's command line defaults to this; the API does not.
+    session_desc.defaultMatrixLayoutMode = SLANG_MATRIX_LAYOUT_COLUMN_MAJOR;
+
+    Slang::ComPtr<slang::ISession> session;
+    if (SLANG_FAILED(global.createSession(session_desc, session.writeRef()))) {
+        throw std::runtime_error("slang::IGlobalSession::createSession failed");
+    }
+
+    // Slang addresses a file by module name, without the extension: "quad.slang" on
+    // disk is the module "quad", found by walking the search paths above.
+    std::string module_name(shader_name);
+    if (module_name.ends_with(".slang")) {
+        module_name.resize(module_name.size() - 6);
+    }
+
+    Slang::ComPtr<slang::IBlob> diagnostics;
+    slang::IModule* module =
+        session->loadModule(module_name.c_str(), diagnostics.writeRef());
+    if (module == nullptr) {
+        throw std::runtime_error(std::format(
+            "Could not compile shader module '{}' from '{}'.\n{}", module_name,
+            search_path, blob_text(diagnostics)));
+    }
+
+    // Every [shader("...")] function in the file becomes an entry point of the SPIR-V
+    // module. Composing them with the module itself and linking is what produces one
+    // binary holding the whole pipeline.
+    std::vector<slang::IComponentType*> components{module};
+    const SlangInt entry_point_count = module->getDefinedEntryPointCount();
+    std::vector<Slang::ComPtr<slang::IEntryPoint>> entry_points(
+        static_cast<size_t>(entry_point_count));
+    for (SlangInt i = 0; i < entry_point_count; ++i) {
+        const size_t index = static_cast<size_t>(i);
+        if (SLANG_FAILED(
+                module->getDefinedEntryPoint(i, entry_points[index].writeRef()))) {
+            throw std::runtime_error(
+                std::format("Could not read entry point {} of '{}'", i, module_name));
+        }
+        components.push_back(entry_points[index]);
+    }
+    if (entry_point_count == 0) {
+        throw std::runtime_error(std::format(
+            "'{}' declares no entry points. Mark one with [shader(\"vertex\")] or "
+            "[shader(\"fragment\")].",
+            module_name));
+    }
+
+    Slang::ComPtr<slang::IComponentType> composed;
+    diagnostics = nullptr;
+    if (SLANG_FAILED(session->createCompositeComponentType(
+            components.data(), static_cast<SlangInt>(components.size()),
+            composed.writeRef(), diagnostics.writeRef()))) {
+        throw std::runtime_error(std::format("Composing '{}' failed.\n{}", module_name,
+                                             blob_text(diagnostics)));
+    }
+
+    Slang::ComPtr<slang::IComponentType> linked;
+    diagnostics = nullptr;
+    if (SLANG_FAILED(composed->link(linked.writeRef(), diagnostics.writeRef()))) {
+        throw std::runtime_error(std::format("Linking '{}' failed.\n{}", module_name,
+                                             blob_text(diagnostics)));
+    }
+
+    Slang::ComPtr<slang::IBlob> spirv;
+    diagnostics = nullptr;
+    if (SLANG_FAILED(
+            linked->getTargetCode(0, spirv.writeRef(), diagnostics.writeRef()))) {
+        throw std::runtime_error(std::format("Generating SPIR-V for '{}' failed.\n{}",
+                                             module_name, blob_text(diagnostics)));
+    }
+
+    // codeSize is in bytes; pCode is a uint32_t*. Slang's blob is already aligned for
+    // it, which is the one thing worth checking if you ever swap the source of the
+    // bytes.
     const VkShaderModuleCreateInfo info{
         .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
-        .codeSize = code.size() * sizeof(uint32_t),
-        .pCode = code.data(),
+        .codeSize = spirv->getBufferSize(),
+        .pCode = static_cast<const uint32_t*>(spirv->getBufferPointer()),
     };
 
-    VkShaderModule module = VK_NULL_HANDLE;
-    VK_CHECK(vkCreateShaderModule(device, &info, nullptr, &module));
-    return module;
+    VkShaderModule shader_module = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateShaderModule(device, &info, nullptr, &shader_module));
+    return shader_module;
 }
 
 PipelineBuilder& PipelineBuilder::shaders(VkShaderModule module,

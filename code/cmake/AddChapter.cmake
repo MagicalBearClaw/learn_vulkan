@@ -8,62 +8,33 @@
 #
 # The target name is the chapter id with dots replaced by underscores, so
 # `1.7.hello_triangle` builds `bin/1.7.hello_triangle` from target
-# `ch_1_7_hello_triangle`. Shaders are compiled to SPIR-V next to the binary.
+# `ch_1_7_hello_triangle`.
 #
-# Shaders are written in Slang. One .slang file holds every stage of a pipeline and
-# compiles to one SPIR-V module with one entry point per stage, so a chapter lists a
-# single shader file where a GLSL project would list a .vert and a .frag.
+# Shaders are written in Slang and are NOT compiled by the build. The samples link
+# libslang and compile them at startup, so all this does is put the .slang source
+# where the running binary can find it: bin/shaders/<chapter-id>/. Editing a shader
+# and re-running is enough; there is no SPIR-V artefact anywhere.
 
-find_program(LVK_SLANGC
-    NAMES slangc slangc.exe
-    HINTS
-        "$ENV{VULKAN_SDK}/bin"
-        "$ENV{SLANG_ROOT}/bin"
-        "${CMAKE_CURRENT_LIST_DIR}/../out/build/${CMAKE_PRESET_NAME}/vcpkg_installed/x64-linux/tools/shader-slang"
-        "${CMAKE_CURRENT_LIST_DIR}/../out/build/${CMAKE_PRESET_NAME}/vcpkg_installed/x64-windows/tools/shader-slang"
-    DOC "slangc, used to compile Slang to SPIR-V at build time")
-
-# Slang targets a SPIR-V version, not a Vulkan one. SPIR-V 1.6 is the version Vulkan
-# 1.3 consumes, and 1.3 is this project's baseline.
-set(LVK_SPIRV_PROFILE "spirv_1_6")
-
-function(_lvk_compile_shaders target chapter_id)
+function(_lvk_stage_shaders target chapter_id)
     if(NOT ARGN)
         return()
     endif()
-    if(NOT LVK_SLANGC)
-        message(FATAL_ERROR
-            "slangc was not found, so the shaders cannot be compiled.\n"
-            "  Install it with one of:\n"
-            "    - the Vulkan SDK 1.3.296 or newer, which bundles slangc\n"
-            "    - a release from https://github.com/shader-slang/slang/releases\n"
-            "    - your distribution's shader-slang package\n"
-            "  Then re-run CMake, or point it at the binary directly with\n"
-            "    cmake --preset <preset> -DLVK_SLANGC=/path/to/slangc")
-    endif()
 
-    set(spv_dir "${LVK_BINARY_DIR}/shaders/${chapter_id}")
+    set(shader_dir "${LVK_BINARY_DIR}/shaders/${chapter_id}")
     set(outputs "")
 
     foreach(shader IN LISTS ARGN)
         get_filename_component(shader_name "${shader}" NAME)
-        set(spv "${spv_dir}/${shader_name}.spv")
+        set(staged "${shader_dir}/${shader_name}")
         add_custom_command(
-            OUTPUT "${spv}"
-            COMMAND "${CMAKE_COMMAND}" -E make_directory "${spv_dir}"
-            # -emit-spirv-directly skips the intermediate GLSL that older Slang
-            # versions went through; -fvk-use-entrypoint-name keeps the SPIR-V entry
-            # points named after the Slang functions instead of renaming them to
-            # "main", which is what lets one module hold both stages; -g2 emits the
-            # debug info RenderDoc needs to show Slang source.
-            COMMAND "${LVK_SLANGC}" "${CMAKE_CURRENT_SOURCE_DIR}/${shader}"
-                    -target spirv -profile ${LVK_SPIRV_PROFILE}
-                    -emit-spirv-directly -fvk-use-entrypoint-name -g2
-                    -o "${spv}"
+            OUTPUT "${staged}"
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "${shader_dir}"
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                    "${CMAKE_CURRENT_SOURCE_DIR}/${shader}" "${staged}"
             DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${shader}"
-            COMMENT "Compiling ${chapter_id}/${shader_name} to SPIR-V"
+            COMMENT "Staging ${chapter_id}/${shader_name}"
             VERBATIM)
-        list(APPEND outputs "${spv}")
+        list(APPEND outputs "${staged}")
     endforeach()
 
     add_custom_target(${target}_shaders DEPENDS ${outputs})
@@ -94,10 +65,10 @@ function(add_chapter chapter_id)
         target_link_libraries(${target} PRIVATE vkcommon ${ARG_LIBS})
     endif()
 
-    # Each sample knows its own id so it can locate its compiled shaders.
+    # Each sample knows its own id so it can locate its shader sources at run time.
     target_compile_definitions(${target} PRIVATE LVK_CHAPTER_ID="${chapter_id}")
 
-    _lvk_compile_shaders(${target} "${chapter_id}" ${ARG_SHADERS})
+    _lvk_stage_shaders(${target} "${chapter_id}" ${ARG_SHADERS})
 
     set_property(GLOBAL APPEND PROPERTY LVK_CHAPTERS "${chapter_id}")
 endfunction()
