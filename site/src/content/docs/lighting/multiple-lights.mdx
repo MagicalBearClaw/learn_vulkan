@@ -1,0 +1,279 @@
+---
+title: Multiple Lights
+description: Six lights of three kinds in one array, summed in a loop - and the specialisation constant swapping jobs, from the kind of light to how many there are.
+sidebar:
+  order: 6
+---
+
+<figure>
+  <img src="/img/reference/2.6.multiple_lights.png" alt="Ten crates lit by six lights at once: a dim cool sun, four coloured bulbs shown as small bright cubes, and a white torch at the camera. Cyan spills across the left face of the central crate, pink along its top edge, orange on the crate at the upper right and green on the one at the right" />
+  <figcaption>Chapter 2.6: one sun, four bulbs and a torch, all shading the same crates.</figcaption>
+</figure>
+
+Every chapter so far has lit its scene with exactly one light. 2.5 made that one light
+configurable — it could be a sun, a bulb or a torch — but there was still only ever one of
+it, and that let the shader take a shortcut it is now time to give up.
+
+Real scenes have many lights. The good news is that the hard part is already done: nothing
+in this chapter changes the Phong terms from 2.2, or attenuation, or the cone from 2.5.
+What changes is the shape of the data, and one small reversal in what the specialisation
+constant is for.
+
+## Light is additive
+
+Start with the physics, because it is unusually kind here. Two lights shining on a surface
+deliver the sum of what each delivers alone. There is no interaction term, no blending
+mode, no order dependence. Photons from the sun and photons from a torch arrive
+independently and the surface reflects both.
+
+So "multiple lights" is a loop and a `+=`:
+
+```slang title="code/src/2.lighting/multiple_lights/multiple_lights.slang"
+float3 colour = float3(0.0);
+for (int i = 0; i < kLightCount; ++i) {
+    Light light = globals.lights[i];
+
+    switch (light.type) {
+    case kDirectional:
+        colour += directional_contribution(light, surface);
+        break;
+    case kPoint:
+        colour += point_contribution(light, surface);
+        break;
+    default:
+        colour += spot_contribution(light, surface);
+        break;
+    }
+}
+```
+
+That is the whole idea. Everything else in this chapter is about getting six lights into
+the shader in the first place, and about the two things that stop being free once you have
+more than one.
+
+## One struct, one array, one `type`
+
+2.5 built a `Light` struct that could describe any of the three kinds, and the article
+promised that this was what would let them share an array. Here is the payoff — the struct
+gains exactly one field:
+
+```slang title="code/src/2.lighting/multiple_lights/multiple_lights.slang"
+    float inner_cutoff;
+    float outer_cutoff;
+
+    int type;  // 0 directional, 1 point, 2 spot
+```
+
+That field is free. 2.5's five trailing floats packed from offset 80 in steps of four and
+left the block at 100 bytes, which std140 then rounded up to 112. `type` lands at offset
+100, inside padding that was already being paid for:
+
+```cpp title="code/src/2.lighting/multiple_lights/main.cpp"
+static_assert(offsetof(Light, type) == 100);
+static_assert(sizeof(Light) == 112);
+```
+
+The array inherits that 112-byte stride, which is worth checking rather than assuming —
+disassembling the SPIR-V shows `OpDecorate %_arr_Light ArrayStride 112`, matching the C++
+array exactly. A struct that can describe three kinds of light costs the same as one that
+could describe a single kind.
+
+The array itself has a fixed length:
+
+```slang title="code/src/2.lighting/multiple_lights/multiple_lights.slang"
+static const int kMaxLights = 8;
+
+struct Globals {
+    float4x4 view;
+    float4x4 projection;
+    float4 view_position;
+    Light lights[kMaxLights];
+};
+```
+
+A uniform block cannot have a run-time length, and — less obviously — it cannot be sized by
+a specialisation constant either, because the block's layout has to be settled when the
+block is declared. So the array is sized for the worst case the program will ever ask for,
+and something else decides how much of it is real.
+
+## The specialisation constant changes jobs
+
+In 2.5, specialisation constant 0 was the *kind* of light. That worked because there was
+one light and therefore one kind. With a sun, four bulbs and a torch in the same array
+there is no single kind to bake in, so the kind goes back into the data where it belongs —
+and constant 0 takes the other job:
+
+```slang title="code/src/2.lighting/multiple_lights/multiple_lights.slang"
+[[vk::constant_id(0)]] const int kLightCount = 6;
+```
+
+This is a better fit than it might look. The loop bound is fixed when the pipeline is
+created, so the loop has a constant trip count and the compiler is free to unroll it
+completely — which it could not do if the count were a uniform, since it would then have to
+emit a real loop with a run-time exit test.
+
+The three figures below differ by nothing but this constant. Same binary, same scene, same
+shader source, one number:
+
+<figure>
+  <img src="/img/2.6/sun-only.png" alt="The ten crates lit only by the dim directional sun: uniformly dark brown, every face flat, the four lamp cubes still visible as bright coloured squares" />
+  <figcaption><code>kLightCount = 1</code>: the sun alone. Dim, even, and flat.</figcaption>
+</figure>
+
+<figure>
+  <img src="/img/2.6/sun-and-bulbs.png" alt="The same crates with the sun and the four coloured bulbs: cyan, pink, orange and green spill across the crates, but the front face of the central crate stays dark brown" />
+  <figcaption><code>kLightCount = 5</code>: the four bulbs added. Note the central crate's front face — no light reaches it.</figcaption>
+</figure>
+
+The full image at the top of the page is `kLightCount = 6`, and the only thing the sixth
+light adds is the torch filling in that dark front face. Reading the three in order is a
+good way to see the sum being built one term at a time.
+
+:::note[The lamps are not lights]
+The little coloured cubes stay visible in all three, including the sun-only figure. They
+are drawn by the lamp pipeline, which just paints a cube in a colour pushed to it — they
+mark where the bulbs *are*, and they are not what lights anything. A light is an entry in
+the array; a lamp is a piece of geometry.
+:::
+
+## Ambient does not survive six copies
+
+Here is the thing that breaks when the light count goes up, and it is worth stating plainly
+because 2.5 taught the opposite.
+
+2.5 ended with this line, and defended it:
+
+```slang
+return float4(ambient + intensity * (diffuse + specular), 1.0);
+```
+
+Ambient was deliberately left outside the intensity multiplier. With one light that is
+reasonable: the ambient term is standing in for all the light bouncing around the scene,
+and that bounced light does not care how far away the torch is or which way it points.
+
+With six lights that reasoning collapses. Every light contributes an unattenuated ambient
+floor, the floors add up, and the scene washes out to flat grey — six times the fill,
+everywhere, regardless of where any of the lights actually are. So ambient moves inside:
+
+```slang title="code/src/2.lighting/multiple_lights/multiple_lights.slang"
+return intensity * (ambient + diffuse + specular);
+```
+
+The scene-wide fill job then falls to the one light whose intensity is always exactly 1.0 —
+the directional sun, which reaches everything by definition. Its ambient survives in full
+and sets the floor; the bulbs' ambient fades with distance along with the rest of their
+contribution, and the torch is given no ambient at all, because a torch does not fill a
+room.
+
+This is the general shape of the problem: a term that is a harmless fiction for one light
+becomes a bug when summed. Part 5's chapter on gamma and Part 6's on image-based lighting
+both exist because "ambient" is a placeholder for something real.
+
+## Writing the shading once
+
+Six lights across three kinds could easily have become three copies of the Phong terms.
+Instead the terms live in one function, and the three kinds differ only in the two values
+they feed it — the direction the light arrives from, and how much of it arrives:
+
+```slang title="code/src/2.lighting/multiple_lights/multiple_lights.slang"
+float3 shade(Light light, Surface surface, float3 to_light, float intensity) { ... }
+
+float3 directional_contribution(Light light, Surface surface) {
+    return shade(light, surface, normalize(-light.direction.xyz), 1.0);
+}
+
+float3 point_contribution(Light light, Surface surface) {
+    float3 offset = light.position.xyz - surface.world_position;
+    float distance = length(offset);
+    return shade(light, surface, offset / distance, attenuation_of(light, distance));
+}
+```
+
+`Surface` bundles what the fragment knows about itself — world position, normal, view
+direction, and the two texture samples — so it is gathered once instead of six times:
+
+```slang title="code/src/2.lighting/multiple_lights/multiple_lights.slang"
+struct Surface {
+    float3 world_position;
+    float3 normal;
+    float3 to_eye;
+    float3 albedo;
+    float3 shine;
+};
+```
+
+Those two texture samples are the reason this matters. Sampling is expensive; sampling the
+same two textures once per light would be six times the memory traffic for identical
+results.
+
+## What it costs
+
+Shading is now `lights × fragments`, and both numbers are large. Three things are worth
+knowing:
+
+**The branch is real now.** Switching on `light.type` is a branch on data, not on a
+specialisation constant, so unlike 2.5's it cannot be compiled away. In practice it is
+cheap: neighbouring fragments read the same array entry on the same iteration and take the
+same branch, and a GPU only pays for a branch when the lanes in a warp disagree — which
+here they never do.
+
+**The uniform buffer is getting full.** `Globals` is now 1040 bytes: 144 for the matrices
+and view position, plus eight lights at 112 each. Vulkan guarantees `maxUniformBufferRange`
+of at least 16 KB, so there is room for roughly 128 lights and no more — and long before
+that limit, pushing a kilobyte of light data every frame for lights that mostly have not
+moved starts to look wasteful. The answer is a storage buffer, which has vastly larger
+limits and is written once rather than per frame; Part 4 takes that up properly.
+
+**Every light shades every fragment.** A fragment on a crate at the back of the scene runs
+the full six-light loop even though four of the bulbs are far too distant to contribute
+anything visible. At six lights nobody cares. At six hundred this is the thing that makes
+forward rendering fall over, and it is exactly the problem deferred shading and tiled
+lighting exist to solve — Part 5.
+
+## What changed since 2.5
+
+- `Light` gained a `type` field, in padding it was already paying for, and became an array
+- `kMaxLights = 8` sizes the array; specialisation constant 0 is now the light *count*
+- the Phong terms moved into `shade()`, called by one function per kind
+- ambient moved inside the intensity multiplier, and the sun now carries the scene's fill
+- push constants gained the lamp colour, bringing the block to exactly 128 bytes — the
+  whole of the range Vulkan guarantees — and both stages now read it
+- the bulbs are brighter than the torch is, which took some fiddling: see the exercises
+
+## Running it
+
+```bash
+./code/out/build/linux-debug/bin/2.6.multiple_lights
+```
+
+Fly through the cluster and watch the coloured pools slide across the crates as your angle
+changes. Point the torch away from a crate and you can see exactly which bulb was lighting
+it.
+
+## Exercises
+
+1. Change `light_count` in `ShaderConstants` to 1, then 5, and rebuild each time — you have
+   reproduced the two figures above. Now set it to 8, so the loop also reads the three
+   unused entries. The image does not change by a single pixel, and that is worth
+   understanding, because a zeroed entry is stranger than it looks. Its `direction` is
+   `(0, 0, 0)`, and `normalize` of a zero vector is NaN — but `max(NaN, 0.0)` returns `0.0`,
+   so the diffuse and specular terms collapse to zero, and the light's black colour finishes
+   the job. Now set those entries' `type` to `1` as well and run again: **every crate turns
+   pure black.** A zeroed *point* light has `constant_term` of zero, so its attenuation is
+   `1/0` — infinity — and infinity multiplied by a black colour is NaN, which this time
+   propagates all the way to the framebuffer. Zero-initialised data is only safe when zero
+   happens to be a meaningful value.
+2. Give the sun a warm colour and the bulbs white, so the only colour in the scene comes
+   from the sun. The scene reads as daylight rather than as a dark room with lamps in it,
+   from a two-line change.
+3. Set `kBulbStrength` back to `1.0`. The bulbs nearly vanish against the sun and the torch.
+   This is what the first version of the sample looked like, and the fix that did *not*
+   work was making the falloff steeper — try `kLinear = 0.14F, kQuadratic = 0.07F` and see
+   why. With no floor and no walls, the nearest thing for a bulb to light is a crate several
+   units away, so a steeper falloff kills the pool before it reaches anything.
+4. Move the ambient term back outside the intensity multiplier, as 2.5 had it, and look at
+   the result. Then reduce every light's ambient by a factor of six and look again. Decide
+   which of the two you would rather maintain when a level designer adds a seventh light.
+5. Add a second spotlight, fixed in the world rather than held by the camera, pointing at
+   the central crate. It needs one more array entry and one more line in `make_lights()` —
+   and nothing at all in the shader. That is the point of the array.
