@@ -1,0 +1,289 @@
+---
+title: Basic Lighting
+description: The Phong reflection model - ambient, diffuse and specular light - plus normals, the normal matrix, and a 3x3 matrix layout trap.
+sidebar:
+  order: 2
+---
+
+<figure>
+  <img src="/img/reference/2.2.basic_lighting.png" alt="The coral cube from chapter 2.1, now with one face brightly lit, the top face dimmer, and the face turned away from the lamp dark" />
+  <figcaption>Chapter 2.2: the same scene, the same frame, and a lighting model. Compare it with 2.1's silhouette.</figcaption>
+</figure>
+
+Chapter 2.1 ended on a cube that was the right colour and the wrong shape. Every face came
+out identical, because nothing in the shader knew which way a face points or where the
+light is.
+
+This chapter supplies both, and the scene above is the result — rendered from exactly the
+same camera, at exactly the same frame, as 2.1's screenshot. Nothing moved. The only
+difference is the arithmetic in the fragment shader.
+
+## The model
+
+Real light bounces around a scene indefinitely, and computing that exactly is out of
+reach for anything interactive. The **Phong reflection model** is an approximation that
+splits the light reaching the eye from a point into three terms, each cheap on its own and
+each standing in for a different physical effect:
+
+| Term | Stands in for | Depends on |
+|---|---|---|
+| **Ambient** | Light that has bounced so many times it arrives from everywhere | nothing |
+| **Diffuse** | Light scattered equally in all directions by a matte surface | the light's direction |
+| **Specular** | Light reflected mirror-fashion into a highlight | the light's direction *and* the eye's |
+
+Add the three together and multiply by the object's colour — the same multiply as 2.1,
+which was right all along. What 2.1 was missing was *how much* light reaches each point.
+
+Phong is not physically based, and Part 6 replaces it. It is still worth learning
+properly, because the vocabulary — normals, light vectors, view vectors, `N · L` — carries
+straight across, and because most of the reasoning about *why* each term looks the way it
+does survives the upgrade.
+
+## Normals
+
+Everything here needs to know which way a surface faces. That is its **normal**: a unit
+vector perpendicular to the surface, pointing outward.
+
+A normal is a property of a vertex, like a position, so the vertex gains an attribute:
+
+```cpp title="code/src/2.lighting/basic_lighting/main.cpp"
+struct Vertex {
+    glm::vec3 position;
+    glm::vec3 normal;
+};
+```
+
+This finally explains why the cube has been 24 vertices since chapter 1.13 rather than 8.
+A corner of a cube belongs to three faces pointing three different ways. It needs three
+normals, a vertex is the whole bundle of attributes, so it needs three vertices. A mesh
+with hard edges always duplicates its vertices along them.
+
+On the Vulkan side this is one more `VkVertexInputAttributeDescription` at location 1, and
+one more field in the shader's input struct. Nothing new.
+
+## Everything in one space
+
+Before any lighting arithmetic: every vector in a dot product has to be in the same
+coordinate space, or the answer means nothing.
+
+This sample does its lighting in **world space**. The light's position is in world space
+already, the camera's position is in world space already, so the vertex stage hands the
+fragment stage a world-space position and a world-space normal:
+
+```slang title="code/src/2.lighting/basic_lighting/lighting.slang"
+struct VSOutput {
+    float4 position : SV_Position;
+    [[vk::location(0)]] float3 world_position;
+    [[vk::location(1)]] float3 normal;
+};
+```
+
+View space is an equally valid choice — the camera sits at the origin there, which makes
+the eye vector trivial. What is not valid is mixing them, and a world-space light position
+against a view-space normal is one of the most common lighting bugs there is.
+
+## The normal matrix
+
+The position is transformed by the model matrix. The normal is **not**.
+
+Picture a surface tilted at 45° and stretch the object to twice its width. The surface
+flattens out — so its normal has to tilt *toward* vertical. Apply the stretch to the
+normal itself and it tilts the other way, becoming less vertical as the surface becomes
+more so. Positions and normals respond oppositely to a stretch.
+
+The matrix that transforms normals correctly is the **inverse transpose** of the upper
+3×3 of the model matrix, and this sample computes it on the CPU:
+
+```cpp title="code/src/2.lighting/basic_lighting/main.cpp"
+[[nodiscard]] std::array<glm::vec4, 3> normal_matrix_of(const glm::mat4& model) {
+    const glm::mat3 m = glm::inverseTranspose(glm::mat3(model));
+    return {glm::vec4(m[0], 0.0F), glm::vec4(m[1], 0.0F), glm::vec4(m[2], 0.0F)};
+}
+```
+
+It is computed once per object rather than once per vertex, which would be the right call
+anyway. But there is a second reason, which is worth knowing if you are coming from GLSL:
+
+:::caution[Slang has no `inverse()`]
+GLSL has a built-in `inverse()`, and a lot of tutorial code computes the normal matrix in
+the vertex shader with it. Slang does not — try it and you get
+`error[E30015]: undefined identifier 'inverse'`. Code ported from GLSL that inverts
+matrices in a shader has to move that work to the CPU, which is where it belonged.
+:::
+
+For a pure rotation, the inverse transpose *is* the rotation — rotations are orthogonal,
+so inverting and transposing cancel. It only differs once a scale is involved, and less
+often than you might expect; exercise 3 shows exactly when.
+
+The normal is renormalised in the fragment shader, not the vertex shader. Interpolating
+between unit vectors produces vectors shorter than unit length, and every term below
+assumes unit vectors.
+
+## Ambient
+
+```slang title="code/src/2.lighting/basic_lighting/lighting.slang"
+const float kAmbientStrength = 0.1;
+float3 ambient = kAmbientStrength * globals.light_colour.rgb;
+```
+
+A constant. It is a crude stand-in for indirect light, and its job is modest: stop the
+faces turned away from the lamp going pure black, which no real surface does. In the
+screenshot it is what you are seeing on the left-hand face.
+
+## Diffuse
+
+```slang title="code/src/2.lighting/basic_lighting/lighting.slang"
+float3 to_light = normalize(globals.light_position.xyz - input.world_position);
+float diffuse_amount = max(dot(normal, to_light), 0.0);
+float3 diffuse = diffuse_amount * globals.light_colour.rgb;
+```
+
+This is **Lambert's cosine law**, and it is the term doing almost all the work in the
+screenshot.
+
+A beam of light of fixed width lands on a patch of surface. Facing the beam squarely, the
+patch catches all of it. Tilted, the same beam spreads over a larger area, so each unit of
+area receives less. The fraction received falls off with the cosine of the angle between
+the surface normal and the direction to the light — and for two unit vectors, the cosine
+of the angle between them is exactly their dot product.
+
+The `max` matters. A negative dot product means the surface faces away from the light,
+and the right amount of light for that is zero, not negative. Leave it out and faces
+turned away from the lamp subtract the ambient term and go blacker than black — which,
+after clamping, is just black, and a silent loss of the ambient floor.
+
+## Specular
+
+```slang title="code/src/2.lighting/basic_lighting/lighting.slang"
+float3 to_eye = normalize(globals.view_position.xyz - input.world_position);
+float3 reflected = reflect(-to_light, normal);
+float specular_amount = pow(max(dot(to_eye, reflected), 0.0), kShininess);
+float3 specular = kSpecularStrength * specular_amount * globals.light_colour.rgb;
+```
+
+The highlight. Reflect the incoming light about the normal as if the surface were a
+mirror, then ask how closely that reflected ray points at the eye. Dead on, the highlight
+is at full strength; the further off, the dimmer.
+
+`reflect` wants the direction the light is travelling, which is from the light *toward*
+the surface — the opposite of `to_light`, hence the negation. Forget it and the highlight
+turns up on the wrong side of the object: in this scene, the face turned *away* from the
+lamp starts to glow.
+
+The exponent is the surface's **shininess**. A dot product falls off gently; raised to the
+32nd power it falls off steeply, and the highlight tightens into a small bright spot.
+Higher is glossier. 2.3 makes this a property of the material rather than a constant.
+
+This is the only term that depends on where the camera is, which is why `view_position`
+joined the per-frame block. It is also the physical difference between matte and shiny:
+a matte surface looks the same from every angle because it has no specular, and a shiny
+one does not.
+
+## The layout trap: a 3×3 matrix is 48 bytes
+
+Here is this chapter's Vulkan lesson, and it is a sharp one.
+
+The push constants now hold the model matrix, the normal matrix and the object colour:
+
+```slang title="code/src/2.lighting/basic_lighting/lighting.slang"
+struct PushConstants {
+    float4x4 model;
+    float3x3 normal_matrix;
+    float4 object_colour;
+};
+```
+
+The natural C++ counterpart would use `glm::mat3`. **Do not.** Look at what the compiler
+actually lays out, with the `slangc` trick from chapter 1.9:
+
+```
+OpMemberDecorate %PushConstants_std430 0 Offset 0
+OpMemberDecorate %PushConstants_std430 1 Offset 64
+OpMemberDecorate %PushConstants_std430 1 MatrixStride 16
+OpMemberDecorate %PushConstants_std430 2 Offset 112
+```
+
+`MatrixStride 16`. Each column of a 3×3 matrix is a three-component vector, and the
+layout rules align three-component vectors to 16 bytes — so the matrix takes 48 bytes,
+and `object_colour` starts at 112. A `glm::mat3` packs its columns into 12 bytes each, 36
+in all.
+
+Send a `glm::mat3` and the second column arrives 4 bytes early, the third 8 bytes early.
+Try it: the lighting changes visibly, and nothing — not the compiler, not the driver, not
+the validation layers — says a word. It is exactly the `std140` trap from chapter 1.10,
+wearing a matrix.
+
+So the C++ side spells out the padding:
+
+```cpp title="code/src/2.lighting/basic_lighting/main.cpp"
+struct PushConstants {
+    glm::mat4 model;                           // offset 0
+    std::array<glm::vec4, 3> normal_matrix;    // offset 64, one column each
+    glm::vec4 object_colour;                   // offset 112
+};
+static_assert(offsetof(PushConstants, normal_matrix) == 64);
+static_assert(offsetof(PushConstants, object_colour) == 112);
+static_assert(sizeof(PushConstants) == 128);
+```
+
+The `static_assert`s are the habit 1.10 recommended, and here they earn their keep twice
+over. They pin the layout, and the last one records that this struct is now **exactly**
+128 bytes — the push constant size every Vulkan device guarantees. There is no room left.
+The next thing per-object data needs has to go somewhere else, and that is where chapter
+2.3 begins.
+
+:::tip[When in doubt, ask the SPIR-V]
+The offsets above came from disassembling the compiled shader, not from memorising layout
+rules. That is the reliable way to settle a layout question: the compiler's answer is the
+one the GPU will use.
+:::
+
+## What changed since 2.1
+
+- `Vertex` gained a `normal`, and the cube's 24 vertices each carry one
+- `Globals` gained `light_position` and `view_position` (176 bytes)
+- `PushConstants` gained `normal_matrix`, reaching the 128-byte limit
+- the lit fragment entry point computes ambient, diffuse and specular
+- the lamp, the pipelines, the descriptor set and the camera are unchanged
+
+## Running it
+
+```bash
+./code/out/build/linux-debug/bin/2.2.basic_lighting
+```
+
+Watch a face as it turns toward the lamp and away again, and fly around to the far side:
+the face lit from your side goes dark from the other. Get close to a face angled between
+you and the lamp to catch the specular highlight sliding across it as you move — it
+follows your eye, not the light.
+
+## Exercises
+
+1. Set `kAmbientStrength` to `0.0`, then to `0.5`. At zero, the faces turned away from the
+   lamp go pure black — darker than the background behind them, which no real object
+   does. At a half, the scene looks washed out and flat again — too much ambient is 2.1
+   creeping back.
+2. Change `kShininess` to `4` and to `256`. Then set `kSpecularStrength` to `0` and fly
+   around: the cube's appearance stops depending on where you are.
+3. See when the normal matrix matters. Replace `push.normal_matrix` in the vertex shader
+   with `(float3x3)push.model` — the model matrix itself.
+
+   First, scale the lit cube *before* rotating it:
+   `glm::rotate(...) * glm::scale(glm::mat4(1.0F), glm::vec3(1.8F, 0.6F, 1.0F))`. The
+   picture is **identical** to the correct version, to the pixel. On a box, every normal
+   lies along a scaled axis, and scaling a vector along its own axis only changes its
+   length, which normalisation removes.
+
+   Now scale *after* rotating:
+   `glm::scale(glm::mat4(1.0F), glm::vec3(1.8F, 0.6F, 1.0F)) * glm::rotate(...)`. Now the
+   stretch is not along the box's own axes, the normals genuinely tilt the wrong way, and
+   the shading changes: the front face comes out brighter and its gradient runs the wrong
+   way. Put the normal matrix back and compare. It is a subtle difference on a box — on a
+   sphere or a character it is glaring.
+4. Do the layout trap on purpose. Change `normal_matrix_of` to `memcpy` a `glm::mat3`
+   straight into the array. Run it and confirm the validation layers stay silent, then
+   delete the `static_assert`s and note that nothing would have caught this but your eye.
+5. Move the lighting into view space. Transform the normal by the view matrix as well,
+   bring the light position into view space on the CPU, and replace `view_position` with
+   the origin. The picture should not change at all — which is how you know you did it
+   right.
