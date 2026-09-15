@@ -1,0 +1,199 @@
+---
+title: Colours
+description: What a colour physically means, why lighting is a multiply, and the first sample with two pipelines.
+sidebar:
+  order: 1
+---
+
+<figure>
+  <img src="/img/reference/2.1.colours.png" alt="A flat coral cube with a small white cube floating above and to the right of it" />
+  <figcaption>Chapter 2.1: an object, a light, and no lighting model yet. Every face is the same shade.</figcaption>
+</figure>
+
+Part 1 was about machinery. You can put a triangle on the screen, feed it data, texture
+it, transform it and fly a camera around it — and none of that says anything about how
+anything should **look**.
+
+That starts here. This chapter is short on Vulkan and long on a single idea, and the
+next five chapters are all built on it.
+
+## What a colour is
+
+A light source emits some mixture of wavelengths. A surface absorbs some of them and
+reflects the rest. What reaches your eye is what is left.
+
+That is the whole model, and it gives you the arithmetic immediately. Call the light's
+colour a triple of how much red, green and blue it emits, and the object's colour a
+triple of what **fraction** of each it reflects. Then the result is the two multiplied
+component by component:
+
+```
+result = light ⊗ object
+```
+
+Coral is `(1.0, 0.5, 0.31)`: it reflects all the red that falls on it, half the green,
+about a third of the blue. Under white light `(1.0, 1.0, 1.0)` it looks coral. Under a
+green light `(0.0, 1.0, 0.0)` the red and blue terms multiply by zero and it looks dark
+green — because a surface cannot reflect a wavelength that never arrived.
+
+This is why the multiply is the right operation and addition is not. An object's colour
+is not something it *has*, it is something it **does to light**.
+
+```slang title="code/src/2.lighting/colours/colours.slang"
+[shader("fragment")]
+float4 fragmentMain(VSOutput input) : SV_Target {
+    float3 result = push.object_colour.rgb * globals.light_colour.rgb;
+    return float4(result, 1.0);
+}
+```
+
+That is the entire shading model for this chapter. There is no normal, no direction, no
+distance — so every face of the cube comes out identical and the result reads as a flat
+silhouette rather than as a solid.
+
+**Look at the screenshot above and notice how wrong it is.** The cube is rotating, and
+the only thing that changes is its outline. That is worth sitting with for a moment,
+because chapter 2.2 adds one dot product and the whole thing snaps into three
+dimensions.
+
+## Two pipelines
+
+The scene has two objects: the coral cube, and a small white cube standing in for the
+lamp. The lamp is not lit by anything — it *is* the light — so it ignores the shading
+model and draws at the light's own colour.
+
+Two different fragment shaders, then. In OpenGL that would be a second shader program
+and a `glUseProgram` between the draws. In Vulkan it is a second `VkPipeline`, which
+this chapter builds in the cheapest possible way:
+
+```slang title="code/src/2.lighting/colours/colours.slang"
+[shader("vertex")]   VSOutput vertexMain(VSInput input)         { ... }
+[shader("fragment")] float4 fragmentMain(VSOutput input)        : SV_Target { ... }
+[shader("fragment")] float4 lampFragmentMain(VSOutput input)    : SV_Target { ... }
+```
+
+Three entry points, one file, one SPIR-V module — and the vertex stage is genuinely
+shared rather than duplicated. Both pipelines come from that one module, differing only
+in which fragment entry point they name:
+
+```cpp title="code/src/2.lighting/colours/main.cpp"
+const auto build = [&](const char* fragment_entry) {
+    return vkc::PipelineBuilder(device)
+        .shaders(shader, "vertexMain", fragment_entry)
+        // ... everything else identical
+        .build();
+};
+
+object_pipeline_ = build("fragmentMain");
+lamp_pipeline_ = build("lampFragmentMain");
+```
+
+This is `pName` from chapter 1.7 finally doing something. It is also the clearest
+possible statement of what a `VkPipeline` *is*: a compiled combination of state. Change
+one thing in the combination and you have a different object, chosen at draw time with
+one `vkCmdBindPipeline`.
+
+:::note[Two pipelines is not a cost to fear, but it is not free either]
+Pipeline creation is expensive — it is where the driver compiles SPIR-V to machine code.
+Two is nothing. A real renderer ends up with hundreds, because every material variant,
+every blend mode and every vertex layout is its own combination, and that is the problem
+chapter 4.10 solves with pipeline caches.
+
+Binding a pipeline, by contrast, is cheap. Sorting your draws so you bind each pipeline
+once rather than switching back and forth is one of the easiest wins in a renderer.
+:::
+
+## Set 0 means per-frame, from now on
+
+This is the chapter to fix a convention, because Part 2 is about to need it.
+
+```slang title="code/src/2.lighting/colours/colours.slang"
+struct Globals {
+    float4x4 view;
+    float4x4 projection;
+    float4 light_colour;
+};
+[[vk::binding(0, 0)]] ConstantBuffer<Globals> globals;
+```
+
+**Set 0 is per-frame data**: the camera, and from 2.5 the lights. It is written once at
+the top of the frame and bound once.
+
+**Push constants are per-object data**: this chapter's model matrix and object colour,
+80 of the 128 guaranteed bytes.
+
+**Set 1 will be per-material data**, and that is chapter 2.3's subject.
+
+The reason to split them is lifetime. The camera changes once per frame; a material
+changes once per object; rebinding the cheap one should not mean rewriting the expensive
+one. Vulkan rewards this directly — binding set 1 does not disturb set 0, so you can
+bind the camera once and then walk the scene rebinding only materials.
+
+:::caution[`stageFlags` now names both stages]
+The fragment shader reads `light_colour` from the same block the vertex shader reads the
+matrices from, so the binding has to say so:
+
+```cpp title="code/src/2.lighting/colours/main.cpp"
+.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+```
+
+Forget it and the validation layers tell you plainly, which is a mercy — the same
+mistake in the `std140` layout would have been silent.
+:::
+
+## What changed since 1.14
+
+The sample got **shorter**, which is the first time that has happened in a while.
+
+:::note[Now from `vkcommon`]
+`vkc::Camera` — chapter 1.14's camera with its SDL handling folded in. The whole of
+1.14's `on_event` and `move_camera`, about sixty lines, is now:
+
+```cpp title="code/src/2.lighting/colours/main.cpp"
+void on_event(const SDL_Event& event) override {
+    camera_.handle_event(event, window().handle());
+}
+// and, once per frame:
+camera_.update(delta_time());
+```
+:::
+
+Also gone: the texture, the sampler, and the texture coordinate on `Vertex`. They come
+back in 2.4, when a material is more than four floats.
+
+Added: a second pipeline, `light_colour` in the per-frame block, and `object_colour` in
+the push constants.
+
+The cube is still 24 vertices rather than 8, even though nothing now needs per-face
+data. That is deliberate — 2.2 gives every face its own normal and it would be 24 again
+immediately, and keeping the layout stable makes the diff between the two chapters
+readable.
+
+## Running it
+
+```bash
+./code/out/build/linux-debug/bin/2.1.colours
+```
+
+A coral cube turning slowly, and a white cube orbiting it. Right-click to capture the
+mouse, `WASD` to fly, `shift` to sprint, `Escape` to quit.
+
+## Exercises
+
+1. Change `kLightColour` to a strong green, `(0.0, 1.0, 0.0, 1.0)`. The cube goes dark
+   green, not green-tinted coral, because the red and blue it would have reflected were
+   never emitted. Work out what colour you would get from a pure blue light before you
+   try it.
+2. Set the light to `(1.0, 0.6, 0.0, 1.0)` — roughly a sodium street lamp. Notice how
+   badly it distorts the coral. This is why photographers care about colour temperature,
+   and it is the same multiply.
+3. Make the lamp cube ignore `light_colour` and draw a fixed magenta instead. Now the
+   marker no longer tells you what colour the light is. Decide which you prefer and why
+   — there is a real argument for both.
+4. Delete the `lamp_pipeline_` and draw the lamp with `object_pipeline_` instead, still
+   pushing `kLightColour` as its object colour. It looks almost the same. Work out what
+   is different about the result and why — the answer is in the multiply.
+5. Build a third pipeline from the same module with
+   `.polygon_mode(VK_POLYGON_MODE_LINE)` and draw the lit cube twice, solid then
+   wireframe. You will need the `fillModeNonSolid` device feature. Three pipelines, one
+   shader module, one pipeline layout.

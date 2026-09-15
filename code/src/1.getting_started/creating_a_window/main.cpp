@@ -32,10 +32,14 @@ public:
         // SDL_WINDOW_VULKAN tells SDL to load the Vulkan loader and to set the window
         // up so that a VkSurfaceKHR can be created from it later. Nothing Vulkan
         // happens yet, but asking for it now saves recreating the window in 1.2.
+        // Resizable, except on a --screenshot run: tiling window managers choose the size
+        // of a resizable window themselves, which would make the book's reference images
+        // depend on whatever else is open. A fixed-size window gets the size asked for.
         window_ = SDL_CreateWindow("LearnVulkan - Creating a Window",
                                    static_cast<int>(args.width),
                                    static_cast<int>(args.height),
-                                   SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
+                                   SDL_WINDOW_VULKAN |
+                                   (args.screenshot.empty() ? SDL_WINDOW_RESIZABLE : 0));
         if (window_ == nullptr) {
             SDL_Quit();
             throw std::runtime_error(

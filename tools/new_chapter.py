@@ -149,8 +149,6 @@ TODO: name exactly what moved into `vkcommon` and what is new here.
 ## Exercises
 
 1. TODO
-
-[Full source]({source_url})
 '''
 
 
@@ -173,9 +171,14 @@ def main() -> int:
         return 1
     part_number, order, slug = match.group(1), int(match.group(2)), match.group(3)
 
-    part_dir = next((d.name for d in sorted(CODE_SRC.iterdir()) if d.is_dir() and d.name.startswith(f"{part_number}.")), None)
+    # Code directories carry the part number ("2.lighting"); docs directories do not,
+    # because Starlight strips dots from URLs. Reuse the existing directory for this
+    # part if there is one, so the first chapter of a part sets the name and the rest
+    # follow it.
+    part_dir = next((d.name for d in sorted(CODE_SRC.iterdir())
+                     if d.is_dir() and d.name.startswith(f"{part_number}.")), None)
     if part_dir is None:
-        part_dir = args.part.replace("-", "_")
+        part_dir = f"{part_number}.{args.part.replace('-', '_')}"
     code_dir = CODE_SRC / part_dir / slug
 
     if code_dir.exists():
@@ -211,7 +214,6 @@ def main() -> int:
                 order=order,
                 slug=slug,
                 part_dir=part_dir,
-                source_url=f"https://github.com/USER/learn_vulkan_com/tree/main/code/src/{part_dir}/{slug}",
             )
         )
 

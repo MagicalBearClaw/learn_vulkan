@@ -140,10 +140,14 @@ private:
         if (!SDL_Init(SDL_INIT_VIDEO)) {
             throw std::runtime_error(std::format("SDL_Init failed: {}", SDL_GetError()));
         }
+        // Resizable, except on a --screenshot run: tiling window managers choose the size
+        // of a resizable window themselves, which would make the book's reference images
+        // depend on whatever else is open. A fixed-size window gets the size asked for.
         window_ = SDL_CreateWindow("LearnVulkan - The Instance",
                                    static_cast<int>(args_.width),
                                    static_cast<int>(args_.height),
-                                   SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
+                                   SDL_WINDOW_VULKAN |
+                                   (args_.screenshot.empty() ? SDL_WINDOW_RESIZABLE : 0));
         if (window_ == nullptr) {
             throw std::runtime_error(
                 std::format("SDL_CreateWindow failed: {}", SDL_GetError()));

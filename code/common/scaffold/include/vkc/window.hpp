@@ -14,7 +14,10 @@ namespace vkc {
 // present to it. SDL3 owns the platform differences; we only ever see the surface.
 class Window {
 public:
-    Window(std::string_view title, uint32_t width, uint32_t height);
+    // `resizable` is false only for --screenshot runs, where a tiling window manager
+    // would otherwise pick the size and the reference images would not be stable.
+    Window(std::string_view title, uint32_t width, uint32_t height,
+           bool resizable = true);
     ~Window();
 
     Window(const Window&) = delete;

@@ -31,13 +31,14 @@ void ensure_sdl_initialised() {
 
 }  // namespace
 
-Window::Window(std::string_view title, uint32_t width, uint32_t height) {
+Window::Window(std::string_view title, uint32_t width, uint32_t height,
+               bool resizable) {
     ensure_sdl_initialised();
 
     const std::string owned_title(title);
     window_ = SDL_CreateWindow(owned_title.c_str(), static_cast<int>(width),
                                static_cast<int>(height),
-                               SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
+                               SDL_WINDOW_VULKAN | (resizable ? SDL_WINDOW_RESIZABLE : 0));
     if (window_ == nullptr) {
         throw std::runtime_error(
             std::format("SDL_CreateWindow failed: {}", SDL_GetError()));

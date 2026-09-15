@@ -39,10 +39,14 @@ older examples.
 window_ = SDL_CreateWindow("LearnVulkan - Creating a Window",
                            static_cast<int>(args.width),
                            static_cast<int>(args.height),
-                           SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
+                           SDL_WINDOW_VULKAN |
+                           (args.screenshot.empty() ? SDL_WINDOW_RESIZABLE : 0));
 ```
 
-Two flags matter.
+Two flags matter. (The conditional is book infrastructure: when `tools/capture.py` asks
+for a screenshot, the window is made fixed-size, because a tiling window manager picks
+the size of a resizable window itself and the reference images would change with
+whatever else is on screen. Read it as `SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE`.)
 
 `SDL_WINDOW_VULKAN` tells SDL to load the Vulkan loader and prepare the window so a
 `VkSurfaceKHR` can be created from it in chapter 1.3. Nothing Vulkan happens yet, but

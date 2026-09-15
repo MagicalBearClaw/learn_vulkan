@@ -17,7 +17,8 @@ App::Options App::parse_args(int argc, char** argv, Options defaults) {
 }
 
 App::App(Options options) : options_(std::move(options)) {
-    window_ = std::make_unique<Window>(options_.title, options_.width, options_.height);
+    window_ = std::make_unique<Window>(options_.title, options_.width, options_.height,
+                                       /*resizable=*/options_.screenshot.empty());
 
     const Context::Config config{
         .app_name = options_.title,
