@@ -19,9 +19,16 @@ Vries in the caption, as that licence requires.
 
 ## Assets
 
-`assets/textures/lvk_grid.png` is this project's own work, drawn by
-`tools/make_textures.py` and committed so that a fresh clone can run the texture
-chapters without fetching anything. Regenerate it with:
+These textures are this project's own work, drawn by `tools/make_textures.py` and
+committed so that a fresh clone can run the texture chapters without fetching anything:
+
+| File | Used from | What it is |
+|---|---|---|
+| `assets/textures/lvk_grid.png` | 1.11 | Test grid: checkerboard, fine lines, orientation marker, border |
+| `assets/textures/lvk_crate_diffuse.png` | 2.4 | Crate diffuse map: brushed-steel frame and rivets around wooden planks |
+| `assets/textures/lvk_crate_specular.png` | 2.4 | The matching specular map: bright steel, near-black wood |
+
+Regenerate them with:
 
 ```bash
 python3 tools/make_textures.py

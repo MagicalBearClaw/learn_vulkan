@@ -1,0 +1,212 @@
+---
+title: Lighting Maps
+description: Diffuse and specular maps, a descriptor set with mixed types, pools sized per type, one sampler for many textures, and why a specular map is UNORM.
+sidebar:
+  order: 4
+---
+
+<figure>
+  <img src="/img/reference/2.4.lighting_maps.png" alt="Three wooden crates with steel frames and rivets, lit from the front by a small lamp between two of them; a bright highlight runs along the middle crate's steel frame while its planks show only a faint sheen" />
+  <figcaption>Chapter 2.4: one material, two textures. The steel shines and the wood does not, on the same face of the same cube.</figcaption>
+</figure>
+
+Chapter 2.3's materials gave each object one diffuse colour and one specular colour. That
+works for a gold cube and fails for nearly everything else, because very few objects are
+one material all over. A crate is wood held together by steel, and those two respond to
+light in completely different ways — on the same face.
+
+The fix is to stop giving the material *a* colour and give it an image of colours: one
+value per texel. This chapter does that for the diffuse and specular terms, and the
+lighting arithmetic does not change at all.
+
+## Two maps, two meanings
+
+A **diffuse map** is the surface's colour, texel by texel. It is what you would normally
+call "the texture", and it replaces 2.3's `material.diffuse`. It also stands in for
+`material.ambient`: a surface's ambient colour is almost always its diffuse colour,
+darker, and the light's ambient component already supplies the "darker".
+
+A **specular map** says how much specular light each texel reflects. Bright where the
+surface is shiny, black where it is not. It replaces `material.specular`.
+
+Both textures in this chapter are drawn by `tools/make_textures.py` and committed with the
+project, like chapter 1.11's test grid. They describe one crate: a brushed-steel frame with
+rivets, and five wooden planks. In the specular map the steel is bright with scuffed,
+duller patches; the rivets are pure white; the wood is almost black, keeping a faint
+varnish sheen; the gaps between planks are zero.
+
+The shader samples both and uses them where 2.3 used constants:
+
+```slang title="code/src/2.lighting/lighting_maps/lighting_maps.slang"
+float3 surface = diffuse_map.Sample(input.uv).rgb;
+float3 shine = specular_map.Sample(input.uv).rgb;
+
+float3 ambient = globals.light.ambient.rgb * surface;
+float3 diffuse = globals.light.diffuse.rgb * diffuse_amount * surface;
+float3 specular = globals.light.specular.rgb * specular_amount * shine;
+```
+
+Both samples happen first, before any arithmetic that could branch. That is chapter 1.11's
+rule about derivatives, and it is easy to break the first time a shader grows an `if`.
+
+## Colour is sRGB. Data is not.
+
+Here is the part of this chapter that has nothing to do with Vulkan's API and everything
+to do with what numbers mean.
+
+```cpp title="code/src/2.lighting/lighting_maps/main.cpp"
+diffuse_map_ = vkc::load_texture(context(),
+    vkc::asset_path("textures/lvk_crate_diffuse.png"), VK_FORMAT_R8G8B8A8_SRGB);
+
+specular_map_ = vkc::load_texture(context(),
+    vkc::asset_path("textures/lvk_crate_specular.png"), VK_FORMAT_R8G8B8A8_UNORM);
+```
+
+Same loader, same kind of file, different formats.
+
+The diffuse map is **colour**. It was authored to look right on a display, and displays are
+sRGB, so its bytes are sRGB-encoded: a value of 128 means "the grey that *looks* halfway
+between black and white", which is only about 22% of the light. `_SRGB` tells the GPU to
+decode that curve when sampling, so the shader receives linear light — the only kind it
+makes sense to multiply and add. Chapter 1.11 explained this for the test grid.
+
+The specular map is **data**. A value of 128 means "reflect half the specular light". It
+was never a colour and it was never encoded for a display. Load it as `_SRGB` and the GPU
+would run every value through the decode curve anyway: 128 would arrive as about 0.22,
+every mid-grey would shrink towards black, and the steel would lose most of its shine.
+Nothing errors. The picture is just wrong.
+
+This is not hypothetical, and it is not subtle once you know where to look. Rendering this
+chapter's captured frame with the specular map loaded as `_SRGB` changes about 4.5% of the
+pixels. The bright highlight along the middle crate's frame breaks up into speckles, because
+the scuffed patches — mid-greys in the map — are pushed far darker than the clean steel
+around them. And the faint varnish sheen on the planks vanishes entirely: the wood's values
+of around 22 out of 255 decode to less than 1%.
+
+The rule generalises, and later chapters depend on it: **colour textures are `_SRGB`;
+everything else is `_UNORM`.** Specular maps, roughness maps, metalness maps, normal maps,
+height maps, masks — all data, all `_UNORM`. `vkc::load_texture` defaults to `_SRGB`
+because colour is the common case, which makes the `_UNORM` in this chapter a deliberate
+line you have to write.
+
+## A set with two kinds of descriptor
+
+Set 1 now holds three things, of two types:
+
+```slang title="code/src/2.lighting/lighting_maps/lighting_maps.slang"
+[[vk::binding(0, 1)]] Sampler2D diffuse_map;
+[[vk::binding(1, 1)]] Sampler2D specular_map;
+
+struct MaterialParams {
+    float shininess;
+};
+[[vk::binding(2, 1)]] ConstantBuffer<MaterialParams> material;
+```
+
+`shininess` is all that remains of 2.3's `Material` once its colours became textures, and it
+still needs somewhere to live. It stays in the material set, beside the maps it belongs
+with, rather than drifting into push constants just because a single float would fit —
+it changes when the material changes, so it goes where the material goes.
+
+The C++ layout mirrors the shader binding for binding: two
+`VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER`s at bindings 0 and 1, and a
+`VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER` at binding 2. A set has no single type. Each binding
+has its own, and the binding numbers and types must agree with the shader.
+
+Filling the set is one `vkUpdateDescriptorSets` call with three writes. The image writes
+name the layout each image will be in **when it is sampled** — `SHADER_READ_ONLY_OPTIMAL`,
+where `load_texture` already left them — not whatever layout they happen to be in while
+you write the descriptor.
+
+## Pools are sized per type
+
+With two descriptor types in play, the pool needs one size entry per type:
+
+```cpp title="code/src/2.lighting/lighting_maps/main.cpp"
+const std::array<VkDescriptorPoolSize, 2> pool_sizes{{
+    {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, vkc::kFramesInFlight + 1},
+    {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2},
+}};
+```
+
+Each entry counts **descriptors of that type across every set the pool will hold** —
+uniform buffers for the two per-frame sets plus the material's, image samplers for the
+material's two. `maxSets` is separate, and counts sets. Chapter 2.3 showed what running
+out looks like; with several types, it is per type, so you can have room for sets and still
+run out of one kind of descriptor.
+
+## One sampler, two textures
+
+Both maps are sampled through the same `VkSampler`:
+
+```cpp title="code/src/2.lighting/lighting_maps/main.cpp"
+sampler_ = vkc::Sampler(context(), vkc::SamplerDesc{});
+```
+
+A sampler describes **how** to read a texture — filtering, mipmapping, what happens past
+the edge — and not **which** texture. Chapter 1.11 kept them as separate objects for
+exactly this reason. Any number of textures that want the same filtering can share one,
+and a real scene typically needs only a handful of samplers for thousands of textures.
+
+## One material, three crates
+
+All three crates use the one material, so set 1 is bound once, outside the loop:
+
+```cpp title="code/src/2.lighting/lighting_maps/main.cpp"
+vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                        pipeline_layout_, 1, 1, &material_set_, 0, nullptr);
+
+for (size_t i = 0; i < kCrates.size(); ++i) {
+    draw_cube(frame.cmd, model);
+}
+```
+
+This is 2.3's lifetime rule with the numbers changed. The material did not change between
+the crates, so nothing about set 1 is rebound. Only the per-object data varies, and that is
+still what push constants are for.
+
+## Where the light goes matters
+
+One practical note from building this sample. The first version put the lamp where 2.3 had
+it, circling above the scene, and the captured frame had **no specular highlights at all** —
+the specular map was working, there was simply nothing for it to show.
+
+A highlight appears where the surface acts as a mirror between the light and your eye.
+With the camera and the lamp both above the crates, that mirror point lies above every
+front face, off the edge of the geometry. So this sample's lamp sweeps from side to side
+low down in front of the crates, where the mirror points land on the steel. If you move the
+camera high and find the highlights gone, that is geometry, not a bug.
+
+## What changed since 2.3
+
+- `Vertex` got its texture coordinate back
+- the material is two textures and a shininess, bound at set 1 through three bindings of two types
+- the pool has a size entry per descriptor type
+- one `vkc::Sampler` serves both textures
+- one material set, bound once, is shared by three crates
+- the lamp sweeps low in front of the scene instead of circling above it
+
+## Running it
+
+```bash
+./code/out/build/linux-debug/bin/2.4.lighting_maps
+```
+
+Watch the steel as the lamp sweeps: highlights slide along the frames and catch the rivets,
+while the planks beside them keep only a faint sheen.
+
+## Exercises
+
+1. Load the specular map as `VK_FORMAT_R8G8B8A8_SRGB` and compare. Then load the *diffuse*
+   map as `_UNORM` and describe what happens to the wood. You now have both halves of the
+   rule in front of you.
+2. Replace `shine` with `float3(1.0)` in the shader — a uniformly shiny crate. The wood
+   gleams like the steel, which is the whole case for specular maps in one change.
+3. Invert the specular map in the shader (`1.0 - shine`) and look: shiny wood, dull steel.
+   Nothing about the geometry changed, only the data.
+4. Give the two maps different samplers: nearest filtering for the specular map, linear for
+   the diffuse. You will need a second `vkc::Sampler` and a change to one write. Get close to
+   a rivet to see the difference.
+5. Add a second material — reuse the diffuse map but make a specular map that is uniformly
+   bright, a "polished" crate — and draw the middle crate with it. Resize the pool, allocate a
+   second set, and rebind set 1 inside the loop only when the material actually changes.
