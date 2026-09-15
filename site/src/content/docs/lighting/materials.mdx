@@ -1,0 +1,249 @@
+---
+title: Materials
+description: Turning lighting constants into material data, and the second descriptor set - per-frame, per-material and per-object data with three different lifetimes.
+sidebar:
+  order: 3
+---
+
+<figure>
+  <img src="/img/reference/2.3.materials.png" alt="Five cubes in a row lit by one lamp: green emerald, pale gold, red ruby, dark grey obsidian and cyan plastic" />
+  <figcaption>Chapter 2.3: one shader, one light, five materials — each in its own descriptor set.</figcaption>
+</figure>
+
+Chapter 2.2 ended with the push constants at exactly 128 bytes, the most every Vulkan
+device guarantees. That is a good place to start, because it forces the question this
+chapter is really about: when data outgrows the place it has been living, where should it
+go?
+
+The answer depends on how often it changes. That turns out to be the organising
+principle for nearly all descriptor code you will ever write.
+
+## What a material is
+
+2.2's fragment shader hard-coded a surface's response to light: an object colour, an
+ambient strength of `0.1`, a specular strength of `0.5` and a shininess of `32`. Every
+surface in the scene shared those numbers except the colour.
+
+Real surfaces differ in all of them, independently. Gold has a warm, tinted highlight;
+plastic has a white one. Rubber has almost no highlight at all; polished metal has a small,
+intense one. So the constants become data:
+
+```slang title="code/src/2.lighting/materials/materials.slang"
+struct Material {
+    float4 ambient;
+    float4 diffuse;
+    float4 specular;
+    float shininess;
+};
+```
+
+Each colour says how much of the matching component of the light the surface sends back.
+`diffuse` is what you would casually call the surface's colour. `ambient` is usually the
+same hue, darker. `specular` is the colour of the highlight — near-white for plastics,
+tinted for metals, which is most of what makes gold read as gold rather than as yellow
+plastic. `shininess` is 2.2's exponent.
+
+Lights get the same three components, for the same reason:
+
+```slang title="code/src/2.lighting/materials/materials.slang"
+struct Light {
+    float4 position;
+    float4 ambient;
+    float4 diffuse;
+    float4 specular;
+};
+```
+
+A dim ambient with a bright diffuse is one lamp in a dark room. A strong ambient with a weak
+diffuse is an overcast afternoon. The shader multiplies the two, term by term:
+
+```slang title="code/src/2.lighting/materials/materials.slang"
+float3 ambient = globals.light.ambient.rgb * material.ambient.rgb;
+float3 diffuse = globals.light.diffuse.rgb * (diffuse_amount * material.diffuse.rgb);
+float3 specular = globals.light.specular.rgb * (specular_amount * material.specular.rgb);
+```
+
+The five materials in the sample come from a classic table in McReynolds and Blythe's
+*Advanced Graphics Programming Using OpenGL*. The values were tuned for a white light at
+full strength in every component, which is what the sample supplies.
+
+## Three lifetimes
+
+Now the Vulkan part. This sample has three kinds of data, and they change at three
+different rates:
+
+| Data | Changes | Lives in |
+|---|---|---|
+| Camera, light | once per frame | **set 0** |
+| Material | once per material | **set 1** |
+| Model matrix, normal matrix | once per object | **push constants** |
+
+Why not just put everything in one set, as chapter 1.10 did?
+
+Because a descriptor set is bound as a unit. If camera and material shared one set, you
+would need one set per (frame, material) combination, and switching material would mean
+rebinding the camera too. Split them, and each piece is bound exactly as often as it
+changes:
+
+```cpp title="code/src/2.lighting/materials/main.cpp"
+// Set 0, once for the whole frame.
+vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                        pipeline_layout_, 0, 1, &frame_sets_[slot], 0, nullptr);
+
+for (size_t i = 0; i < kMaterials.size(); ++i) {
+    // Set 1 only.
+    vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            pipeline_layout_, 1, 1, &material_sets_[i], 0, nullptr);
+    draw_cube(frame.cmd, model);
+}
+```
+
+The fourth argument is `firstSet`. The first call writes set 0; each call in the loop
+writes set 1 and **leaves set 0 alone**. That is the whole point of numbered sets, and it
+is worth ordering them so that the rarest-changing data has the lowest number: binding set
+*N* is designed to leave the sets below it undisturbed.
+
+Order is also how sets are numbered on the C++ side. There is no set-number field
+anywhere; the index into `pSetLayouts` *is* the set number:
+
+```cpp title="code/src/2.lighting/materials/main.cpp"
+const std::array<VkDescriptorSetLayout, 2> set_layouts{frame_set_layout_,
+                                                       material_set_layout_};
+```
+
+## Switching pipelines without losing your sets
+
+After the five cubes, the sample switches to the lamp pipeline and draws — without
+rebinding anything:
+
+```cpp title="code/src/2.lighting/materials/main.cpp"
+vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, lamp_pipeline_);
+draw_cube(frame.cmd, lamp_model);
+```
+
+That works because descriptor sets are not bound *to a pipeline*. They are bound to the
+command buffer, through a pipeline layout, and they survive a pipeline switch as long as
+the new pipeline's layout is **compatible** with the one they were bound through. Both
+pipelines here share one `VkPipelineLayout`, so the sets carry straight over.
+
+"Compatible" is precise. Two pipeline layouts are compatible for set *N* if they were
+created with identically defined set layouts for sets 0 through *N* **and** the same push
+constant ranges. The second half is the surprising one — a layout that differs only in
+which stages can see the push constants is incompatible for every set, and the sets you
+bound stop counting. The validation layers catch it at the draw, and the message is a
+good one to recognise:
+
+```
+vkCmdDrawIndexed(): The VkPipeline [lamp pipeline] (created with VkPipelineLayout ...)
+statically uses descriptor set 0, but set 0 is not compatible with the VkPipelineLayout
+... bound with vkCmdBindDescriptorSets
+```
+
+Exercise 4 walks you into it.
+
+The practical rule is simple: give pipelines that are drawn together one pipeline layout,
+even if some of them do not use every set. The lamp's fragment stage never reads set 1, and
+that is fine.
+
+## Materials do not need a copy per frame
+
+The per-frame buffers still come in pairs, one per frame in flight, because they are
+rewritten every frame while the GPU may still be reading last frame's copy — the reasoning
+from chapter 1.10.
+
+Material buffers are written **once**, at start-up, and never again:
+
+```cpp title="code/src/2.lighting/materials/main.cpp"
+std::memcpy(material_buffers_[i].mapped(), &kMaterials[i].material, sizeof(Material));
+```
+
+So there is one buffer and one set per material, full stop. The rule is not "one per frame
+in flight for everything" but "one per frame in flight for anything the CPU writes while
+the GPU might be reading it". A material that changed at run time would need the pairs
+back.
+
+## One pool, sized for everything
+
+Both kinds of set come out of one pool, and the pool has to be sized for the total:
+
+```cpp title="code/src/2.lighting/materials/main.cpp"
+const auto set_count =
+    static_cast<uint32_t>(vkc::kFramesInFlight + kMaterials.size());
+const VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, set_count};
+```
+
+Get it wrong and there is no validation warning. Set the count one short and the last
+allocation simply fails:
+
+```
+vkAllocateDescriptorSets(device, &material_alloc, material_sets_.data())
+failed with VK_ERROR_OUT_OF_POOL_MEMORY
+```
+
+A fixed-size pool is fine for a fixed scene. A scene that loads materials as it goes needs
+pools that grow — allocate a new pool when one runs out and keep a list — and that is where
+chapter 3.4 eventually replaces per-material sets altogether.
+
+## Layouts, once more
+
+The material block is 52 bytes: three `float4`s and a lone `float` at offset 48, which the
+disassembly confirms. The C++ struct pads it to 64:
+
+```cpp title="code/src/2.lighting/materials/main.cpp"
+struct Material {
+    glm::vec4 ambient;   // offset 0
+    glm::vec4 diffuse;   // offset 16
+    glm::vec4 specular;  // offset 32
+    float shininess;     // offset 48
+    float padding[3];
+};
+static_assert(sizeof(Material) == 64);
+```
+
+The shader would accept 52. The padding is there because `std140` rounds a *nested* struct
+up to a multiple of 16, so a later chapter that puts an array of these in one buffer needs
+the 64-byte version — and it costs nothing to have it right from the start.
+
+`Light` is nested inside `Globals`, and lands at offset 144 with no padding at all, because
+every member is a `float4`. Members largest-first, `float4` over `float3`: the habits from
+1.10 keep paying.
+
+## What changed since 2.2
+
+- `Material` moved into a uniform buffer per material, bound at **set 1**
+- the light gained ambient, diffuse and specular components, nested in `Globals`
+- the object colour left the push constants, which are back down to 112 bytes
+- the pipeline layout has two set layouts; both pipelines share it
+- one cube became five, one per material
+
+## Running it
+
+```bash
+./code/out/build/linux-debug/bin/2.3.materials
+```
+
+Fly close to each cube and watch the highlights. The emerald's and ruby's are tight; the
+obsidian's is broad and dim; the gold's is warm where the plastic's is neutral grey.
+
+## Exercises
+
+1. Set `kLightAmbient` to `(0.2, 0.2, 0.2, 1.0)` and `kLightDiffuse` to `(0.5, 0.5, 0.5,
+   1.0)`. The materials darken and the contrast between lit and unlit faces grows. Work out
+   why the gold cube's unlit faces change more than the obsidian's.
+2. Add a sixth material of your own — pick a colour and decide whether it should behave like
+   a metal (tinted specular) or a plastic (grey specular). You will need to change the pool
+   size, which is exactly the point.
+3. Make one material animate: pulse the ruby's diffuse colour over time by writing its buffer
+   every frame. Run it, then think about what can go wrong with a single buffer the GPU might
+   still be reading — and give that material a buffer per frame in flight.
+4. Break layout compatibility. Give the lamp pipeline a layout of its own: set 0 only, and a
+   push constant range visible to both stages instead of just the vertex stage. Switch to the
+   lamp pipeline and draw without rebinding set 0. Read what the validation layers say. Then,
+   after the switch, rebind set 0 and push the model matrix *through the lamp's own layout*
+   — both calls take a layout argument, and both must name the new one — and watch the
+   message go away.
+5. Swap the set numbers: put materials in set 0 and the frame data in set 1, changing both
+   the shader attributes and the `set_layouts` order, and get it rendering the same image
+   again. Then look at the render loop: which call now has to happen per material, which
+   once per frame, and why is the original order — rarest-changing data in the lowest set —
+   the one to keep?
