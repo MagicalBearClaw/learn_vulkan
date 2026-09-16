@@ -23,3 +23,12 @@ add_subdirectory(2.lighting/materials)
 add_subdirectory(2.lighting/lighting_maps)
 add_subdirectory(2.lighting/light_casters)
 add_subdirectory(2.lighting/multiple_lights)
+
+# Part 3 loads models with Assimp, which is the one dependency this project does not
+# fetch or vendor when it is missing (Dependencies.cmake explains why). Everything up
+# to here still builds without it, so the part is skipped rather than fatal.
+if(LVK_HAVE_ASSIMP)
+    add_subdirectory(3.model_loading/assimp)
+else()
+    message(STATUS "Skipping the model-loading chapters: Assimp was not found")
+endif()

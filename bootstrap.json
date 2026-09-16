@@ -1,14 +1,45 @@
 {
-  "$comment": "Assets used by the tutorial samples. Fetched by tools/bootstrap.py into assets/, which is gitignored. Everything here is openly licensed; see CREDITS.md. Chapters add entries as they need them.",
+  "$comment": "Assets used by the tutorial samples. Fetched by tools/bootstrap.py into assets/, which is gitignored. Everything here is openly licensed; see CREDITS.md. Chapters add entries as they need them. The glTF models are fetched file by file from a pinned commit of KhronosGroup/glTF-Sample-Assets rather than by cloning it: the repository is several gigabytes and these chapters use two models from it.",
   "assets": [
     {
-      "name": "gltf-sample-assets",
-      "description": "Khronos glTF sample models, used from the model-loading chapter onward",
-      "type": "git",
-      "url": "https://github.com/KhronosGroup/glTF-Sample-Assets.git",
-      "revision": "main",
-      "shallow": true,
-      "licence": "CC-BY 4.0 and others, per model; see the repository's LICENSE"
+      "name": "models/damaged_helmet",
+      "description": "Damaged Helmet: one mesh, one material. The model chapters 3.1 and 3.2 load.",
+      "type": "files",
+      "base-url": "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/90d7ede14c7e280af263824604b427a1ca02cb66/Models/DamagedHelmet/glTF-Binary",
+      "files": [
+        "DamagedHelmet.glb"
+      ],
+      "licence": "CC-BY-4.0",
+      "attribution": "Damaged Helmet by ctxwing (2018), rebuilt and converted to glTF from an earlier model by theblueturtle_. The .glb fetched here is the CC-BY-4.0 rebuild.",
+      "source": "https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/DamagedHelmet"
+    },
+    {
+      "name": "models/flight_helmet",
+      "description": "Flight Helmet: six meshes, five materials, separate textures. Chapters 3.3 and 3.4.",
+      "type": "files",
+      "base-url": "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/90d7ede14c7e280af263824604b427a1ca02cb66/Models/FlightHelmet/glTF",
+      "files": [
+        "FlightHelmet.gltf",
+        "FlightHelmet.bin",
+        "FlightHelmet_Materials_GlassPlasticMat_BaseColor.png",
+        "FlightHelmet_Materials_GlassPlasticMat_Normal.png",
+        "FlightHelmet_Materials_GlassPlasticMat_OcclusionRoughMetal.png",
+        "FlightHelmet_Materials_LeatherPartsMat_BaseColor.png",
+        "FlightHelmet_Materials_LeatherPartsMat_Normal.png",
+        "FlightHelmet_Materials_LeatherPartsMat_OcclusionRoughMetal.png",
+        "FlightHelmet_Materials_LensesMat_BaseColor.png",
+        "FlightHelmet_Materials_LensesMat_Normal.png",
+        "FlightHelmet_Materials_LensesMat_OcclusionRoughMetal.png",
+        "FlightHelmet_Materials_MetalPartsMat_BaseColor.png",
+        "FlightHelmet_Materials_MetalPartsMat_Normal.png",
+        "FlightHelmet_Materials_MetalPartsMat_OcclusionRoughMetal.png",
+        "FlightHelmet_Materials_RubberWoodMat_BaseColor.png",
+        "FlightHelmet_Materials_RubberWoodMat_Normal.png",
+        "FlightHelmet_Materials_RubberWoodMat_OcclusionRoughMetal.png"
+      ],
+      "licence": "CC0-1.0",
+      "attribution": "Flight Helmet, converted from Maya by Gary Hsu (2018). Public domain.",
+      "source": "https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/FlightHelmet"
     }
   ]
 }

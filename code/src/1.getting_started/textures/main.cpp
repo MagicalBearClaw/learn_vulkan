@@ -27,6 +27,12 @@
 
 #include <glm/glm.hpp>
 #include <spdlog/spdlog.h>
+
+// stb is a header-only library: one translation unit has to compile its implementation.
+// STB_IMAGE_STATIC keeps the result private to this file, which matters from chapter 3.1
+// onward -- Assimp bundles its own stb_image and exports the same names.
+#define STB_IMAGE_STATIC
+#define STB_IMAGE_IMPLEMENTATION
 #include <stb_image.h>
 
 #include <algorithm>

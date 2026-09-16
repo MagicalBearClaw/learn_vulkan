@@ -4,6 +4,12 @@
 #include "vkc/check.hpp"
 #include "vkc/context.hpp"
 
+// stb_image's implementation is compiled into this file, and STB_IMAGE_STATIC keeps its
+// symbols private to it. Assimp ships its own copy of stb_image and exports the same
+// names from its static library, so one global definition anywhere in vkcommon would
+// collide with it the moment a chapter links both. A private copy cannot clash.
+#define STB_IMAGE_STATIC
+#define STB_IMAGE_IMPLEMENTATION
 #include <stb_image.h>
 
 #include <algorithm>

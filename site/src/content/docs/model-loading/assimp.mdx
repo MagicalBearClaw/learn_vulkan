@@ -1,0 +1,339 @@
+---
+title: Assimp
+description: Where vertices come from when you stop typing them - what is really inside a model file, what Assimp does with it, and which of its post-processing flags matter.
+sidebar:
+  order: 1
+---
+
+<figure>
+  <img src="/img/reference/3.1.assimp.png" alt="An untextured grey sci-fi helmet, lit from the front left, seen at three-quarters" />
+  <figcaption>Chapter 3.1: 14 354 vertices that nobody in this project typed.</figcaption>
+</figure>
+
+Every scene in this series so far has been the same 24 vertices, written out as a C++ array
+and pasted from chapter to chapter. That was the right call while the subject was pipelines
+and descriptors — a cube you can read in one screen never lies to you about what the
+renderer is doing.
+
+It has also been quietly hiding the question this part answers: **where do vertices actually
+come from?** Not from an array. From a file, in a format this project did not design,
+describing a shape nobody here modelled.
+
+## What is actually in the file
+
+The model this chapter loads is `DamagedHelmet.glb`, 3.6 MiB, from the Khronos glTF sample
+assets. `tools/bootstrap.py` fetches it. Before writing any code it is worth looking at what
+that file claims to contain, which you can do without a renderer at all — glTF is JSON:
+
+| | |
+|---|---|
+| scenes | 1 |
+| nodes | 1, carrying a rotation of 90° about x |
+| meshes | 1 |
+| materials | 1 |
+| textures / images | 5, all JPEG, embedded in the file |
+| accessors | 4 — position, normal, texcoord, indices |
+
+A `.gltf` is that JSON plus separate binary and image files; a `.glb` is the same JSON, the
+binary buffer and every image packed into one file. Neither is a format you would invent for
+a GPU to read directly — it is a description, and something has to turn it into buffers.
+
+That "something" is the interesting part. glTF is one format. There are dozens in use, and a
+renderer that only reads glTF cannot open anything an artist hands it.
+
+## One library, one tree
+
+Assimp (the Open Asset Import Library) reads about forty formats and hands every one of them
+back in the same shape:
+
+```
+aiScene
+├── mRootNode ──── aiNode ──── children, a transform, and indices into mMeshes
+├── mMeshes[]      aiMesh    ─ positions, normals, UVs, faces, one material index
+├── mMaterials[]   aiMaterial ─ named properties: textures, colours, factors
+└── mTextures[]    aiTexture  ─ images embedded in the file rather than beside it
+```
+
+Two things about that structure are worth fixing in your head now, because the next three
+chapters are built on them.
+
+**A mesh is not an object.** It is a run of vertices sharing *one material*. A single visible
+thing in a scene is usually several meshes, because it is made of several materials.
+
+**The nodes are where the positions come from.** `aiMesh` holds vertices in its own local
+space; the transform that places it in the world is the product of the node transforms from
+the root down. A mesh on its own does not know where it is.
+
+This chapter deliberately uses neither fact, and 3.2 and 3.3 are exactly the chapters that
+stop ducking them.
+
+## The flags are the library
+
+`ReadFile` takes a bitmask of post-processing steps. They read like options and they are not
+— each one is a real pass over the data, and choosing them is most of what using Assimp well
+consists of.
+
+```cpp title="code/src/3.model_loading/assimp/main.cpp"
+constexpr unsigned int kImportFlags =
+    aiProcess_Triangulate | aiProcess_GenSmoothNormals |
+    aiProcess_JoinIdenticalVertices | aiProcess_PreTransformVertices |
+    aiProcess_ImproveCacheLocality;
+```
+
+| Flag | What it does |
+|---|---|
+| `Triangulate` | Turns every face into triangles. A quad or an n-gon in the file is not something the pipeline can consume. |
+| `GenSmoothNormals` | Generates normals if the file has none, averaged across the faces meeting at each vertex. A no-op when they are present, as they are here. |
+| `JoinIdenticalVertices` | Deduplicates, so a shared corner becomes one vertex referenced many times. This is what makes an index buffer worth having. |
+| `PreTransformVertices` | Collapses the node hierarchy, baking each node's transform into its vertices. |
+| `ImproveCacheLocality` | Reorders triangles so nearby ones share vertices, which the GPU's post-transform cache rewards. |
+
+`PreTransformVertices` is the one doing the most work for this chapter, and it is the
+simplification the whole chapter rests on: it is what lets a sample with no concept of a
+scene graph draw a model correctly. The helmet's single node carries a 90° rotation about x —
+the usual z-up-to-y-up correction — and baking it is the difference between a helmet standing
+up and a helmet lying on its back. Exercise 1 is to see that happen.
+
+:::caution[The `aiProcess_FlipUVs` trap]
+Most OpenGL material passes `aiProcess_FlipUVs`, and copying that here would be a bug.
+
+OpenGL puts texture coordinate `(0,0)` at the **bottom** left, while glTF puts it at the
+**top** left — so an OpenGL renderer has to flip, and a Vulkan one does not, because Vulkan
+agrees with glTF. Flipping anyway means flipping twice.
+
+It costs nothing in this chapter, which samples no textures at all. It costs an afternoon in
+3.2, where the symptom is a texture that looks plausible until you notice the lettering is
+upside down.
+:::
+
+## Reading a mesh
+
+With those flags chosen, pulling the data out is a loop and no cleverness:
+
+```cpp title="code/src/3.model_loading/assimp/main.cpp"
+Assimp::Importer importer;
+const aiScene* scene = importer.ReadFile(path.string(), kImportFlags);
+
+if (scene == nullptr || (scene->mFlags & AI_SCENE_FLAGS_INCOMPLETE) != 0 ||
+    scene->mRootNode == nullptr) {
+    throw std::runtime_error("Assimp could not read " + path.string() + ": " +
+                             importer.GetErrorString());
+}
+```
+
+Three failure cases rather than one, and the middle is the dangerous one:
+`AI_SCENE_FLAGS_INCOMPLETE` means Assimp returned a scene it only partly understood. It is
+not null, it is not an error, and it is missing data — check it, or you will debug a renderer
+for something the loader already knew.
+
+:::note[The `Importer` owns the scene]
+`aiScene` lives inside the `Importer` and dies with it. Everything the sample keeps is copied
+out before `load_model` returns. Holding an `aiScene*` past that point is a use-after-free,
+and it is the most common way to misuse this library.
+:::
+
+Then, per mesh:
+
+```cpp title="code/src/3.model_loading/assimp/main.cpp"
+const auto base = static_cast<uint32_t>(model.vertices.size());
+
+for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
+    Vertex vertex{};
+    vertex.position = to_glm(mesh->mVertices[v]);
+    vertex.normal = mesh->HasNormals() ? to_glm(mesh->mNormals[v])
+                                       : glm::vec3(0.0F, 1.0F, 0.0F);
+    vertex.uv = mesh->HasTextureCoords(0)
+                    ? glm::vec2(mesh->mTextureCoords[0][v].x,
+                                mesh->mTextureCoords[0][v].y)
+                    : glm::vec2(0.0F);
+    model.vertices.push_back(vertex);
+}
+
+for (unsigned int f = 0; f < mesh->mNumFaces; ++f) {
+    const aiFace& face = mesh->mFaces[f];
+    for (unsigned int i = 0; i < face.mNumIndices; ++i) {
+        model.indices.push_back(base + face.mIndices[i]);
+    }
+}
+```
+
+`base` is the only subtle line. Each mesh numbers its indices from zero, and this chapter
+concatenates every mesh into one pair of buffers, so each mesh's indices shift up by the
+number of vertices already in. Get it wrong with a one-mesh model and nothing happens, which
+is precisely why it is worth pointing at.
+
+`mTextureCoords` is an array of up to eight UV sets. Set 0 is the one materials use by
+default and the only one this series reads.
+
+Running it prints what it found:
+
+```
+DamagedHelmet.glb: 1 mesh(es), 2 material(s), 5 embedded texture(s)
+  mesh 0 "mesh_helmet_LP_13930damagedHelmet": 14354 vertices, 15452 faces, material 0
+  total: 14354 vertices, 46356 indices, bounds (-0.95 -0.90 -1.19) to (0.94 0.90 0.81)
+```
+
+15 452 faces × 3 = 46 356 indices, which is the arithmetic confirming `Triangulate` did what
+it said.
+
+**Two materials, in a file that declares one.** Assimp synthesises a default material for
+meshes that reference none, so its material count is routinely one higher than the file's.
+Nothing here uses it — but a loop over `mNumMaterials` that expects the file's own count is
+a bug waiting for 3.3, where materials stop being ignorable.
+
+## How big is it, and where?
+
+An array of 24 vertices needs no introduction. A file does:
+
+```cpp title="code/src/3.model_loading/assimp/main.cpp"
+model_matrix_ = glm::rotate(glm::mat4(1.0F), glm::radians(215.0F),
+                            glm::vec3(0.0F, 1.0F, 0.0F)) *
+                glm::translate(glm::mat4(1.0F), -model.centre());
+camera_.position = {0.0F, 0.0F, model.radius() * 2.6F};
+```
+
+This is why `load_model` returns the bounding box along with the buffers. A model file
+carries no promise about scale, origin or facing: it may be centred or it may not, and it may
+be measured in metres, centimetres or nothing in particular. Without measuring it, the first
+run of any new model is either an empty screen or a wall of polygons an inch from the camera,
+and both look exactly like a broken renderer.
+
+The half-turn is chosen by eye. glTF fixes the axes — y up, z toward the viewer — but nothing
+says which way a model *faces*, so you look at it and you turn it.
+
+## What Vulkan sees
+
+Almost nothing changed, which is the honest lesson of the chapter. A vertex buffer does not
+care where its bytes came from, and `vkc::upload_to_device_local` from 1.8 uploads 14 354
+vertices exactly as it uploaded 24.
+
+One line is genuinely different:
+
+```cpp title="code/src/3.model_loading/assimp/main.cpp"
+vkCmdBindIndexBuffer(frame.cmd, index_buffer_.handle(), 0, VK_INDEX_TYPE_UINT32);
+```
+
+Every chapter so far used `VK_INDEX_TYPE_UINT16`, because a cube has 24 vertices. Models do
+not live under a 65 535-vertex ceiling, and two bytes per index is not a saving worth an
+arbitrary limit for.
+
+The pipeline also declares **two** vertex attributes where `Vertex` has three fields. The
+loader fills `uv` in and nothing samples it yet, so the stride counts it and the pipeline does
+not mention it. Describing it anyway is not free — add a third attribute for it and the
+validation layers say so at pipeline creation:
+
+```
+vkCreateGraphicsPipelines(): pCreateInfos[0].pVertexInputState
+Vertex attribute at location 2 not consumed by vertex shader.
+```
+
+Which is a warning rather than an error: the pipeline is created and the model still draws.
+It is worth keeping clean anyway, because it is the same check that catches the genuinely
+broken case — a shader input with no attribute feeding it. 3.2 turns `uv` on properly.
+
+:::note[Nothing new in `vkcommon`]
+Part 3's first chapter adds no shared code. Model loading does not enter `vkcommon` yet
+because the thing worth sharing is not the `Assimp::Importer` call — it is the `Mesh` and
+`Model` types that 3.2 and 3.3 build, and those chapters write them out in full first.
+:::
+
+## Building it
+
+Assimp is the one dependency in this project that CMake does not fetch or vendor when it is
+missing. VMA, stb and Slang all have fallbacks; Assimp is a large C++ library that takes
+minutes to build and brings its own compression dependencies, so a clear message beats a long
+build:
+
+```cmake title="code/cmake/Dependencies.cmake"
+find_package(assimp CONFIG QUIET)
+if(TARGET assimp::assimp)
+    set(LVK_HAVE_ASSIMP TRUE)
+else()
+    set(LVK_HAVE_ASSIMP FALSE)
+    message(WARNING "Assimp was not found, so the model-loading chapters ...")
+endif()
+```
+
+Missing Assimp is a warning, not an error, and `code/src/CMakeLists.txt` skips Part 3 rather
+than failing the build. Everything through 2.6 still compiles. The vcpkg presets have Assimp
+already; a system build needs `assimp` from your distribution, and the warning names the
+package.
+
+:::caution[Assimp exports stb's symbols, and it will break your link]
+Adding Assimp broke every Part 3 target with an error that has nothing to do with models:
+
+```
+multiple definition of `stbi_load'
+```
+
+Assimp bundles its own copy of `stb_image` and its static library exports all 43 `stbi_*`
+symbols. This project also compiles `stb_image`, for texture loading and screenshots, and two
+definitions of the same symbol do not link.
+
+The fix is to stop exporting ours. `stb_image`'s implementation macro now lives in the two
+translation units that actually read an image file — `vkcommon`'s `image.cpp` and chapter
+1.11 — each with `STB_IMAGE_STATIC`, which gives the implementation internal linkage:
+
+```cpp title="code/common/scaffold/src/image.cpp"
+#define STB_IMAGE_STATIC
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb_image.h>
+```
+
+A private copy cannot collide with anybody's. `stb_image_write` stays shared in
+`stb_impl.cpp`, because nothing else exports `stbi_write_*`.
+
+It is worth knowing this shape in general: a static library that vendors a common
+header-only dependency will export its symbols unless its authors hid them, and the collision
+surfaces at link time in whatever unlucky target happens to use both.
+:::
+
+## Running it
+
+```bash
+python3 tools/bootstrap.py          # once, to fetch the model
+./code/out/build/linux-vcpkg-debug/bin/3.1.assimp
+```
+
+A grey helmet, lit by a key and a fill. Right-click to capture the mouse, `WASD` to fly.
+
+Fly close and look along a curved surface. Those are interpolated vertex normals doing the
+work — the mesh is 15 452 flat triangles, and the only reason it reads as a smooth shell is
+that the file shipped a normal per vertex and the rasteriser blends them across each face.
+
+## What changed since 2.6
+
+- vertices come from a file instead of a `constexpr std::array`
+- `VK_INDEX_TYPE_UINT32` instead of `UINT16`
+- the lighting is cut back to two directional lights and a flat albedo — the subject here is
+  the geometry, and Part 2's six-light array would only be in the way
+- no textures, no material set, one descriptor set and one draw call
+- `assimp::assimp` is linked by this chapter only, through `add_chapter`'s `LIBS` argument
+
+## Exercises
+
+1. Delete `aiProcess_PreTransformVertices` and run it. The helmet tips onto its back — the
+   node's 90° rotation about x is no longer applied to anything, and the loader ignores node
+   transforms entirely. The printed bounds are the proof: `(-0.95 -0.90 -1.19)…(0.94 0.90
+   0.81)` becomes `(-0.95 -1.19 -0.90)…(0.94 0.81 0.90)`, with y and z swapped. Chapter 3.3
+   is where that transform gets applied properly instead of baked away.
+2. Print every material's name with `scene->mMaterials[i]->GetName()`. There are two for a
+   file that declares one, and the extra is Assimp's default. Work out which meshes reference
+   it here.
+3. Point the loader at `assets/models/flight_helmet/FlightHelmet.gltf`, which `bootstrap.py`
+   has already fetched. It has six meshes and six materials, and this chapter's loader
+   concatenates them into one buffer and paints the lot in a single grey. It renders — and it
+   is exactly the wrong answer, which is what 3.2 exists to fix.
+4. Swap `VK_INDEX_TYPE_UINT32` back to `UINT16` without changing the buffer's contents.
+   Predict what you will see before you run it: the model has 14 354 vertices, so its indices
+   *would* fit in 16 bits, but the bytes in the buffer are 32-bit values. Then explain the
+   shape on screen.
+5. Time the `ReadFile` call with `std::chrono` and print the milliseconds, then run again
+   without `aiProcess_ImproveCacheLocality` and `aiProcess_JoinIdenticalVertices`. Loading is
+   not free, and knowing which flags cost what is the difference between a two-second startup
+   and a twenty-second one on a real scene.
+6. Feed it a file that does not exist, and one that is not a model at all — rename a `.png` to
+   `.glb`. Both should produce the loader's own message rather than a crash or a blank window.
+
+Next: 3.2, where a mesh stops being a pile of vertices and becomes an object that owns its
+buffers and its material.

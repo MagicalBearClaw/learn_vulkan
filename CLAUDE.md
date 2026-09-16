@@ -84,6 +84,11 @@ python3 tools/make_textures.py
 
 # Site
 cd site && npm run dev
+
+# Site build. `npm run build` is `astro check && astro build`, and astro check
+# prompts to install @astrojs/check when it is missing -- which hangs forever in a
+# non-interactive shell. This is the unattended form:
+cd site && npx astro build < /dev/null
 ```
 
 ## Conventions
@@ -108,9 +113,22 @@ cd site && npm run dev
   Linux-only code without guarding it.
 - **Three presets, all working.** `linux-debug` builds against system packages
   (`LVK_DEPS=system`), `linux-vcpkg-debug` builds against vcpkg and installs nothing
-  system-wide, and Windows uses vcpkg. Verified by building all 21 chapters both ways,
+  system-wide, and Windows uses vcpkg. Verified by building every chapter both ways,
   warning-free, and running `tools/capture.py --all` against each build tree: every
-  chapter renders 0.00% different in both modes.
+  chapter renders 0.00% different in both modes. The counts differ from Part 3 on:
+  vcpkg builds 22 chapters, `linux-debug` builds 21 and skips 3.1, because this machine
+  has no system Assimp.
+- **Assimp is the one dependency with no fallback.** VMA, stb and Slang are fetched when
+  missing; Assimp is not, because it is large and slow to build. `Dependencies.cmake`
+  warns instead of failing and sets `LVK_HAVE_ASSIMP`, which `code/src/CMakeLists.txt`
+  uses to skip Part 3. Everything through 2.6 must keep building without it.
+- **Assimp exports stb_image's symbols.** Its static library defines all 43 `stbi_*`
+  names, so a second global definition anywhere in this project makes every Part 3
+  target fail to link with `multiple definition of stbi_load`. `stb_impl.cpp` therefore
+  holds only `STB_IMAGE_WRITE_IMPLEMENTATION`; the two TUs that read images -- vkcommon's
+  `image.cpp` and chapter 1.11 -- compile their own copy with `STB_IMAGE_STATIC`. stb is
+  an `-isystem` include, so those TUs stay warning-free. Do not put a global
+  `STB_IMAGE_IMPLEMENTATION` back.
 - The repository path contains spaces. This was long recorded here as breaking vcpkg,
   and it does not, for this dependency set: the build tree and `vcpkg_installed` both
   live under the spaced path and install fine. The one autotools port that ever

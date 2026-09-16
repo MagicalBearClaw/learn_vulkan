@@ -12,8 +12,8 @@
 # Either way the rest of the build sees the same imported targets, so no sample or
 # CMakeLists anywhere else has to care which mode is active.
 #
-# Note for vcpkg users: several vcpkg ports build through autotools, which mishandles
-# paths containing spaces. Keep the checkout somewhere without them.
+# Both modes work on Linux, including from a path containing spaces: this dependency
+# set reaches no autotools port, so nothing here needs a space-free checkout.
 
 if(WIN32)
     set(_lvk_default_deps "vcpkg")
@@ -107,8 +107,8 @@ endif()
 # compression dependencies, and every platform this series targets already packages
 # it -- so a clear message beats a long build.
 # Not fatal when missing: only the Part 3 chapters need it, and the rest of the series
-# should still configure and build without it. LVK_HAVE_ASSIMP is what those chapters
-# will be gated on once they exist; nothing reads it yet.
+# should still configure and build without it. code/src/CMakeLists.txt gates those
+# chapters on LVK_HAVE_ASSIMP.
 find_package(assimp CONFIG QUIET)
 if(TARGET assimp::assimp)
     set(LVK_HAVE_ASSIMP TRUE)

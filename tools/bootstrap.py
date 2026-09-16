@@ -54,7 +54,29 @@ def fetch_archive(entry: dict, target: Path) -> None:
     archive.unlink()
 
 
-FETCHERS = {"git": fetch_git, "archive": fetch_archive}
+def fetch_files(entry: dict, target: Path) -> None:
+    """Download a named list of files from one base URL.
+
+    The models this series uses are a handful of files inside a very large repository,
+    so cloning it to get them would cost gigabytes for a few megabytes of asset. The
+    base URL pins a commit rather than a branch: a sample's reference screenshot is
+    compared pixel by pixel, and an asset that changed underneath it would look like a
+    renderer regression.
+    """
+    base = entry["base-url"].rstrip("/")
+    headers = {"User-Agent": entry.get("user-agent", "learn-vulkan-bootstrap")}
+    target.mkdir(parents=True, exist_ok=True)
+
+    for name in entry["files"]:
+        destination = target / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        print(f"  downloading {name}")
+        request = urllib.request.Request(f"{base}/{name}", headers=headers)
+        with urllib.request.urlopen(request) as response, destination.open("wb") as out:
+            shutil.copyfileobj(response, out)
+
+
+FETCHERS = {"git": fetch_git, "archive": fetch_archive, "files": fetch_files}
 
 
 def main() -> int:

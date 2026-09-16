@@ -37,6 +37,23 @@ python3 tools/make_textures.py
 Everything else under `assets/` is downloaded by `tools/bootstrap.py` from the sources
 listed in `bootstrap.json`, and each entry there records its licence.
 
+### Models
+
+Both come from the Khronos
+[glTF-Sample-Assets](https://github.com/KhronosGroup/glTF-Sample-Assets) repository, and
+`bootstrap.json` fetches them file by file from a pinned commit rather than cloning it —
+the repository is several gigabytes and these chapters use two models from it.
+
+| Model | Used from | Author | Licence |
+|---|---|---|---|
+| Damaged Helmet | 3.1 | [ctxwing](https://github.com/ctxwing), 2018 | [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) |
+| Flight Helmet | 3.3 | Gary Hsu, 2018 | [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) |
+
+Damaged Helmet is ctxwing's rebuild and glTF conversion of an earlier model by
+theblueturtle\_. The two are licensed separately: the rebuild — the `.glb` fetched here
+and the only version this series uses — is CC BY 4.0, while theblueturtle\_'s earlier
+version is CC BY-NC 4.0 and is not used.
+
 ## Libraries
 
 | Library | Used for | Licence |
