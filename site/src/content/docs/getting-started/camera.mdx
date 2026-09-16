@@ -203,6 +203,19 @@ Added to `vkcommon` after this chapter: `vkc::Camera`, which is this code with t
 handling folded in. The first chapter to use it is 2.1, where the subject is lighting and
 a camera is something you want to already have.
 
+This is also the first chapter that takes its **depth buffer** from `vkcommon` instead of
+building one itself. Chapter 1.13 wrote `choose_depth_format` and `create_depth_buffer`
+out in full and explained every line of both; from here on they are two calls:
+
+```cpp title="code/src/1.getting_started/camera/main.cpp"
+depth_format_ = vkc::choose_depth_format(context().physical_device());
+depth_ = vkc::create_depth_buffer(context(), depth_format_, swapchain().extent());
+```
+
+`create_depth_buffer` still does exactly what 1.13 did: wait for the GPU to go idle,
+create a depth-format image with the `DEPTH` aspect, and move it to
+`DEPTH_ATTACHMENT_OPTIMAL` once so that no frame ever has to.
+
 ## Exercises
 
 1. Remove the `delta_time()` multiplication and run the sample with `--frames 2000` while

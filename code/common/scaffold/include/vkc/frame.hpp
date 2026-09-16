@@ -29,6 +29,14 @@ inline constexpr uint32_t kFramesInFlight = 2;
 void transition_image(VkCommandBuffer cmd, VkImage image, VkImageLayout from,
                       VkImageLayout to);
 
+// Opens dynamic rendering into a colour view and a depth view, clearing both.
+//
+// Chapter 1.5 introduced VkRenderingInfo and 1.13 added the depth attachment. Both
+// attachments clear on load, so neither needs its previous contents; the depth buffer's
+// storeOp is DONT_CARE because nothing reads it once the frame is over.
+void begin_rendering(VkCommandBuffer cmd, VkImageView colour_view, VkImageView depth_view,
+                     VkExtent2D extent, const VkClearColorValue& clear_colour);
+
 // What a sample gets handed for the duration of one frame.
 struct FrameInfo {
     VkCommandBuffer cmd = VK_NULL_HANDLE;

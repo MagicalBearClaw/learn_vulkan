@@ -134,16 +134,26 @@ constant; if it varies per frame it belongs in a uniform buffer.
 
 ## What is in `vkcommon` now
 
-Nothing new. Part 2 added not one line to the shared library — every chapter in it is the
-same renderer with different arithmetic, which is exactly why the part is about shading
-rather than about Vulkan.
+No new subsystem. Part 2 did not teach one — every chapter in it is the same renderer with
+different arithmetic, which is exactly why the part is about shading rather than about
+Vulkan.
 
-There is one piece of honest debt to record. Chapter 1.13 taught the depth buffer, so by
-this series' own rule it could have moved into `vkcommon` from 1.14. It did not, and the
-result is that **eight chapters each define their own `choose_depth_format` and
-`create_depth_buffer`**, and six each define an identical `begin_rendering`. That is
-copy-paste, it has been copy-paste since 1.14, and Part 3 folds all three into `vkcommon`
-where they belonged two chapters into Part 1.
+What did change is that a piece of long-standing debt got paid. Chapter 1.13 taught the
+depth buffer, so by this series' own rule it could have moved into `vkcommon` from 1.14.
+It did not, and for a while **eight chapters each defined their own `choose_depth_format`
+and `create_depth_buffer`**, while six more repeated an identical `begin_rendering`. All
+three now live in the shared library — the two depth helpers in `image.cpp`,
+`begin_rendering` in `frame.cpp`:
+
+```cpp
+depth_format_ = vkc::choose_depth_format(context().physical_device());
+depth_ = vkc::create_depth_buffer(context(), depth_format_, swapchain().extent());
+vkc::begin_rendering(frame.cmd, frame.view, depth_.view(), frame.extent, clear);
+```
+
+Chapter 1.13 keeps its hand-written copies, because it is the chapter that teaches them.
+Every chapter after it calls them. The rule has still not been broken: nothing entered
+`vkcommon` before the chapter that explained it.
 
 ## Things Part 2 did badly on purpose
 

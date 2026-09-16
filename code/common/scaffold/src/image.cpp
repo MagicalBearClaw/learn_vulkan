@@ -7,6 +7,7 @@
 #include <stb_image.h>
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstring>
 #include <format>
@@ -250,6 +251,54 @@ Image load_texture(Context& context, const std::filesystem::path& path,
     });
 
     return image;
+}
+
+VkFormat choose_depth_format(VkPhysicalDevice physical_device) {
+    // Most precise first. A format is only usable as a depth attachment if the GPU says
+    // so, and asking is cheaper than assuming: D24_UNORM_S8_UINT is absent on some
+    // desktop GPUs and D32_SFLOAT_S8_UINT on some mobile ones.
+    constexpr std::array candidates{
+        VK_FORMAT_D32_SFLOAT,
+        VK_FORMAT_D32_SFLOAT_S8_UINT,
+        VK_FORMAT_D24_UNORM_S8_UINT,
+    };
+
+    for (const VkFormat format : candidates) {
+        VkFormatProperties properties{};
+        vkGetPhysicalDeviceFormatProperties(physical_device, format, &properties);
+        if ((properties.optimalTilingFeatures &
+             VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0) {
+            return format;
+        }
+    }
+    throw std::runtime_error("No supported depth attachment format was found.");
+}
+
+Image create_depth_buffer(Context& context, VkFormat format, VkExtent2D extent) {
+    // The GPU must have finished with the old depth buffer before it is replaced. A
+    // resize already waits for idle, and at start-up there is nothing in flight, so this
+    // costs nothing in either case.
+    context.wait_idle();
+
+    Image depth(context, ImageDesc{
+                             .format = format,
+                             .extent = extent,
+                             .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                             .mip_levels = 1,
+                             // The aspect is the easy one to forget, and it has to match
+                             // in the view and in every barrier.
+                             .aspect = VK_IMAGE_ASPECT_DEPTH_BIT,
+                         });
+
+    // A new image is in UNDEFINED. Moving it to the attachment layout once here means no
+    // frame ever has to, and loadOp CLEAR discards the contents anyway.
+    immediate_submit(context, [&](VkCommandBuffer cmd) {
+        depth.transition(cmd, VK_IMAGE_LAYOUT_UNDEFINED,
+                         VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
+    });
+
+    context.name(depth.handle(), VK_OBJECT_TYPE_IMAGE, "depth buffer");
+    return depth;
 }
 
 Sampler::Sampler(Context& context, const SamplerDesc& desc)

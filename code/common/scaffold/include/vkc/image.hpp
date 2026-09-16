@@ -79,6 +79,16 @@ private:
 [[nodiscard]] Image load_texture(Context& context, const std::filesystem::path& path,
                                  VkFormat format = VK_FORMAT_R8G8B8A8_SRGB);
 
+// Picks a depth format this GPU can use as a depth attachment, preferring the most
+// precise. Chapter 1.13 wrote this out and explained the order: D32_SFLOAT first, the
+// two stencil-carrying formats behind it as fallbacks.
+[[nodiscard]] VkFormat choose_depth_format(VkPhysicalDevice physical_device);
+
+// Creates a depth image and leaves it in DEPTH_ATTACHMENT_OPTIMAL, ready to attach.
+// Chapter 1.13 again, called once at start-up and again on every resize.
+[[nodiscard]] Image create_depth_buffer(Context& context, VkFormat format,
+                                        VkExtent2D extent);
+
 // How to read between texels. Kept separate from Image on purpose: a sampler is an
 // independent object in Vulkan, and a handful of them serve a whole scene.
 struct SamplerDesc {

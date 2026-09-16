@@ -158,8 +158,9 @@ protected:
             context(), kIndices.data(), sizeof(kIndices),
             VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
 
-        depth_format_ = choose_depth_format();
-        create_depth_buffer(swapchain().extent());
+        depth_format_ = vkc::choose_depth_format(context().physical_device());
+        depth_ = vkc::create_depth_buffer(context(), depth_format_,
+                                          swapchain().extent());
 
         load_textures();
         create_uniform_buffers();
@@ -175,7 +176,9 @@ protected:
         spdlog::info("Right-click to capture the mouse, WASD to fly, Escape to quit.");
     }
 
-    void on_resize(VkExtent2D extent) override { create_depth_buffer(extent); }
+    void on_resize(VkExtent2D extent) override {
+        depth_ = vkc::create_depth_buffer(context(), depth_format_, extent);
+    }
 
     // The whole of 1.14's on_event and move_camera, now that vkc::Camera owns both.
     void on_event(const SDL_Event& event) override {
@@ -213,7 +216,8 @@ protected:
         const size_t slot = frame.frame_number % vkc::kFramesInFlight;
         update_globals(slot, frame.extent, light_position);
 
-        begin_rendering(frame);
+        vkc::begin_rendering(frame.cmd, frame.view, depth_.view(), frame.extent,
+                             {{0.02F, 0.02F, 0.04F, 1.0F}});
 
         set_viewport(frame);
 
@@ -278,52 +282,10 @@ private:
     }
 
     // ---------------------------------------------------------------------------
-    // Frame plumbing, unchanged from 1.14
+    // Frame plumbing. choose_depth_format, create_depth_buffer and begin_rendering
+    // now live in vkcommon -- 1.13 wrote all three out in full -- which leaves the
+    // viewport and the projection matrix here.
     // ---------------------------------------------------------------------------
-
-    void begin_rendering(const vkc::FrameInfo& frame) {
-        const VkClearValue colour_clear{.color = {{0.02F, 0.02F, 0.04F, 1.0F}}};
-        const VkRenderingAttachmentInfo colour_attachment{
-            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-            .pNext = nullptr,
-            .imageView = frame.view,
-            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            .resolveMode = VK_RESOLVE_MODE_NONE,
-            .resolveImageView = VK_NULL_HANDLE,
-            .resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-            .clearValue = colour_clear,
-        };
-
-        const VkClearValue depth_clear{.depthStencil = {1.0F, 0}};
-        const VkRenderingAttachmentInfo depth_attachment{
-            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-            .pNext = nullptr,
-            .imageView = depth_.view(),
-            .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-            .resolveMode = VK_RESOLVE_MODE_NONE,
-            .resolveImageView = VK_NULL_HANDLE,
-            .resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-            .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-            .clearValue = depth_clear,
-        };
-
-        const VkRenderingInfo rendering{
-            .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
-            .pNext = nullptr,
-            .flags = 0,
-            .renderArea = {{0, 0}, frame.extent},
-            .layerCount = 1,
-            .viewMask = 0,
-            .colorAttachmentCount = 1,
-            .pColorAttachments = &colour_attachment,
-            .pDepthAttachment = &depth_attachment,
-            .pStencilAttachment = nullptr,
-        };
-        vkCmdBeginRendering(frame.cmd, &rendering);
-    }
 
     static void set_viewport(const vkc::FrameInfo& frame) {
         const VkViewport viewport{
@@ -338,44 +300,6 @@ private:
 
         const VkRect2D scissor{.offset = {0, 0}, .extent = frame.extent};
         vkCmdSetScissor(frame.cmd, 0, 1, &scissor);
-    }
-
-    [[nodiscard]] VkFormat choose_depth_format() {
-        constexpr std::array candidates{
-            VK_FORMAT_D32_SFLOAT,
-            VK_FORMAT_D32_SFLOAT_S8_UINT,
-            VK_FORMAT_D24_UNORM_S8_UINT,
-        };
-
-        for (const VkFormat format : candidates) {
-            VkFormatProperties properties{};
-            vkGetPhysicalDeviceFormatProperties(context().physical_device(), format,
-                                                &properties);
-            if ((properties.optimalTilingFeatures &
-                 VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0) {
-                return format;
-            }
-        }
-        throw std::runtime_error("No supported depth attachment format was found.");
-    }
-
-    void create_depth_buffer(VkExtent2D extent) {
-        context().wait_idle();
-        depth_ = vkc::Image(
-            context(), vkc::ImageDesc{
-                           .format = depth_format_,
-                           .extent = extent,
-                           .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
-                           .mip_levels = 1,
-                           .aspect = VK_IMAGE_ASPECT_DEPTH_BIT,
-                       });
-
-        vkc::immediate_submit(context(), [&](VkCommandBuffer cmd) {
-            depth_.transition(cmd, VK_IMAGE_LAYOUT_UNDEFINED,
-                              VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
-        });
-
-        context().name(depth_.handle(), VK_OBJECT_TYPE_IMAGE, "depth buffer");
     }
 
     [[nodiscard]] static glm::mat4 build_projection(VkExtent2D extent) {

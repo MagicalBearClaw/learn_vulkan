@@ -156,6 +156,22 @@ void on_event(const SDL_Event& event) override {
 // and, once per frame:
 camera_.update(delta_time());
 ```
+
+The depth buffer and the start of the render pass come from there too, for the same
+reason — chapter 1.13 wrote all three out and explained them:
+
+```cpp title="code/src/2.lighting/colours/main.cpp"
+depth_format_ = vkc::choose_depth_format(context().physical_device());
+depth_ = vkc::create_depth_buffer(context(), depth_format_, swapchain().extent());
+
+// and, once per frame:
+vkc::begin_rendering(frame.cmd, frame.view, depth_.view(), frame.extent,
+                     {{0.02F, 0.02F, 0.04F, 1.0F}});
+```
+
+`begin_rendering` fills in the two `VkRenderingAttachmentInfo` structures and the
+`VkRenderingInfo` around them. Both attachments clear on load; the depth buffer's
+`storeOp` is `DONT_CARE`, because nothing reads it once the frame is over.
 :::
 
 Also gone: the texture, the sampler, and the texture coordinate on `Vertex`. They come

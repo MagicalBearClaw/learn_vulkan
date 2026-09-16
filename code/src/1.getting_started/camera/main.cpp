@@ -186,8 +186,9 @@ protected:
                                                    VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
                                            });
 
-        depth_format_ = choose_depth_format();
-        create_depth_buffer(swapchain().extent());
+        depth_format_ = vkc::choose_depth_format(context().physical_device());
+        depth_ = vkc::create_depth_buffer(context(), depth_format_,
+                                          swapchain().extent());
 
         create_uniform_buffers();
         create_descriptors();
@@ -201,7 +202,9 @@ protected:
 
     // The depth buffer is exactly the size of the colour attachment, so it has to
     // follow the swapchain when the window changes.
-    void on_resize(VkExtent2D extent) override { create_depth_buffer(extent); }
+    void on_resize(VkExtent2D extent) override {
+        depth_ = vkc::create_depth_buffer(context(), depth_format_, extent);
+    }
 
     void on_event(const SDL_Event& event) override {
         // Relative mouse mode hides the cursor and reports motion as deltas with no
@@ -351,62 +354,6 @@ private:
     // ---------------------------------------------------------------------------
     // Depth
     // ---------------------------------------------------------------------------
-
-    // Depth formats are not all mandatory, so the first supported one wins.
-    //
-    // D32_SFLOAT is the one to want: a full float has plenty of precision and no
-    // stencil bits to pay for. D24_UNORM_S8_UINT is the traditional alternative and is
-    // what much older hardware prefers. D16 is genuinely too coarse for a scene of any
-    // depth -- it is where z-fighting comes from.
-    [[nodiscard]] VkFormat choose_depth_format() {
-        constexpr std::array candidates{
-            VK_FORMAT_D32_SFLOAT,
-            VK_FORMAT_D32_SFLOAT_S8_UINT,
-            VK_FORMAT_D24_UNORM_S8_UINT,
-        };
-
-        for (const VkFormat format : candidates) {
-            VkFormatProperties properties{};
-            vkGetPhysicalDeviceFormatProperties(context().physical_device(), format,
-                                                &properties);
-            if ((properties.optimalTilingFeatures &
-                 VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0) {
-                spdlog::info("Depth format: {}",
-                             format == VK_FORMAT_D32_SFLOAT ? "D32_SFLOAT" : "other");
-                return format;
-            }
-        }
-        throw std::runtime_error("No supported depth attachment format was found.");
-    }
-
-    void create_depth_buffer(VkExtent2D extent) {
-        // The GPU must have finished with the old one. A resize already waits for idle,
-        // but on_start has nothing in flight and this costs nothing there.
-        context().wait_idle();
-
-        // Same vkc::Image as the texture, with three things different: a depth format,
-        // DEPTH_STENCIL_ATTACHMENT usage instead of SAMPLED, and a DEPTH aspect. The
-        // aspect is the one that is easy to forget, and it has to match everywhere --
-        // in the view, in every barrier, in every copy.
-        depth_ = vkc::Image(context(), vkc::ImageDesc{
-                                           .format = depth_format_,
-                                           .extent = extent,
-                                           .usage =
-                                               VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
-                                           .mip_levels = 1,
-                                           .aspect = VK_IMAGE_ASPECT_DEPTH_BIT,
-                                       });
-
-        // A new image is in UNDEFINED. Moving it to the attachment layout once here
-        // means the render pass never has to, and since loadOp is CLEAR the previous
-        // contents are discarded every frame anyway.
-        vkc::immediate_submit(context(), [&](VkCommandBuffer cmd) {
-            depth_.transition(cmd, VK_IMAGE_LAYOUT_UNDEFINED,
-                              VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
-        });
-
-        context().name(depth_.handle(), VK_OBJECT_TYPE_IMAGE, "depth buffer");
-    }
 
     // ---------------------------------------------------------------------------
     // Matrices

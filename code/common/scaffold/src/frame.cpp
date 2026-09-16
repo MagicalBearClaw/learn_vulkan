@@ -50,6 +50,52 @@ void transition_image(VkCommandBuffer cmd, VkImage image, VkImageLayout from,
     vkCmdPipelineBarrier2(cmd, &dependency);
 }
 
+void begin_rendering(VkCommandBuffer cmd, VkImageView colour_view, VkImageView depth_view,
+                     VkExtent2D extent, const VkClearColorValue& clear_colour) {
+    const VkRenderingAttachmentInfo colour_attachment{
+        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .pNext = nullptr,
+        .imageView = colour_view,
+        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .resolveMode = VK_RESOLVE_MODE_NONE,
+        .resolveImageView = VK_NULL_HANDLE,
+        .resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+        .clearValue = VkClearValue{.color = clear_colour},
+    };
+
+    // 1.0 is the far plane: clearing to it means every fragment is closer than what is
+    // already there, which is what makes VK_COMPARE_OP_LESS work on the first draw.
+    const VkClearValue depth_clear{.depthStencil = {1.0F, 0}};
+    const VkRenderingAttachmentInfo depth_attachment{
+        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .pNext = nullptr,
+        .imageView = depth_view,
+        .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+        .resolveMode = VK_RESOLVE_MODE_NONE,
+        .resolveImageView = VK_NULL_HANDLE,
+        .resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+        .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+        .clearValue = depth_clear,
+    };
+
+    const VkRenderingInfo rendering{
+        .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .renderArea = {{0, 0}, extent},
+        .layerCount = 1,
+        .viewMask = 0,
+        .colorAttachmentCount = 1,
+        .pColorAttachments = &colour_attachment,
+        .pDepthAttachment = &depth_attachment,
+        .pStencilAttachment = nullptr,
+    };
+    vkCmdBeginRendering(cmd, &rendering);
+}
+
 FrameContext::FrameContext(Context& context, Swapchain& swapchain)
     : context_(context), swapchain_(swapchain) {
     create_per_frame_objects();
