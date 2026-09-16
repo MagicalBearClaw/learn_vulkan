@@ -311,8 +311,9 @@ That is 3.3.
 
 1. Point the loader at `assets/models/flight_helmet/FlightHelmet.gltf`. Six meshes, six
    materials, and textures in files beside the model rather than embedded — which the loader
-   already handles, in the `embedded == nullptr` branch. It will draw. Then read the next
-   chapter's opening and work out what is wrong with the result.
+   already handles, in the `embedded == nullptr` branch. It draws correctly, and 3.3 explains
+   the slightly uncomfortable reason why: this model's node transforms are all identity, so
+   `PreTransformVertices` has nothing to bake and its absence would change nothing.
 2. Put `aiProcess_FlipUVs` back and look carefully before deciding whether it is broken. Then
    find the visor. This is the most valuable five minutes in the chapter.
 3. Delete the `white_texture` fallback and let a material with no base colour map leave its
@@ -329,5 +330,5 @@ That is 3.3.
    Nothing will move, because `PreTransformVertices` has already baked every transform into the
    vertices — which is precisely the machinery 3.3 replaces.
 
-Next: 3.3, where the node hierarchy stops being baked away, a model becomes a tree rather than
-a list, and six meshes finally need to be in six different places.
+Next: 3.3, where the node hierarchy stops being baked away and a model becomes a tree rather
+than a list.
