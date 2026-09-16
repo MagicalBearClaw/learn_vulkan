@@ -1,0 +1,291 @@
+---
+title: Bindless Materials
+description: A material stops being a descriptor set to bind and becomes an integer to look up. One texture array, one material buffer, and a draw loop that binds nothing at all.
+sidebar:
+  order: 4
+---
+
+<figure>
+  <img src="/img/reference/3.4.bindless_materials.png" alt="The same leather flight helmet on its wooden base as the previous chapter, rendered identically" />
+  <figcaption>Chapter 3.4: pixel for pixel the previous chapter's image. Every descriptor bind in the draw loop is gone.</figcaption>
+</figure>
+
+That caption is the whole chapter. The picture does not change — it is byte-identical to 3.3's,
+verified rather than assumed — and everything about how it gets drawn does.
+
+## The cost that is left
+
+3.3's draw loop did this, once per mesh:
+
+```cpp
+vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                        pipeline_layout_, 1, 1, &material.set, 0, nullptr);
+```
+
+Six meshes, six binds. That is nothing. A city block with fifty thousand draws is fifty thousand
+binds, each one a call into the driver that exists only because of how the descriptors were
+arranged — not because anything about the *scene* changed.
+
+And the arrangement scales the wrong way in memory too. One descriptor set per material means the
+pool has to be sized from the material count, which 3.2 and 3.3 both did:
+
+```cpp
+const auto material_count = static_cast<uint32_t>(model_.materials.size());
+```
+
+A pool cannot grow. So a renderer built this way needs to know its material count before it loads
+anything, and guesses high.
+
+## A material becomes an integer
+
+The alternative: put every texture the model uses into **one array**, put every material's
+parameters into **one buffer**, and let a draw name its material with a single number.
+
+Set 1 stops being per-material and becomes per-*model*, with two bindings:
+
+```cpp title="code/src/3.model_loading/bindless_materials/main.cpp"
+const std::array<VkDescriptorSetLayoutBinding, 2> bindless_bindings{{
+    {
+        .binding = 0,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .descriptorCount = 1,
+        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+        .pImmutableSamplers = nullptr,
+    },
+    {
+        .binding = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+        .descriptorCount = texture_count,
+        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+        .pImmutableSamplers = nullptr,
+    },
+}};
+```
+
+`descriptorCount` on binding 1 is where the array's length is decided — which is why the layout
+still cannot be built until the model has been read. What changed is that the count now sizes *one
+binding* rather than deciding how many sets exist.
+
+On the shader side the array is declared with no length at all:
+
+```hlsl title="code/src/3.model_loading/bindless_materials/bindless_materials.slang"
+[[vk::binding(0, 1)]] StructuredBuffer<Material> materials;
+[[vk::binding(1, 1)]] Sampler2D base_colour_maps[];
+```
+
+and the fragment shader takes two steps instead of none:
+
+```hlsl title="code/src/3.model_loading/bindless_materials/bindless_materials.slang"
+Material material = materials[push.material];
+
+float3 albedo = base_colour_maps[material.texture].Sample(input.uv).rgb *
+                material.base_colour_factor.rgb;
+```
+
+Both indices are the same for every fragment in the draw — they come from a push constant, which
+cannot vary within a draw — so this is a **dynamically uniform** index and needs no
+`NonUniformResourceIndex()` wrapper. A renderer that packed several materials into a single draw
+would need one, and the validation layers would say so.
+
+## `descriptorIndexing` is a headline, not a switch
+
+Chapter 1.4 enabled this, and said it was for "bindless textures, used from part 3":
+
+```cpp
+features12.descriptorIndexing = VK_TRUE;
+```
+
+It is not enough, and the way you find out is worth showing. That feature reports that the
+implementation supports the descriptor-indexing *family*; it enables none of the individual
+capabilities, each of which is its own boolean. Running this chapter with only the line above
+produces:
+
+```
+vkCreateShaderModule(): SPIR-V Capability RuntimeDescriptorArray was declared, but one of
+the following requirements is required (VkPhysicalDeviceVulkan12Features::runtimeDescriptorArray).
+```
+
+Note *where* that arrives. Not at the draw, not at pipeline creation — at `vkCreateShaderModule`,
+the moment the SPIR-V is handed over, because the capability is declared in the module itself.
+That is about as early and as specific as a Vulkan error gets.
+
+:::note[What moved into vkcommon]
+One line, in `Context::create_device()`:
+
+```cpp title="code/common/scaffold/src/context.cpp"
+features12.runtimeDescriptorArray = VK_TRUE;
+```
+
+It is the only feature this chapter needs. `shaderSampledImageArrayNonUniformIndexing`,
+`descriptorBindingPartiallyBound` and `descriptorBindingVariableDescriptorCount` are the other
+three you will meet in bindless code, and none of them is required here: the index is dynamically
+uniform, every array slot is written, and the length is known before the layout is built.
+:::
+
+## Two indices, not one
+
+A material record holds an index rather than the texture itself:
+
+```cpp title="code/src/3.model_loading/bindless_materials/main.cpp"
+struct MaterialGpu {
+    glm::vec4 base_colour_factor{1.0F};  // 0
+    uint32_t texture = 0;                // 16
+    uint32_t pad0 = 0;                   // 20
+    uint32_t pad1 = 0;                   // 24
+    uint32_t pad2 = 0;                   // 28
+};
+```
+
+It would be simpler for material *i* to use texture *i*, and it would be wrong, because materials
+and textures are not in one-to-one correspondence. FlightHelmet proves it:
+
+```
+FlightHelmet.gltf: 6 mesh(es), 7 material(s), 0 embedded texture(s)
+  material 0 "HoseMat"
+    base colour "FlightHelmet_Materials_RubberWoodMat_BaseColor.png" -> texture 0
+  material 1 "RubberWoodMat"
+    base colour "FlightHelmet_Materials_RubberWoodMat_BaseColor.png" -> texture 0 (already loaded)
+  ...
+  material 6 ""
+    base colour "(none)" -> texture 5
+  6 draw(s), 7 material(s), 6 distinct texture(s)
+```
+
+`HoseMat` and `RubberWoodMat` are different materials sharing one image. 3.2 and 3.3 uploaded it
+twice and nothing noticed, because each material owned a descriptor set to put its own copy in.
+With a single shared array the duplicate becomes visible: it is another 4 MB sitting at another
+index for no reason. A one-line cache keyed on the texture's path removes it, and seven materials
+resolve to six images.
+
+Six instead of seven is a modest saving on a model this size. On a scene where forty materials are
+variations on the same four atlases it is not.
+
+## std430, and the vector that is not the size it looks
+
+The first run of this chapter rendered the helmet in white and black. The hose was correct and
+nothing else was.
+
+That pattern — element zero right, every later element wrong — is the signature of a **stride
+mismatch**, and the cause was the padding. The shader's struct originally ended with a `uint3`:
+
+```hlsl
+struct Material {
+    float4 base_colour_factor;
+    uint texture;
+    uint3 pad;         // wrong
+};
+```
+
+In std430 a three-component vector aligns to **16 bytes**, not 4. So `uint3 pad` does not sit at
+offset 20 next to `texture`; it is pushed out to offset 32, and the struct becomes 48 bytes against
+the CPU's 32. Every read after the first is then displaced by 16 bytes more than the last.
+
+The fix is to pad with three scalars, which align to 4 apiece:
+
+```hlsl
+uint texture;   // 16
+uint pad0;      // 20
+uint pad1;      // 24
+uint pad2;      // 28
+```
+
+Nothing warns about this. The shader compiles, the buffer binds, the validation layers are silent —
+the sizes involved are legal, they simply disagree. This is the tax on hand-writing both halves of
+a GPU struct, and the cheapest defence is the one used throughout this series: write the offsets in
+a comment on both sides, and `static_assert` them on the side that can.
+
+```cpp title="code/src/3.model_loading/bindless_materials/main.cpp"
+static_assert(sizeof(MaterialGpu) == 32);
+static_assert(offsetof(MaterialGpu, texture) == 16);
+```
+
+## The draw loop binds nothing
+
+Both sets go down once, above the loop:
+
+```cpp title="code/src/3.model_loading/bindless_materials/main.cpp"
+const std::array<VkDescriptorSet, 2> sets{frame_sets_[slot], bindless_set_};
+vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                        pipeline_layout_, 0,
+                        static_cast<uint32_t>(sets.size()), sets.data(), 0, nullptr);
+```
+
+and what remains per draw is geometry and one push:
+
+```cpp title="code/src/3.model_loading/bindless_materials/main.cpp"
+for (const Draw& draw : model_.draws) {
+    const Mesh& mesh = model_.meshes[draw.mesh];
+    // ... bind vertex and index buffers ...
+    const PushConstants push{
+        .model = model_matrix,
+        .normal_matrix = normal_matrix_of(model_matrix),
+        .material = mesh.material,
+    };
+    // ... push, draw ...
+}
+```
+
+The push block shrank with it, from 128 bytes to 116. `colour` carried a `vec4` of base colour
+factor through three chapters at offset 112; the factor is in the buffer now, and the four-byte
+index that finds it takes its place.
+
+The descriptor pool stopped scaling with the scene, too. Three sets, whatever the model:
+
+```cpp title="code/src/3.model_loading/bindless_materials/main.cpp"
+.maxSets = vkc::kFramesInFlight + 1,
+```
+
+Two vertex-buffer binds are still there per draw, and Part 9 is where those go as well — once a
+draw is fully described by numbers in buffers rather than by binds, the CPU stops needing to be in
+the loop at all. That is what `vkCmdDrawIndexedIndirect` is for, and this chapter is the step that
+makes it possible.
+
+## The proof is that nothing changed
+
+A refactor that rearranges every descriptor in the renderer is exactly the kind of change that
+quietly alters the image. So the check is not "does it look right" but a pixel comparison against
+the previous chapter's reference:
+
+```
+3.4 vs 3.3 reference: 0 of 921600 pixels differ (0.0000%)
+```
+
+Same geometry, same lighting, same textures, same shading arithmetic — reached without binding a
+single descriptor set inside the draw loop.
+
+## What changed since 3.3
+
+- set 1 holds the whole model: a storage buffer of materials and an array of every texture
+- `vkCmdBindDescriptorSets` leaves the draw loop entirely; both sets bind once per frame
+- `MaterialGpu` replaces 3.3's `Material` — no `vkc::Image`, no `VkDescriptorSet`, just a colour
+  factor and a texture index
+- textures are cached by path, so materials sharing an image share a slot
+- the push block loses `colour` and gains `material`, 128 bytes down to 116
+- the descriptor pool is a fixed three sets rather than one per material
+- `features12.runtimeDescriptorArray = VK_TRUE` in vkcommon
+
+What did **not** change: the geometry, the node walk, the lighting rig, the `Globals` block, and
+the rendered image.
+
+## Exercises
+
+1. Remove `features12.runtimeDescriptorArray` from `Context::create_device()` and run this chapter.
+   Read the message carefully and note which function reports it — then predict, before testing,
+   whether a chapter from Part 2 would also fail.
+2. Put the `uint3` back in the shader's `Material` struct and look at the result. Then work out,
+   from the offsets alone, which texture each material ends up sampling.
+3. Delete the texture cache so every material loads its own image. The picture will not change.
+   Find the change with `VK_LAYER_ENABLES` best-practices output, or by printing the number of
+   `vkc::Image` objects.
+4. Move `base_colour_factor` back into the push constants and leave only the texture index in the
+   buffer. Measure nothing; just decide which version you would rather extend to twenty material
+   parameters, and why.
+5. Give each material its own sampler index as well as its texture index, backed by a small array
+   of samplers. Which glTF material property would make this worth doing?
+6. The material buffer is uploaded once and never written again. What would have to change — in the
+   buffer, in its memory type, and in the synchronisation — if a material's colour could be edited
+   while the model was on screen?
+
+That closes Part 3, and with it the arc that began in 3.1 with a file full of vertices and a flat
+grey helmet. Part 4 leaves model loading behind and returns to the pipeline itself: depth and
+stencil state, blending and culling, and rendering into something other than the screen.

@@ -315,6 +315,12 @@ void Context::create_device() {
     features12.pNext = &features13;
     features12.bufferDeviceAddress = VK_TRUE;
     features12.descriptorIndexing = VK_TRUE;
+    // descriptorIndexing is a headline, not a switch: it reports that the implementation
+    // supports the descriptor-indexing family, and enables none of the individual
+    // capabilities. Each of those is its own boolean, and a shader that declares one
+    // without it enabled is rejected by vkCreateShaderModule. Chapter 3.4 needs exactly
+    // this one, for its unbounded `Sampler2D base_colour_maps[]`.
+    features12.runtimeDescriptorArray = VK_TRUE;
 
     VkPhysicalDeviceFeatures2 features2{};
     features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
