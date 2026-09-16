@@ -219,7 +219,8 @@ here they never do.
 
 **The uniform buffer is getting full.** `Globals` is now 1040 bytes: 144 for the matrices
 and view position, plus eight lights at 112 each. Vulkan guarantees `maxUniformBufferRange`
-of at least 16 KB, so there is room for roughly 128 lights and no more — and long before
+of at least 16 KB. Subtract the 144 bytes of matrices and divide by 112 and that is room
+for about 145 lights, and no more — and long before
 that limit, pushing a kilobyte of light data every frame for lights that mostly have not
 moved starts to look wasteful. The answer is a storage buffer, which has vastly larger
 limits and is written once rather than per frame; Part 4 takes that up properly.

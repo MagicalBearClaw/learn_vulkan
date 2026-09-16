@@ -1,0 +1,202 @@
+---
+title: Review
+description: What Part 2 built, the Phong model in one place, every std140 rule you actually hit, and the six things Part 2 did badly on purpose.
+sidebar:
+  order: 7
+---
+
+Part 1 ended with a textured cube you could fly around, lit by nothing at all. Part 2 lit
+it, and the light came from six sources of three different kinds without the renderer
+gaining a single new Vulkan object type.
+
+That is the honest summary of this part: **the graphics got much better and the Vulkan got
+only slightly harder.** Everything new here was either shader arithmetic or a question of
+where to put data.
+
+This chapter has no new code.
+
+## What you built
+
+| Chapter | Added |
+|---|---|
+| 2.1 | A second pipeline from one shader module; light as a multiply |
+| 2.2 | Ambient, diffuse and specular; normals; the normal matrix |
+| 2.3 | Material and light as structs; the second descriptor set |
+| 2.4 | Diffuse and specular maps; a set with mixed descriptor types |
+| 2.5 | Directional, point and spot lights; attenuation; soft cone edges |
+| 2.6 | Six lights in one array, summed in a loop |
+
+## The Phong model, assembled
+
+Spread over five chapters, it is worth seeing in one piece. For each light:
+
+```
+ambient  = light.ambient  × surface_colour
+diffuse  = light.diffuse  × max(dot(N, L), 0)          × surface_colour
+specular = light.specular × max(dot(V, R), 0)^shininess × specular_map
+```
+
+with `N` the unit surface normal, `L` the unit direction **toward** the light, `V` the unit
+direction toward the eye, and `R` the reflection of `-L` about `N`. Each light's total is
+scaled by an intensity — 1 for a directional light, `1/(c + l·d + q·d²)` for a point light,
+that times the cone falloff for a spotlight — and the lights are summed.
+
+Four things in there are worth remembering as ideas rather than as lines of code:
+
+**Diffuse is Lambert's cosine law.** A surface tilted away from a light catches its energy
+over a larger area, so each point gets less. `dot(N, L)` *is* that cosine, which is why the
+term is a dot product and not something more elaborate.
+
+**Specular is a cheat, and a good one.** Phong asks how closely the reflected light ray
+lines up with your eye, then raises that to a power. There is no physics in the exponent;
+it is a knob that happens to look like glossiness. Chapter 5.1 replaces it with something
+marginally more defensible and considerably faster.
+
+**Normals do not transform like positions.** Under non-uniform scale, the inverse transpose
+is what keeps a normal perpendicular to its surface. 2.2 spent a page on this because it is
+the single most common source of lighting bugs that look like art problems.
+
+**Ambient is a confession.** It is a flat constant standing in for every bounce of light the
+renderer does not simulate. It is the most obviously wrong term in the model, and Part 6
+replaces it with something that actually integrates incoming light.
+
+## The Vulkan lesson: where data lives
+
+The real content of Part 2, and the reason it is placed here rather than after Part 3, is
+that lighting is the first time a scene has data with **three different lifetimes**. Vulkan
+makes you say which is which:
+
+| Lifetime | Changes | Where it went |
+|---|---|---|
+| Per frame | every frame | set 0: view, projection, eye position, the light array |
+| Per material | per object *kind* | set 1: diffuse map, specular map, shininess |
+| Per object | every draw | push constants: model matrix, normal matrix, colour |
+
+Bind set 0 once at the top of the frame, set 1 once per material, and push 128 bytes per
+draw. `firstSet` in `vkCmdBindDescriptorSets` is what lets set 1 change without disturbing
+set 0 — and the reason set numbers are ordered by lifetime, slowest first, is precisely so
+that this works.
+
+Three rules learned the hard way in 2.3 and 2.4:
+
+- **Pool sizes are per descriptor *type*,** summed across every set the pool will hand out.
+  `maxSets` counts sets, not descriptors. Get either wrong and allocation fails with
+  `VK_ERROR_OUT_OF_POOL_MEMORY`.
+- **The layout's descriptor types must match the shader's declarations.** A combined image
+  sampler where the shader declares a uniform buffer is caught at pipeline creation.
+- **Pipeline layout compatibility is structural.** Two pipelines can share bound sets only
+  if their layouts agree on set layouts 0…N *and* on the push constant ranges. The
+  validation layers do say so, clearly, when they do not.
+
+## Every layout rule Part 2 actually hit
+
+std140 is the source of more silent wrongness than any other part of this series, because
+a mismatch produces a picture that is merely *incorrect* rather than an error. Collected:
+
+| Rule | Where it bit |
+|---|---|
+| `float3` is padded to 16 bytes | everywhere; every vector in a block is a `float4` on the C++ side |
+| `float3x3` has a 16-byte column stride — 48 bytes, not 36 | 2.2: `glm::mat3` in a push constant, 6.39% wrong and no message |
+| scalars align to 4, and pack tightly | 2.5: five floats from offset 80, filling one 16-byte slot and part of the next |
+| a nested struct rounds up to a multiple of 16 | 2.3 and 2.5: `Light` is 112 bytes, not 100 |
+| an array inherits that rounded stride | 2.6: `ArrayStride 112`, confirmed in the SPIR-V |
+| push constants: 128 bytes guaranteed | 2.6 uses exactly 128 |
+| uniform buffers: 16 KB guaranteed | 2.6's `Globals` is 1 040 bytes; the ceiling is about 145 lights |
+
+The defence, used in every chapter of this part, is `static_assert` on `offsetof` and
+`sizeof`. It costs one line per field that matters and converts a class of bug that shows
+up as "the lighting looks a bit off" into one that shows up as a build failure.
+
+:::tip[When in doubt, disassemble]
+Every layout claim above was checked rather than assumed, and the tool is one command:
+
+```bash
+slangc shader.slang -target spirv -emit-spirv-directly -o out.spv
+spirv-dis out.spv | grep -E "Offset|ArrayStride"
+```
+
+The compiler will tell you exactly what it decided. It is faster than reasoning about the
+rules, and unlike reasoning, it is never wrong.
+:::
+
+## Specialisation constants, twice
+
+Chapter 1.9 introduced them and nothing used them until Part 2 used them for two different
+jobs in consecutive chapters:
+
+- **2.5:** the *kind* of light. One light, one kind, so the `switch` folds away entirely.
+- **2.6:** the *number* of lights. Several kinds in one array means the kind has to be data
+  again — but the loop bound is still fixed at pipeline creation, so it can be unrolled.
+
+The general shape: a specialisation constant is for a value that is constant for the life
+of a pipeline but not known when the shader is written. If it varies per draw it is a push
+constant; if it varies per frame it belongs in a uniform buffer.
+
+## What is in `vkcommon` now
+
+Nothing new. Part 2 added not one line to the shared library — every chapter in it is the
+same renderer with different arithmetic, which is exactly why the part is about shading
+rather than about Vulkan.
+
+There is one piece of honest debt to record. Chapter 1.13 taught the depth buffer, so by
+this series' own rule it could have moved into `vkcommon` from 1.14. It did not, and the
+result is that **eight chapters each define their own `choose_depth_format` and
+`create_depth_buffer`**, and six each define an identical `begin_rendering`. That is
+copy-paste, it has been copy-paste since 1.14, and Part 3 folds all three into `vkcommon`
+where they belonged two chapters into Part 1.
+
+## Things Part 2 did badly on purpose
+
+Every one of these is a later chapter.
+
+**Nothing casts a shadow.** The crates are lit as though the other crates were not there,
+because each fragment asks only "which way is the light" and never "can I see it". This is
+the largest single gap between Part 2 and a believable image. Chapter 5.3 closes it, and
+5.4 does it for point lights.
+
+**Specular is Phong, not Blinn-Phong.** The reflection-vector formulation breaks down at
+grazing angles and costs more than the half-vector version. Chapter 5.1.
+
+**Every light shades every fragment.** 2.6's loop runs for all six lights on every fragment
+of every crate, including the four bulbs too distant to contribute anything visible. Fine at
+six lights; catastrophic at six hundred. Chapter 5.9.
+
+**Normals are per-vertex.** A flat face is flat — all the surface detail in the crates is
+painted on, and the lighting cannot see any of it. Chapter 5.5 gets normals from a texture.
+
+**The attenuation constants are magic numbers.** `1.0`, `0.09`, `0.032` came from a table of
+distances, not from anything physical. Real falloff is inverse-square, and using it requires
+an HDR pipeline to survive the dynamic range. Chapters 5.7 and 6.2.
+
+**Colour arithmetic is casually linear.** Colour textures are loaded `_SRGB` and data
+textures `_UNORM`, which is the important half of the problem, and the rest of the story —
+what the final write to the swapchain does, and why a sum of six lights can exceed 1.0 and
+has nowhere to go — is chapter 5.2.
+
+## Where Part 3 goes
+
+Part 2 lit a cube. Part 3 replaces the cube.
+
+Every scene so far has had 24 vertices defined in a C++ array. Real geometry arrives in
+files, with many meshes, many materials and a transform hierarchy, and it will not fit in
+the shape the samples have been using. Part 3 loads it with Assimp (3.1), builds a `Mesh`
+that owns its buffers (3.2), assembles meshes into a `Model` (3.3) — and then hits the
+problem that a model with forty materials would need forty descriptor sets and forty binds
+per draw.
+
+The answer is **bindless** (3.4): descriptor indexing, one large array of textures bound
+once, and an index in the push constants choosing per draw. It is the first time this series
+uses a Vulkan 1.3 feature with no OpenGL counterpart at all, and it makes the last three
+chapters of Part 2 look like the small version of the problem.
+
+Before moving on, one thing worth doing:
+
+```bash
+diff code/src/2.lighting/light_casters/main.cpp \
+     code/src/2.lighting/multiple_lights/main.cpp
+```
+
+Six lights instead of one, and almost all of the difference is in how the data is shaped.
+That is Part 2 in a single diff.
+
+Then: chapter 3.1, and a real model.
