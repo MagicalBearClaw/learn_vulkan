@@ -13,10 +13,20 @@
     "stb",
     {
       "name": "sdl3",
+      "default-features": false,
       "features": [
-        "vulkan"
+        "vulkan",
+        "wayland",
+        "x11"
       ]
     },
-    "shader-slang"
+    "shader-slang",
+    "assimp"
+  ],
+  "overrides": [
+    {
+      "name": "vulkan-memory-allocator",
+      "version": "3.3.0"
+    }
   ]
 }

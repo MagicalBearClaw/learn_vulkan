@@ -70,7 +70,10 @@
       "name": "linux-vcpkg-debug",
       "displayName": "Linux Debug (vcpkg)",
       "inherits": ["linux-base", "vcpkg"],
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "LVK_DEPS": "vcpkg"
+      }
     }
   ],
   "buildPresets": [

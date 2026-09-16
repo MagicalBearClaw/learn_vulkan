@@ -99,6 +99,33 @@ if(NOT TARGET slang::slang)
         NO_DEFAULT_PATH)
 endif()
 
+# --- Assimp --------------------------------------------------------------------
+# Model loading, from chapter 3.1 onward.
+#
+# This one gets no FetchContent fallback, unlike VMA, stb and Slang. Assimp is a large
+# C++ library that takes minutes to compile from source and drags in its own
+# compression dependencies, and every platform this series targets already packages
+# it -- so a clear message beats a long build.
+# Not fatal when missing: only the Part 3 chapters need it, and the rest of the series
+# should still configure and build without it. LVK_HAVE_ASSIMP is what those chapters
+# will be gated on once they exist; nothing reads it yet.
+find_package(assimp CONFIG QUIET)
+if(TARGET assimp::assimp)
+    set(LVK_HAVE_ASSIMP TRUE)
+else()
+    set(LVK_HAVE_ASSIMP FALSE)
+    message(WARNING
+        "Assimp was not found, so the model-loading chapters (3.1 onward) will be "
+        "skipped. Everything else builds as usual.\n"
+        "To get them, either configure with vcpkg, which installs nothing "
+        "system-wide:\n"
+        "    cmake --preset linux-vcpkg-debug\n"
+        "or install assimp for the system build (LVK_DEPS=system):\n"
+        "  Arch / CachyOS:   sudo pacman -S assimp\n"
+        "  Debian / Ubuntu:  sudo apt install libassimp-dev\n"
+        "  Fedora:           sudo dnf install assimp-devel")
+endif()
+
 # VMA's headers use Clang nullability annotations that -Wpedantic objects to. It is
 # third-party code, so include it as SYSTEM and let its own authors' warnings be
 # their business rather than ours.

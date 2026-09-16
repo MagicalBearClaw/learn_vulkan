@@ -58,6 +58,10 @@ an article contrasts the two.
 cd code && cmake --preset linux-debug
 cmake --build code/out/build/linux-debug
 
+# Build (Linux, vcpkg -- installs nothing system-wide)
+cd code && cmake --preset linux-vcpkg-debug
+cmake --build code/out/build/linux-vcpkg-debug
+
 # Build (Windows, vcpkg)
 cd code && cmake --preset x64-debug
 cmake --build code/out/build/x64-debug
@@ -102,5 +106,21 @@ cd site && npm run dev
 
 - Development happens on Linux; Windows must keep building. Do not add MSVC-only or
   Linux-only code without guarding it.
-- The repository path contains spaces, which breaks vcpkg's autotools ports. Linux
-  uses system packages (`LVK_DEPS=system`); Windows uses vcpkg.
+- **Three presets, all working.** `linux-debug` builds against system packages
+  (`LVK_DEPS=system`), `linux-vcpkg-debug` builds against vcpkg and installs nothing
+  system-wide, and Windows uses vcpkg. Verified by building all 21 chapters both ways,
+  warning-free, and running `tools/capture.py --all` against each build tree: every
+  chapter renders 0.00% different in both modes.
+- The repository path contains spaces. This was long recorded here as breaking vcpkg,
+  and it does not, for this dependency set: the build tree and `vcpkg_installed` both
+  live under the spaced path and install fine. The one autotools port that ever
+  appeared was `libxcrypt`, reached through SDL3's `ibus` default feature, so
+  `vcpkg.json` sets `"default-features": false` and asks only for `vulkan`, `wayland`
+  and `x11`.
+- **The two modes do not ship the same Slang.** vcpkg's newest is 2026.7.1;
+  `LVK_SLANG_VERSION` pins 2026.17.1 for the fetched fallback. Both compile the samples'
+  shaders, but a Slang-version-specific claim must be checked in the mode it concerns.
+- **VMA is pinned to 3.3.0** in `vcpkg.json`, matching the FetchContent tag. 3.4.0 adds
+  `VmaAllocationCreateInfo::minAlignment`, and the fully-designated initialisers in
+  `buffer.cpp`, `image.cpp` and chapters 1.8 and 1.11 then warn about the missing field.
+  Those initialisers are quoted in the articles, so the pin is cheaper than the edit.
