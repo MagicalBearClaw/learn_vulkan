@@ -102,8 +102,10 @@ OpenGL puts texture coordinate `(0,0)` at the **bottom** left, while glTF puts i
 agrees with glTF. Flipping anyway means flipping twice.
 
 It costs nothing in this chapter, which samples no textures at all. It costs an afternoon in
-3.2, where the symptom is a texture that looks plausible until you notice the lettering is
-upside down.
+3.2, where — measured rather than guessed — the symptom is worse than an upside-down texture.
+A model's UVs are not one sheet but dozens of scattered islands, so flipping `v` does not
+mirror each panel in place; it lands every island on a different island's paint. The helmet
+still renders, still looks like a helmet, and simply wears the wrong surface.
 :::
 
 ## Reading a mesh

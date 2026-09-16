@@ -116,8 +116,8 @@ cd site && npx astro build < /dev/null
   system-wide, and Windows uses vcpkg. Verified by building every chapter both ways,
   warning-free, and running `tools/capture.py --all` against each build tree: every
   chapter renders 0.00% different in both modes. The counts differ from Part 3 on:
-  vcpkg builds 22 chapters, `linux-debug` builds 21 and skips 3.1, because this machine
-  has no system Assimp.
+  vcpkg builds 23 chapters, `linux-debug` builds 21 and skips both model-loading chapters,
+  because this machine has no system Assimp.
 - **Assimp is the one dependency with no fallback.** VMA, stb and Slang are fetched when
   missing; Assimp is not, because it is large and slow to build. `Dependencies.cmake`
   warns instead of failing and sets `LVK_HAVE_ASSIMP`, which `code/src/CMakeLists.txt`

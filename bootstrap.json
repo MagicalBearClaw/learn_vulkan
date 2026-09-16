@@ -15,7 +15,7 @@
     },
     {
       "name": "models/flight_helmet",
-      "description": "Flight Helmet: six meshes, five materials, separate textures. Chapters 3.3 and 3.4.",
+      "description": "Flight Helmet: six meshes, six materials, separate textures. Chapters 3.3 and 3.4.",
       "type": "files",
       "base-url": "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/90d7ede14c7e280af263824604b427a1ca02cb66/Models/FlightHelmet/glTF",
       "files": [

@@ -29,6 +29,7 @@ add_subdirectory(2.lighting/multiple_lights)
 # to here still builds without it, so the part is skipped rather than fatal.
 if(LVK_HAVE_ASSIMP)
     add_subdirectory(3.model_loading/assimp)
+    add_subdirectory(3.model_loading/mesh)
 else()
     message(STATUS "Skipping the model-loading chapters: Assimp was not found")
 endif()

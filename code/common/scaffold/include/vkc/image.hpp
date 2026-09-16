@@ -71,6 +71,15 @@ private:
 // Number of mip levels a texture of this size can have, down to 1x1.
 [[nodiscard]] uint32_t mip_level_count(uint32_t width, uint32_t height) noexcept;
 
+// Uploads four-byte-per-texel pixels, builds the mip chain with vkCmdBlitImage, and
+// leaves the image in SHADER_READ_ONLY_OPTIMAL. This is the second half of chapter
+// 1.11 -- everything after the decode -- split out so that a caller who already has
+// pixels in memory need not write them to a file first. Chapter 3.2, whose textures
+// arrive as JPEG blobs inside a .glb, is the first such caller.
+[[nodiscard]] Image create_texture(Context& context, const void* rgba_pixels,
+                                   VkExtent2D extent,
+                                   VkFormat format = VK_FORMAT_R8G8B8A8_SRGB);
+
 // Loads an image file, uploads it, builds its mip chain with vkCmdBlitImage, and leaves
 // it in SHADER_READ_ONLY_OPTIMAL. Chapter 1.11, start to finish.
 //

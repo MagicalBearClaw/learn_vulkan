@@ -17,6 +17,7 @@
 #include <bit>
 #include <cstring>
 #include <format>
+#include <memory>
 #include <stdexcept>
 #include <utility>
 
@@ -194,32 +195,19 @@ void generate_mipmaps(VkCommandBuffer cmd, const Image& image) {
 
 }  // namespace
 
-Image load_texture(Context& context, const std::filesystem::path& path,
-                   VkFormat format) {
-    int width = 0;
-    int height = 0;
-    int channels = 0;
-    stbi_uc* pixels =
-        stbi_load(path.string().c_str(), &width, &height, &channels, STBI_rgb_alpha);
-    if (pixels == nullptr) {
-        throw std::runtime_error(
-            std::format("Could not load '{}': {}. Did you run tools/make_textures.py?",
-                        path.string(), stbi_failure_reason()));
-    }
-
+Image create_texture(Context& context, const void* rgba_pixels, VkExtent2D extent,
+                     VkFormat format) {
     VkFormatProperties properties{};
     vkGetPhysicalDeviceFormatProperties(context.physical_device(), format, &properties);
     if ((properties.optimalTilingFeatures &
          VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) == 0) {
-        stbi_image_free(pixels);
         throw std::runtime_error(
             "This GPU cannot linearly filter blits of this format, so mipmaps cannot "
             "be generated at load time.");
     }
 
-    const VkExtent2D extent{static_cast<uint32_t>(width), static_cast<uint32_t>(height)};
-    const VkDeviceSize size =
-        static_cast<VkDeviceSize>(width) * static_cast<VkDeviceSize>(height) * 4;
+    const VkDeviceSize size = static_cast<VkDeviceSize>(extent.width) *
+                              static_cast<VkDeviceSize>(extent.height) * 4;
 
     Image image(context,
                 ImageDesc{
@@ -235,8 +223,7 @@ Image load_texture(Context& context, const std::filesystem::path& path,
     Buffer staging(context.allocator(), size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                    VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
                        VMA_ALLOCATION_CREATE_MAPPED_BIT);
-    std::memcpy(staging.mapped(), pixels, static_cast<size_t>(size));
-    stbi_image_free(pixels);
+    std::memcpy(staging.mapped(), rgba_pixels, static_cast<size_t>(size));
 
     immediate_submit(context, [&](VkCommandBuffer cmd) {
         image.transition(cmd, VK_IMAGE_LAYOUT_UNDEFINED,
@@ -257,6 +244,27 @@ Image load_texture(Context& context, const std::filesystem::path& path,
     });
 
     return image;
+}
+
+Image load_texture(Context& context, const std::filesystem::path& path,
+                   VkFormat format) {
+    int width = 0;
+    int height = 0;
+    int channels = 0;
+    // The deleter is not decoration: create_texture throws on a GPU that cannot filter
+    // this format, and a bare stbi_uc* would leak the decoded image on the way out.
+    const std::unique_ptr<stbi_uc, void (*)(void*)> pixels(
+        stbi_load(path.string().c_str(), &width, &height, &channels, STBI_rgb_alpha),
+        stbi_image_free);
+    if (pixels == nullptr) {
+        throw std::runtime_error(
+            std::format("Could not load '{}': {}. Did you run tools/make_textures.py?",
+                        path.string(), stbi_failure_reason()));
+    }
+
+    return create_texture(context, pixels.get(),
+                          {static_cast<uint32_t>(width), static_cast<uint32_t>(height)},
+                          format);
 }
 
 VkFormat choose_depth_format(VkPhysicalDevice physical_device) {
