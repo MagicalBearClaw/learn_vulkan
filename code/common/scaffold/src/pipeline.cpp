@@ -236,6 +236,26 @@ PipelineBuilder& PipelineBuilder::depth(VkFormat format, bool test, bool write,
     return *this;
 }
 
+PipelineBuilder& PipelineBuilder::depth_bias(float constant_factor, float slope_factor) {
+    depth_bias_ = true;
+    depth_bias_constant_ = constant_factor;
+    depth_bias_slope_ = slope_factor;
+    return *this;
+}
+
+PipelineBuilder& PipelineBuilder::stencil_attachment(VkFormat format) {
+    stencil_format_ = format;
+    return *this;
+}
+
+PipelineBuilder& PipelineBuilder::stencil_test(VkStencilOpState front,
+                                               VkStencilOpState back) {
+    stencil_test_ = true;
+    stencil_front_ = front;
+    stencil_back_ = back;
+    return *this;
+}
+
 PipelineBuilder& PipelineBuilder::colour_attachment(VkFormat format) {
     colour_format_ = format;
     return *this;
@@ -342,10 +362,13 @@ VkPipeline PipelineBuilder::build() const {
         .polygonMode = polygon_mode_,
         .cullMode = cull_mode_,
         .frontFace = front_face_,
-        .depthBiasEnable = VK_FALSE,
-        .depthBiasConstantFactor = 0.0F,
+        .depthBiasEnable = depth_bias_ ? VK_TRUE : VK_FALSE,
+        .depthBiasConstantFactor = depth_bias_constant_,
+        // No clamp: 0 means "do not limit the bias", which is what you want until a
+        // steeply-angled polygon produces a slope-scaled offset large enough to push
+        // geometry through something else.
         .depthBiasClamp = 0.0F,
-        .depthBiasSlopeFactor = 0.0F,
+        .depthBiasSlopeFactor = depth_bias_slope_,
         .lineWidth = 1.0F,
     };
 
@@ -369,9 +392,9 @@ VkPipeline PipelineBuilder::build() const {
         .depthWriteEnable = depth_write_ ? VK_TRUE : VK_FALSE,
         .depthCompareOp = depth_compare_,
         .depthBoundsTestEnable = VK_FALSE,
-        .stencilTestEnable = VK_FALSE,
-        .front = {},
-        .back = {},
+        .stencilTestEnable = stencil_test_ ? VK_TRUE : VK_FALSE,
+        .front = stencil_front_,
+        .back = stencil_back_,
         .minDepthBounds = 0.0F,
         .maxDepthBounds = 1.0F,
     };
@@ -416,7 +439,7 @@ VkPipeline PipelineBuilder::build() const {
         .colorAttachmentCount = 1,
         .pColorAttachmentFormats = &colour_format_,
         .depthAttachmentFormat = depth_format_,
-        .stencilAttachmentFormat = VK_FORMAT_UNDEFINED,
+        .stencilAttachmentFormat = stencil_format_,
     };
 
     const VkGraphicsPipelineCreateInfo pipeline_info{

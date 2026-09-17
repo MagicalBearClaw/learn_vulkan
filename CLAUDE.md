@@ -116,12 +116,14 @@ cd site && npx astro build < /dev/null
   system-wide, and Windows uses vcpkg. Verified by building every chapter both ways,
   warning-free, and running `tools/capture.py --all` against each build tree: every
   chapter renders 0.00% different in both modes. The counts differ from Part 3 on:
-  vcpkg builds 25 chapters, `linux-debug` builds 21 and skips all four model-loading chapters,
+  vcpkg builds 26 chapters, `linux-debug` builds 22 and skips all four model-loading chapters,
   because this machine has no system Assimp.
 - **Assimp is the one dependency with no fallback.** VMA, stb and Slang are fetched when
   missing; Assimp is not, because it is large and slow to build. `Dependencies.cmake`
   warns instead of failing and sets `LVK_HAVE_ASSIMP`, which `code/src/CMakeLists.txt`
-  uses to skip Part 3. Everything through 2.6 must keep building without it.
+  uses to skip Part 3. Everything through 2.6 must keep building without it, and so must
+  Part 4 onward: those `add_subdirectory` lines sit outside the gate, and the scaffolder
+  appends new ones after it -- which is correct for Part 4 and wrong for Part 3.
 - **Assimp exports stb_image's symbols.** Its static library defines all 43 `stbi_*`
   names, so a second global definition anywhere in this project makes every Part 3
   target fail to link with `multiple definition of stbi_load`. `stb_impl.cpp` therefore

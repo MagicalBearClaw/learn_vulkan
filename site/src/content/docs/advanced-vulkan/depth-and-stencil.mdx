@@ -1,0 +1,319 @@
+---
+title: "Pipeline state: depth & stencil"
+description: The depth test decided what you could see for eleven chapters without being looked at. This one looks at it, adds the stencil test beside it, and changes the picture without touching a shader.
+sidebar:
+  order: 1
+---
+
+<figure>
+  <img src="/img/reference/4.1.depth_and_stencil.png" alt="Two wooden crates standing on a painted slab set into a tiled grid floor, each crate ringed by a thin orange outline" />
+  <figcaption>Chapter 4.1: two crates, a painted slab lying in the floor's plane, and an outline that is not geometry.</figcaption>
+</figure>
+
+Every chapter since 1.7 changed the picture by changing what a shader computed. This one
+does not. Its fragment shaders are the shortest in the series so far — one lit surface,
+one flat colour — and the orange ring around each crate is not drawn by either of them.
+
+What changes the picture here is the state the fragments meet *after* the fragment shader
+has finished: the depth test, and the stencil test sitting next to it in the same struct.
+
+## The struct that has been there all along
+
+`VkPipelineDepthStencilStateCreateInfo` has been in `PipelineBuilder` since 1.13, filled
+in and never discussed:
+
+```cpp title="code/common/scaffold/src/pipeline.cpp"
+const VkPipelineDepthStencilStateCreateInfo depth_stencil{
+    .depthTestEnable = depth_test_ ? VK_TRUE : VK_FALSE,
+    .depthWriteEnable = depth_write_ ? VK_TRUE : VK_FALSE,
+    .depthCompareOp = depth_compare_,
+    .depthBoundsTestEnable = VK_FALSE,
+    .stencilTestEnable = stencil_test_ ? VK_TRUE : VK_FALSE,
+    .front = stencil_front_,
+    .back = stencil_back_,
+    .minDepthBounds = 0.0F,
+    .maxDepthBounds = 1.0F,
+};
+```
+
+Three of those fields are worth separating, because they are routinely confused:
+
+- **`depthTestEnable`** decides whether the fragment's depth is *compared* at all. Off
+  means every fragment survives, whatever is in front of it.
+- **`depthWriteEnable`** decides whether a surviving fragment's depth is *stored*. Off
+  means the surface is visible but invisible to everything drawn after it — which is
+  exactly what a transparent surface wants, and what 4.2 will need.
+- **`depthCompareOp`** decides what "closer" means. `LESS` with a buffer cleared to 1.0 is
+  the arrangement this series has used throughout, and it is a convention, not a law.
+
+The outline pipeline in this chapter turns the first two off together. An outline is a
+decoration in screen space, not a thing in the world: it should not be buried by the floor
+it overlaps, and nothing drawn later should be occluded by it.
+
+## Two surfaces in one plane
+
+The slab in the picture is a quad lying at exactly the floor's y. Both surfaces produce a
+depth value at every pixel they share, the two values are the same number computed along
+different paths, and `LESS` has to pick one.
+
+The textbook answer is that they z-fight — a shimmering speckle of one surface and the
+other. **That is not what happened here, and it is worth saying so.** With the slab as a
+smaller quad with its own vertices, it simply won, everywhere, on this GPU, with no help
+at all. Turning depth bias on and off changes 333 pixels out of 921600 — 0.04%, and all of
+them on the slab's own edges.
+
+That is luck, not a guarantee, and the way to see what the depth test really does with a
+tie is to remove the luck: give the slab the floor's exact vertices, so the two depth
+values are computed by the same arithmetic from the same inputs and come out bit for bit
+identical.
+
+<figure>
+  <img src="/img/4.1/coplanar-unbiased.png" alt="The grid floor with no slab visible at all" />
+  <figcaption>Identical coplanar geometry, no depth bias. The slab is drawn, and every one of its fragments is rejected.</figcaption>
+</figure>
+
+With `VK_COMPARE_OP_LESS`, equal is not less. The slab loses every pixel and disappears
+completely — not a speckle, not a fight, an absence. Switch the bias on and it is the
+floor that vanishes instead:
+
+<figure>
+  <img src="/img/4.1/coplanar-biased.png" alt="The same view with the painted slab covering the entire floor" />
+  <figcaption>The same geometry with `depthBiasConstantFactor = -2.0`. 74.38% of the frame changes.</figcaption>
+</figure>
+
+Depth bias is the fixed-function answer to coplanar geometry, and it lives in the
+rasterisation state rather than the depth-stencil state:
+
+```cpp title="code/common/scaffold/src/pipeline.cpp"
+.depthBiasEnable = depth_bias_ ? VK_TRUE : VK_FALSE,
+.depthBiasConstantFactor = depth_bias_constant_,
+.depthBiasClamp = 0.0F,
+.depthBiasSlopeFactor = depth_bias_slope_,
+```
+
+The constant factor is not a distance. It is a multiple of *r*, the smallest difference the
+depth format can resolve — a number the implementation defines, and the reason the bias is
+expressed this way rather than in world units: the same offset has to work in a format
+with 24 fixed-point bits and one with a float exponent.
+
+The slope factor is scaled by how fast depth changes across the polygon. A floor seen at a
+glancing angle covers an enormous depth range in very few pixels, and a constant offset
+that is ample head-on is nothing at all out near the horizon.
+
+:::note[Why the number is negative]
+`LESS` means smaller wins, and Vulkan's depth range runs 0 at the near plane to 1 at the
+far one. A negative bias moves a fragment toward the viewer, which is the direction that
+wins the comparison. Under a reversed-Z setup — `GREATER` with the buffer cleared to 0 —
+the sign flips with it.
+:::
+
+## The stencil test needs a format that has one
+
+Everything so far was depth. The stencil test needs something the previous eleven chapters
+never asked for: somewhere to put the stencil.
+
+vkcommon's chooser, written in 1.13, asks for the most precise depth format first:
+
+```cpp title="code/common/scaffold/src/image.cpp"
+constexpr std::array candidates{
+    VK_FORMAT_D32_SFLOAT,
+    VK_FORMAT_D32_SFLOAT_S8_UINT,
+    VK_FORMAT_D24_UNORM_S8_UINT,
+};
+```
+
+`VK_FORMAT_D32_SFLOAT` has no stencil aspect at all, and it is the one that wins on any
+sane desktop GPU. So this chapter writes its own chooser that considers only the two
+combined formats. Vulkan guarantees at least one of them is supported as a depth-stencil
+attachment, but not which, so both have to be asked for — on this machine (an RTX 4080) it
+is `D32_SFLOAT_S8_UINT`.
+
+Keeping 1.13's chooser and asking for a stencil anyway is instructive, because the
+validation layers catch it four separate times before a single pixel is drawn:
+
+```
+vkCreateImageView(): pCreateInfo Using format (VK_FORMAT_D32_SFLOAT) with aspect flags
+(VK_IMAGE_ASPECT_DEPTH_BIT|VK_IMAGE_ASPECT_STENCIL_BIT) but depth-only image formats can
+have only the VK_IMAGE_ASPECT_DEPTH_BIT set.
+
+vkCreateGraphicsPipelines(): pCreateInfos[0].pNext<VkPipelineRenderingCreateInfo>
+.stencilAttachmentFormat (VK_FORMAT_D32_SFLOAT) does not have a stencil aspect
+(need to use a stencil format).
+
+vkCmdBeginRendering(): pRenderingInfo->pStencilAttachment->imageView was created with a
+format (VK_FORMAT_D32_SFLOAT) that does not have a stencil aspect.
+```
+
+The aspect mask is the part that is easy to forget, because it is not one decision but
+three that must agree: the view's `subresourceRange`, every barrier's `subresourceRange`,
+and the layout. A depth-stencil image uses `VK_IMAGE_ASPECT_DEPTH_BIT |
+VK_IMAGE_ASPECT_STENCIL_BIT` and `VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL`, not
+the depth-only versions 1.13 used.
+
+## Three attachments, two of them the same view
+
+Dynamic rendering describes depth and stencil separately, so `VkRenderingInfo` grows a
+third attachment:
+
+```cpp title="code/src/4.advanced_vulkan/depth_and_stencil/main.cpp"
+const VkRenderingInfo rendering{
+    .colorAttachmentCount = 1,
+    .pColorAttachments = &colour_attachment,
+    .pDepthAttachment = &depth_attachment,
+    .pStencilAttachment = &stencil_attachment,
+};
+```
+
+`depth_attachment` and `stencil_attachment` name **the same `VkImageView`**. That is not a
+duplicate and not a mistake: a combined format is one image carrying two aspects, and they
+are listed separately because they are cleared, loaded and stored separately. Here both
+clear on load — depth to 1.0, stencil to 0 — and both are `DONT_CARE` on store, because
+nothing outlives the frame.
+
+Clearing the stencil is load-bearing. The outline pass asks "did a crate write here?", and
+that question only means anything if the buffer started the frame saying no.
+
+## Declaring the attachment is not enabling the test
+
+Every pipeline in this chapter declares the stencil format, including the three that never
+test the stencil:
+
+```cpp title="code/src/4.advanced_vulkan/depth_and_stencil/main.cpp"
+const auto base = [&]() -> vkc::PipelineBuilder {
+    return vkc::PipelineBuilder(device)
+        .shaders(shader)
+        .vertex_input(std::span(&binding, 1), attributes)
+        .colour_attachment(swapchain().format())
+        .stencil_attachment(depth_stencil_format_)
+        .layout(pipeline_layout_);
+};
+```
+
+Without a render pass object, a pipeline carries its own description of the attachments it
+expects, and that description has to match the rendering instance it is used inside.
+Dropping `stencil_attachment()` and running gives:
+
+```
+vkCmdDrawIndexed(): VkRenderingInfo::pStencilAttachment->imageView format
+(VK_FORMAT_D32_SFLOAT_S8_UINT) must match the corresponding format in
+VkPipelineRenderingCreateInfo::stencilAttachmentFormat (VK_FORMAT_UNDEFINED).
+```
+
+Note where it lands: at the **draw**, not at pipeline creation. Nothing is wrong with
+either object on its own; they are only incompatible once used together, which is the
+characteristic shape of a dynamic-rendering mistake and worth recognising.
+
+## Stamping a silhouette
+
+The crates are drawn with the only state that differs from the floor's:
+
+```cpp title="code/src/4.advanced_vulkan/depth_and_stencil/main.cpp"
+const VkStencilOpState write_one{
+    .failOp = VK_STENCIL_OP_KEEP,
+    .passOp = VK_STENCIL_OP_REPLACE,
+    .depthFailOp = VK_STENCIL_OP_KEEP,
+    .compareOp = VK_COMPARE_OP_ALWAYS,
+    .compareMask = 0xFF,
+    .writeMask = 0xFF,
+    .reference = 1,
+};
+```
+
+`compareOp = ALWAYS` means this pass never rejects anything — it is writing, not reading.
+`passOp = REPLACE` stores `reference` wherever the fragment also survived the depth test,
+so what accumulates is the crates' *visible* silhouette, occlusions included.
+
+`depthFailOp = KEEP` is the field that earns its place. A fragment that passes the stencil
+test and fails the depth test is behind something else, and keeping the stencil unchanged
+there is what stops a crate hidden behind a wall from stamping a silhouette that would then
+be outlined straight through the wall.
+
+The three op fields cover the three possible fates of a fragment, and every one of them
+needs an answer: stencil failed, stencil passed but depth failed, both passed.
+
+## Drawing only where nothing was
+
+The outline is the same cube, 6% larger, with the test inverted:
+
+```cpp title="code/src/4.advanced_vulkan/depth_and_stencil/main.cpp"
+const VkStencilOpState keep_where_unstamped{
+    .failOp = VK_STENCIL_OP_KEEP,
+    .passOp = VK_STENCIL_OP_KEEP,
+    .depthFailOp = VK_STENCIL_OP_KEEP,
+    .compareOp = VK_COMPARE_OP_NOT_EQUAL,
+    .compareMask = 0xFF,
+    .writeMask = 0x00,
+    .reference = 1,
+};
+```
+
+`NOT_EQUAL 1` keeps only fragments landing where no crate was drawn, which of a
+slightly-enlarged crate is precisely the rim protruding past the real one. `writeMask = 0`
+because this pass reads the stencil and must leave it intact for the next crate.
+
+The draw order matters more than any of the state does:
+
+```cpp title="code/src/4.advanced_vulkan/depth_and_stencil/main.cpp"
+vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, crate_pipeline_);
+for (const CratePlacement& crate : kCrates) { /* ... */ }
+
+if (outlines_) {
+    vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, outline_pipeline_);
+    for (const CratePlacement& crate : kCrates) { /* ... */ }
+}
+```
+
+Every crate stamps its silhouette before any outline is drawn. Interleave the two — crate,
+outline, crate, outline — and the first crate's halo spills across the second crate, which
+has not yet written the stencil that would have masked it. All the writes, then all the
+reads.
+
+:::note[What moved into vkcommon]
+Three setters on `PipelineBuilder`, all of them pass-throughs:
+
+```cpp title="code/common/scaffold/include/vkc/pipeline.hpp"
+PipelineBuilder& depth_bias(float constant_factor, float slope_factor);
+PipelineBuilder& stencil_attachment(VkFormat format);
+PipelineBuilder& stencil_test(VkStencilOpState front, VkStencilOpState back);
+```
+
+The two `VkStencilOpState` structs are still written out field by field in this chapter's
+`main.cpp`, as 1.9 did with its specialisation entries. The builder carries them; it does
+not decide anything.
+
+The depth-stencil *buffer* stayed here rather than moving. vkcommon's
+`create_depth_buffer()` is 1.13's, produces a depth-only image, and every chapter from 1.13
+to 3.4 still wants exactly that.
+:::
+
+## What changed since 3.4
+
+- a depth-stencil format, chosen from the two combined candidates rather than 1.13's list
+- an image whose aspect mask, view and layout all name depth *and* stencil
+- a third attachment in `VkRenderingInfo`, pointing at the same view as the second
+- five pipelines that differ only in depth and stencil state, sharing two fragment shaders
+- `depth_bias`, `stencil_attachment` and `stencil_test` on `PipelineBuilder`
+- Part 4 sits outside the Assimp gate in `code/src/CMakeLists.txt`: 22 chapters build
+  without Assimp now, 26 with it
+
+## Exercises
+
+1. Give the slab the floor's exact four vertices and run it with the bias off. Predict
+   first whether it will fight, vanish, or win — then explain the result in terms of what
+   `VK_COMPARE_OP_LESS` does with two equal numbers.
+2. Change `depthCompareOp` on the floor and crate pipelines to `VK_COMPARE_OP_GREATER` and
+   the depth clear to `0.0`. Everything should look identical. Work out why this
+   arrangement — reversed-Z — has better precision, given how floats are distributed.
+3. Set the outline pipeline's `depthTestEnable` back to true and find the camera angle that
+   shows why it is off.
+4. Move the outline pass between the two crate draws and reproduce the spill described
+   above.
+5. Change the crates' `depthFailOp` from `KEEP` to `REPLACE`, then move the camera so one
+   crate is behind the other. What is now outlined, and why?
+6. Two crates, two different reference values, two outline passes: outline one crate in
+   orange and the other in cyan without adding a pipeline. What has to become dynamic
+   state, and which `vkCmdSet*` call provides it?
+
+Next: 4.2, where the other half of the fixed-function tail — blending and culling — turns
+out to be the thing that decides whether a transparent surface looks like glass or like a
+mistake, and where `depthWriteEnable` finally earns the paragraph it got here.

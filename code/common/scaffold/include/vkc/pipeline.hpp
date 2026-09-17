@@ -61,6 +61,23 @@ public:
     PipelineBuilder& depth(VkFormat format, bool test, bool write,
                            VkCompareOp compare = VK_COMPARE_OP_LESS);
 
+    // Offsets every depth value this pipeline produces before the depth test compares
+    // it, in multiples of the smallest difference the depth buffer can resolve.
+    // Negative moves toward the viewer. Chapter 4.1 explains what the two factors do
+    // and why a distance in world units would be the wrong unit for the job.
+    PipelineBuilder& depth_bias(float constant_factor, float slope_factor);
+
+    // Declares that the render pass instance has a stencil attachment of this format.
+    // Required of *every* pipeline drawn into such an instance, including ones that
+    // never test the stencil: the pipeline's attachment description has to match the
+    // rendering instance's. This does not enable the stencil test.
+    PipelineBuilder& stencil_attachment(VkFormat format);
+
+    // Enables the stencil test and sets the op state for front- and back-facing
+    // triangles. Chapter 4.1 writes both VkStencilOpState structs out in full and
+    // explains every field; this only carries them through.
+    PipelineBuilder& stencil_test(VkStencilOpState front, VkStencilOpState back);
+
     // Dynamic rendering has no render pass to describe the attachments, so the
     // pipeline is told their formats directly. These must match the images the
     // chapter actually renders into.
@@ -101,6 +118,15 @@ private:
     bool depth_test_ = false;
     bool depth_write_ = false;
     VkCompareOp depth_compare_ = VK_COMPARE_OP_LESS;
+
+    bool depth_bias_ = false;
+    float depth_bias_constant_ = 0.0F;
+    float depth_bias_slope_ = 0.0F;
+
+    VkFormat stencil_format_ = VK_FORMAT_UNDEFINED;
+    bool stencil_test_ = false;
+    VkStencilOpState stencil_front_{};
+    VkStencilOpState stencil_back_{};
 
     bool blending_ = false;
 
