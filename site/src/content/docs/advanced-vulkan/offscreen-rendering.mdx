@@ -1,0 +1,408 @@
+---
+title: "Offscreen rendering & render targets"
+description: The scene stops going to the screen and starts going into an image you own. Nothing about the drawing changes; everything about what happens next does.
+sidebar:
+  order: 3
+---
+
+<figure>
+  <img src="/img/reference/4.3.offscreen_rendering.png" alt="The glass panes, ferns and crates of the previous chapter, apparently unchanged" />
+  <figcaption>Chapter 4.3, running with no effect selected. This is 4.2's frame, and it is
+  pixel for pixel the same frame — but it reached the screen by a different road.</figcaption>
+</figure>
+
+Every chapter so far has drawn into a swapchain image, because that is the image the
+window system hands over and there was never a reason to want a different one. This
+chapter stops doing that. The scene is drawn into an image the sample allocates itself,
+and a second pass reads that image as a texture and writes the result to the screen.
+
+That second pass is where post-processing lives, and it is also where shadow maps,
+cubemap faces, deferred G-buffers, bloom and every other multi-pass technique in the rest
+of this series begins. All of them are the same three moves. Two of them you already know.
+
+- <kbd>1</kbd> cycles the post-processing effect
+- <kbd>2</kbd> cycles the render scale
+
+## A render target is an image with one more usage bit
+
+There is no `VkRenderTarget`. There is no type for it at all. What makes an image a render
+target is a usage flag, asked for when the image is created:
+
+```cpp
+offscreen_colour_ = vkc::Image(
+    context(), vkc::ImageDesc{
+                   .format = offscreen_format_,
+                   .extent = offscreen_extent_,
+                   .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                            VK_IMAGE_USAGE_SAMPLED_BIT,
+                   .mip_levels = 1,
+                   .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
+               });
+```
+
+`COLOR_ATTACHMENT_BIT` lets a rendering pass write to it. `SAMPLED_BIT` lets a shader read
+from it. Chapter 1.11's textures had the second bit and not the first; this series'
+swapchain asks for `COLOR_ATTACHMENT_BIT | TRANSFER_DST_BIT | TRANSFER_SRC_BIT` and not
+`SAMPLED_BIT`, which is one reason the screen's own image cannot stand in for this one.
+Asking for both is the whole of what this chapter needs, and everything that follows is a
+consequence of having asked.
+
+The usage flags are not a hint. A driver picks the image's internal memory arrangement
+from them, and using an image for something it was not created for is undefined behaviour
+that the validation layers will catch immediately.
+
+The scene needs its own depth buffer too, sized to the scene image rather than to the
+window:
+
+```cpp
+offscreen_depth_ =
+    vkc::create_depth_buffer(context(), depth_format_, offscreen_extent_);
+```
+
+That is the same `create_depth_buffer` chapter 1.13 wrote. The depth buffer belongs to the
+target being rendered into, not to the one being presented — a distinction that has not
+mattered until now because there was only ever one of each.
+
+### The format is a free choice
+
+This sample gives the scene image the swapchain's format, which keeps the two passes
+agreeing about what a colour means and costs nothing to explain. It is not a requirement,
+and the freedom is the point: a render target can be any format the GPU supports for the
+usage asked of it. Part 5's HDR chapter puts `R16G16B16A16_SFLOAT` here precisely so that
+the scene pass can write values above 1.0 that a swapchain image could not hold.
+
+## There is no framebuffer
+
+In OpenGL this is the moment you build a framebuffer object, attach textures to it, check
+it for completeness, and bind it. In Vulkan 1.3 there is nothing to build:
+
+```cpp
+vkc::begin_rendering(frame.cmd, offscreen_colour_.view(), offscreen_depth_.view(),
+                     offscreen_extent_, {{0.05F, 0.06F, 0.09F, 1.0F}});
+```
+
+That is `vkcommon`'s `begin_rendering`, unchanged since chapter 1.13, called with a
+different view and a different extent. Dynamic rendering takes the attachments as fields
+of `VkRenderingInfo` at the moment rendering begins, so "render to texture" is not a mode
+to enter — it is a different value in a struct.
+
+The shader does not change either. `offscreen_rendering.slang` is 4.2's shader with the
+cull-mode experiments removed. A fragment shader writes to `SV_Target`; what `SV_Target`
+*is* was decided outside the shader and can be changed without touching a line of Slang.
+
+:::caution[The viewport follows the target, not the window]
+```cpp
+set_viewport(frame.cmd, offscreen_extent_);   // pass one
+set_viewport(frame.cmd, frame.extent);        // pass two
+```
+This is the classic first bug of a render-to-texture pass. The viewport is dynamic state,
+it is whatever the last `vkCmdSetViewport` said, and a frame with two differently sized
+targets in it needs two calls. Forget the first one and the scene is drawn into a corner
+of a correctly sized image; forget the second and the screen keeps the scene image's
+dimensions. Every sample before this one took its viewport from `frame.extent` because
+there was only one answer, so `set_viewport` here takes an extent rather than a
+`FrameInfo`.
+:::
+
+## The barrier
+
+Here is the part that is genuinely new, and it is the chapter.
+
+An image that is being written as a colour attachment and an image that is being read by a
+sampler are not stored the same way. The GPU is free to arrange attachment memory for fast
+per-pixel blending and texture memory for fast filtered fetches, and those are different
+arrangements. Moving between them is a *layout transition*, and nothing does it unless you
+say so.
+
+There are two transitions in this frame.
+
+### Into the target
+
+```cpp
+image_barrier(frame.cmd, offscreen_colour_.handle(), VK_IMAGE_LAYOUT_UNDEFINED,
+              VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+              VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+              VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+              VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+              VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+```
+
+`UNDEFINED` as the old layout means "I do not want what is in there". That is the right
+answer every frame: the colour attachment's `loadOp` is `CLEAR`, so the previous frame's
+pixels are about to be thrown away regardless, and naming the real old layout would ask
+the driver to preserve contents nobody reads.
+
+The *source scope* is not empty, though, and this is easy to get wrong. There is one scene
+image and two frames in flight. The previous frame's second pass may still be sampling
+this image when the current frame's first pass wants to overwrite it — a write after a
+read is still a hazard, and `FRAGMENT_SHADER` / `SHADER_SAMPLED_READ` is what that previous
+reader was.
+
+A barrier's source scope covers every command submitted earlier on the queue, not just
+earlier commands in the same command buffer, which is what makes one barrier enough to
+cover a hazard that spans two frames. The alternative is one scene image per frame in
+flight, which trades memory for the bubble this barrier introduces.
+
+### Out of the target
+
+```cpp
+image_barrier(frame.cmd, offscreen_colour_.handle(),
+              VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+              VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+              VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+              VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+              VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+```
+
+Two separate things happen here and they are worth keeping apart. The *layout* changes, so
+the hardware can rearrange the memory into something a sampler likes. And a *dependency*
+is recorded, so the fragment shaders of the second pass cannot begin reading before the
+colour writes of the first pass have landed.
+
+Read the four masks as one sentence: colour-attachment writes, from the colour attachment
+output stage, must complete before sampled reads in the fragment shader stage begin.
+Everything outside that sentence stays free to overlap.
+
+### Why these masks and not `ALL_COMMANDS`
+
+`vkcommon` has had `transition_image` since chapter 1.5, and it names
+`VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT` on both sides — "everything before, everything
+after". It is always correct and it is a blunt instrument: it forbids overlap that was
+never a problem.
+
+Until this chapter that was a fine trade, because the only transitions were at the top and
+bottom of a frame where there was nothing to overlap with. Here there are two transitions
+in the *middle* of a frame, and what they say decides how much of the two passes may run
+at once. So this chapter writes the precise form out, and `vkcommon` gains it.
+
+### What happens without it
+
+Deleting the second barrier and running the sample produces, with the validation layers in
+their default configuration, nine copies of this — and then a tenth message saying the
+layer has hit its `duplicate_message_limit` and will stop repeating itself:
+
+```text
+vkCmdDraw(): Cannot use VkImage 0x5e000000005e[scene colour] (layer 0, mip 0) with
+specific layout VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL (specified by combined image
+sampler descriptor [VkDescriptorSet 0x430000000043[scene image], Set 0, Binding 0,
+Index 0, variable "scene"]) that doesn't match the previous known layout
+VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL.
+```
+
+The descriptor promised `SHADER_READ_ONLY_OPTIMAL` and the image was never moved there.
+Core validation tracks layouts, so it catches this on its own.
+
+What core validation does *not* catch is the other half — the timing. Running the same
+broken build with synchronization validation switched on produces twenty messages instead
+of ten, and the extra ones look like this:
+
+```text
+vkQueueSubmit2(): WRITE_AFTER_WRITE hazard detected. vkCmdPipelineBarrier2 (from
+VkCommandBuffer 0x55ea4c65f530[frame[1]] submitted on the current VkQueue
+0x55ea4c9adb30) writes to VkImage 0x5e000000005e[scene colour], which was previously
+written at the end of the render pass instance (vkCmdEndRendering) by the attachment
+storeOp (from VkCommandBuffer 0x55ea4c6568b0[frame[0]] submitted on VkQueue
+0x55ea4c9adb30).
+```
+
+Note the two different command buffers: `frame[1]` colliding with `frame[0]`. That is the
+frames-in-flight hazard from the previous section, reported by name.
+
+:::note[Turning synchronization validation on]
+It is off by default, and the `VK_LAYER_ENABLES` environment variable that used to switch
+it on now prints a deprecation warning. The current form is a settings file:
+
+```bash
+printf 'khronos_validation.validate_sync = true\n' > vk_layer_settings.txt
+VK_LAYER_SETTINGS_PATH=$PWD/vk_layer_settings.txt ./bin/4.3.offscreen_rendering
+```
+
+It costs real performance, which is why it is not on for every run. It is worth turning on
+whenever a frame gains a pass, because a missing dependency usually still produces the
+right picture on the machine it was written on.
+:::
+
+## The second pass
+
+```cpp
+vkCmdDraw(frame.cmd, 3, 1, 0, 0);
+```
+
+Three vertices, no vertex buffer, no index buffer. The shader builds them from the vertex
+index, the same way chapter 1.7's very first triangle did:
+
+```slang
+[shader("vertex")]
+VSOutput vertexMain(uint vertex_index: SV_VulkanVertexID) {
+    VSOutput output;
+    output.uv = float2((vertex_index << 1) & 2, vertex_index & 2);
+    output.position = float4(output.uv * 2.0 - 1.0, 0.0, 1.0);
+    return output;
+}
+```
+
+The three vertices come out at uv `(0,0)`, `(2,0)` and `(0,2)`, so in clip space they land
+at `(-1,-1)`, `(3,-1)` and `(-1,3)`: one triangle with the screen's square tucked into its
+corner. A quad would do the same job with two triangles and a seam down the diagonal where
+they meet; one oversized triangle has no seam, and the parts hanging off the screen cost
+nothing because the rasteriser clips them.
+
+The rendering info for this pass is written out rather than taken from `vkcommon`, because
+it differs from every previous one in the series in two ways.
+
+```cpp
+.pDepthAttachment = nullptr,
+```
+
+No depth attachment at all. One triangle covering the screen has nothing to be occluded by
+and nothing to occlude, so the pipeline has no `depth()` call either.
+
+```cpp
+.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+```
+
+Not `CLEAR`. The triangle writes every pixel, so clearing first would be work whose every
+result is immediately overwritten. `DONT_CARE` is not "keep the old contents" — it is a
+promise that nothing will read them, which on a tiled GPU lets the driver skip pulling the
+attachment into tile memory at all.
+
+### The kernels
+
+The fragment shader is where the effect happens, and the only reason it needs a *texture*
+rather than a copy is that a fragment here can read its neighbours — something no fragment
+in the scene pass could do.
+
+```slang
+float3 convolve(float2 uv, float weights[9]) {
+    float3 total = float3(0.0);
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            float2 offset = float2(float(x), float(y)) * push.texel;
+            total += scene.Sample(uv + offset).rgb * weights[(y + 1) * 3 + (x + 1)];
+        }
+    }
+    return total;
+}
+```
+
+`push.texel` is `1 / width, 1 / height` of the *scene image*, pushed in each frame. That is
+what makes the kernels follow the render scale instead of assuming the scene image is the
+size of the window — which, in this sample, it usually is not.
+
+The weights decide everything else, and they divide into two families by what they sum to.
+Sharpen's weights sum to 1, so a flat region comes through untouched and only differences
+from the neighbourhood are amplified. The Laplacian's sum to 0, so a flat region comes out
+black and only the places where the image *changes* survive:
+
+<figure>
+  <img src="/img/4.3/edges.png" alt="The same scene reduced to coloured outlines on black: the floor's grout lines, the crates' edges, the ferns' silhouettes and the panes' borders" />
+  <figcaption>Edge detection, <kbd>1</kbd> five times. The panes' interiors vanish because
+  they are flat; their borders survive. The ferns survive almost entirely, because a cutout
+  silhouette is nothing but edges.</figcaption>
+</figure>
+
+A blur is the least visually convincing of the set, and usefully so: a 3×3 gaussian at
+1280×720 changes 54.94% of the frame's pixels and is nearly impossible to see. Kernel
+radius has to be read relative to resolution, and a real blur either uses a much wider
+kernel, or — far cheaper — does its blurring at a much smaller size. Part 5's bloom chapter
+does the second.
+
+## The render target is not the window
+
+<kbd>2</kbd> cycles the scene image between 100%, 50%, 25% and 200% of the window's size.
+Nothing else changes: the same scene, the same draw calls, the same second pass.
+
+<figure>
+  <img src="/img/4.3/scale-25.png" alt="The same scene, visibly blocky, with stair-stepped edges on the crates and panes" />
+  <figcaption>The scene rendered into a 320×180 image and stretched across 1280×720.
+  63.47% of pixels differ from the reference.</figcaption>
+</figure>
+
+This is dynamic resolution scaling in its crudest form, and it is one of the two things
+offscreen rendering buys that nothing else can. The scene costs a sixteenth as many
+fragment shader invocations at 25%; the post pass still costs a full screen's worth,
+because it is writing the screen.
+
+Two details make it work at all. The projection matrix's aspect ratio comes from the scene
+image, not the window — the matrix belongs to the target being drawn into. And the second
+pass's sampler filters `LINEAR` with `CLAMP_TO_EDGE`: linear because at 25% each scene
+texel covers sixteen screen pixels and nearest filtering would make that obvious, and
+clamped because a 3×3 kernel on the outermost pixel reaches one texel past the edge, where
+`REPEAT` would fetch the opposite side of the screen.
+
+## What the round trip costs
+
+The frame at the top of this page was captured from this chapter's sample. Compared
+against 4.2's reference image — which was rendered straight into the swapchain with no
+offscreen pass at all — **0 of 921600 pixels differ**.
+
+That is worth being precise about, because it is a measurement and not a guarantee. It
+holds here because the scene image has the swapchain's own 8-bit sRGB format and the render
+scale is 1, so every value written is read back and rewritten unchanged. Change the format
+or the scale and there is a conversion in the middle with something to lose. What the
+measurement does establish is that the extra pass, the two barriers and the sampler
+between them introduced no error of their own.
+
+### The alpha channel, checked
+
+4.2 ended by saying that the alpha channel stops being decoration and starts being data
+once something reads the image back. Effect 6 is that check: it draws the scene image's
+alpha as a greyscale picture.
+
+The capture comes back with **one distinct colour across all 921600 pixels**, `(255, 255,
+255, 255)`. Every fragment in the scene — opaque floor, cut-out ferns, blended glass —
+left the attachment's alpha at 1, which is what 4.2's `ZERO`/`ONE` alpha equation was for.
+Had that chapter kept the obvious-looking `ONE`/`ZERO` instead, the panes would appear here
+as three grey rectangles at 140, and the next pass would be sampling them.
+
+There is no figure for it, because a correct result is a white rectangle.
+
+:::note[What moved into vkcommon]
+`vkc::image_barrier()` — the precise form of `transition_image()`, taking the four masks
+explicitly. `transition_image()` stays where it is and keeps its `ALL_COMMANDS` masks; it
+is still the right call at the top and bottom of a frame, and this chapter's version is the
+right one between passes.
+
+Nothing else. A render target did not need a new type, because it turned out to be
+`vkc::Image` with one more usage bit.
+:::
+
+## What changed since 4.2
+
+- an image created with `COLOR_ATTACHMENT_BIT | SAMPLED_BIT`, and a depth buffer sized to
+  it rather than to the window
+- `vkc::begin_rendering()` — unchanged since 1.13 — called with that image's view
+- two precise barriers, and the measured difference between what core validation and
+  synchronization validation each report when one is missing
+- a second pipeline with no vertex input, no depth attachment and a `DONT_CARE` loadOp,
+  drawing three generated vertices
+- a render scale that decouples the scene's resolution from the window's
+- 24 chapters build without Assimp now, 28 with it
+
+## Exercises
+
+1. Delete the *first* barrier — the one into `COLOR_ATTACHMENT_OPTIMAL` — rather than the
+   second, and run with synchronization validation on. Predict which hazard is reported
+   before you look, and explain why the picture still looks correct.
+2. Set the scene image's format to `VK_FORMAT_R8G8B8A8_UNORM` while the swapchain stays
+   sRGB. The image gets darker or lighter; work out which, and which of the two conversions
+   went missing.
+3. Give the second pass its own depth attachment and a depth test the fullscreen triangle
+   is not guaranteed to pass. Work out what the screen should show before you build it,
+   then say why having no depth attachment at all is a better answer than a test you have
+   to reason about.
+4. Render the scene at 25% but leave `push.texel` at the *screen's* texel size instead of
+   the scene image's. Predict what the edge-detect kernel is sampling now, then run it and
+   describe what it turned out to be detecting.
+5. Add a second scene pass with the camera turned 180°, into a second render target, and
+   draw it as a rectangle in the corner of the screen. This is a rear-view mirror, and it
+   needs no new Vulkan concepts at all — only another instance of everything in this
+   chapter.
+6. Move the two `image_barrier()` calls so they are both at the top of `on_render`, before
+   the first pass. Every layout the descriptors ask for still exists at some point in the
+   frame. Work out what the second pass is sampling now, and check yourself with the
+   validation layers before you check yourself with the picture.
+
+Next: 4.4 puts six render targets on one image and points the camera along each axis in
+turn. Everything above happens six times; what is new is the image.

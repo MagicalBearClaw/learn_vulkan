@@ -11,6 +11,7 @@
 #   swapchain.cpp   1.4  The swapchain
 #   frame.cpp       1.5  Command buffers / 1.6  Synchronisation
 #                   1.13 begin_rendering -- the colour and depth attachments
+#                   4.3  image_barrier -- transition_image with the four masks spelled out
 #   app.cpp         the loop those chapters share, plus screenshot support
 #   pipeline.cpp    1.7  Hello triangle -- shader modules and the pipeline builder
 #   buffer.cpp      1.8  Memory and buffers -- VMA buffers, staging, immediate submit

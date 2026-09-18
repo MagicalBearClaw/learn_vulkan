@@ -29,6 +29,21 @@ inline constexpr uint32_t kFramesInFlight = 2;
 void transition_image(VkCommandBuffer cmd, VkImage image, VkImageLayout from,
                       VkImageLayout to);
 
+// The same transition, said precisely: which stage produced the data and which access
+// wrote it, which stage is about to consume it and which access will read it.
+//
+// transition_image() above names ALL_COMMANDS on both sides, which is correct and
+// forbids overlap that was never a problem. That is a fine trade at the top and bottom
+// of a frame, where there is nothing to overlap with. It is the wrong trade in the
+// middle of one -- between two passes that share an image -- because there the masks
+// decide how much of the two passes may run at once. Chapter 4.3 writes this function
+// out and works through both of its calls mask by mask.
+void image_barrier(VkCommandBuffer cmd, VkImage image, VkImageLayout from,
+                   VkImageLayout to, VkPipelineStageFlags2 src_stage,
+                   VkAccessFlags2 src_access, VkPipelineStageFlags2 dst_stage,
+                   VkAccessFlags2 dst_access,
+                   VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT);
+
 // Opens dynamic rendering into a colour view and a depth view, clearing both.
 //
 // Chapter 1.5 introduced VkRenderingInfo and 1.13 added the depth attachment. Both
