@@ -53,25 +53,17 @@ an article contrasts the two.
 ## Commands
 
 ```bash
-# Build (Linux, system packages). CMakePresets.json lives in code/, so the
-# configure step must run from there; the build path is relative to it.
+# Build (Linux). CMakePresets.json lives in code/, so the configure step must run
+# from there; the build path is relative to it.
 cd code && cmake --preset linux-debug
 cmake --build code/out/build/linux-debug
 
-# Build (Linux, vcpkg -- installs nothing system-wide)
-cd code && cmake --preset linux-vcpkg-debug
-cmake --build code/out/build/linux-vcpkg-debug
-
-# Build (Windows, vcpkg)
+# Build (Windows)
 cd code && cmake --preset x64-debug
 cmake --build code/out/build/x64-debug
 
 # Run a sample
 ./code/out/build/linux-debug/bin/<chapter-id>
-
-# Slang is fetched by CMake if find_package(slang CONFIG) finds nothing.
-# To use a specific one instead:
-cd code && cmake --preset linux-debug -DCMAKE_PREFIX_PATH=/path/to/slang
 
 # Scaffold a chapter
 python3 tools/new_chapter.py <part>.<n>.<slug> --title "..." --part <part-slug>
@@ -111,19 +103,22 @@ cd site && npx astro build < /dev/null
 
 - Development happens on Linux; Windows must keep building. Do not add MSVC-only or
   Linux-only code without guarding it.
-- **Three presets, all working.** `linux-debug` builds against system packages
-  (`LVK_DEPS=system`), `linux-vcpkg-debug` builds against vcpkg and installs nothing
-  system-wide, and Windows uses vcpkg. Verified by building every chapter both ways,
-  warning-free, and running `tools/capture.py --all` against each build tree: every
-  chapter renders 0.00% different in both modes. The counts differ from Part 3 on:
-  vcpkg builds 28 chapters, `linux-debug` builds 24 and skips all four model-loading chapters,
-  because this machine has no system Assimp.
-- **Assimp is the one dependency with no fallback.** VMA, stb and Slang are fetched when
-  missing; Assimp is not, because it is large and slow to build. `Dependencies.cmake`
-  warns instead of failing and sets `LVK_HAVE_ASSIMP`, which `code/src/CMakeLists.txt`
-  uses to skip Part 3. Everything through 2.6 must keep building without it, and so must
-  Part 4 onward: those `add_subdirectory` lines sit outside the gate, and the scaffolder
-  appends new ones after it -- which is correct for Part 4 and wrong for Part 3.
+- **vcpkg is the only source of libraries.** There is no system-packages mode and no
+  `find_package` fallback anywhere: `code/vcpkg.json` is the manifest, every preset names
+  the vcpkg toolchain, and every `find_package` in `Dependencies.cmake` is `REQUIRED`.
+  The reason is reproducibility -- the articles quote validation messages and Slang
+  output that a distro's version bump can invalidate, so the library set has to be
+  pinned. A missing library is a vcpkg error, not something CMake works around.
+- **Two presets on each platform.** `linux-debug` / `linux-release` and
+  `x64-debug` / `x64-release`. All of them build **all 28 chapters**, Part 3 included.
+  Verified by building every chapter warning-free and running `tools/capture.py --all`
+  against the build tree: every chapter renders 0.00% different.
+- **Part 3 is no longer gated.** Assimp was once optional, because it is large and slow
+  to compile and the system-packages mode could not be relied on to have it; vcpkg builds
+  it once and caches it, so `code/src/CMakeLists.txt` now adds the model-loading chapters
+  unconditionally. `LVK_HAVE_ASSIMP` and `LVK_DEPS` are both gone. The scaffolder appends
+  new `add_subdirectory` lines at the end of that file, which is now correct for every
+  part.
 - **Assimp exports stb_image's symbols.** Its static library defines all 43 `stbi_*`
   names, so a second global definition anywhere in this project makes every Part 3
   target fail to link with `multiple definition of stbi_load`. `stb_impl.cpp` therefore
@@ -137,10 +132,11 @@ cd site && npx astro build < /dev/null
   appeared was `libxcrypt`, reached through SDL3's `ibus` default feature, so
   `vcpkg.json` sets `"default-features": false` and asks only for `vulkan`, `wayland`
   and `x11`.
-- **The two modes do not ship the same Slang.** vcpkg's newest is 2026.7.1;
-  `LVK_SLANG_VERSION` pins 2026.17.1 for the fetched fallback. Both compile the samples'
-  shaders, but a Slang-version-specific claim must be checked in the mode it concerns.
-- **VMA is pinned to 3.3.0** in `vcpkg.json`, matching the FetchContent tag. 3.4.0 adds
+- **Slang comes from vcpkg's `shader-slang` port**, currently 2026.7.1. There used to be
+  a second Slang -- a pinned official release fetched by CMake when the system build
+  found none -- and the two versions were a standing hazard for any claim about Slang's
+  output. There is now one.
+- **VMA is pinned to 3.3.0** in `vcpkg.json`. 3.4.0 adds
   `VmaAllocationCreateInfo::minAlignment`, and the fully-designated initialisers in
   `buffer.cpp`, `image.cpp` and chapters 1.8 and 1.11 then warn about the missing field.
   Those initialisers are quoted in the articles, so the pin is cheaper than the edit.

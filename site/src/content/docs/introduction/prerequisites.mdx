@@ -41,22 +41,24 @@ is by far the easier path.
 
 ### Linux
 
-Everything comes from your distribution. On Arch and derivatives:
+Your distribution supplies the toolchain and the Vulkan runtime pieces. On Arch and
+derivatives:
 
 ```bash
 sudo pacman -S base-devel cmake ninja clang git python \
-               vulkan-headers vulkan-validation-layers vulkan-tools \
-               volk sdl3 glm spdlog spirv-tools
+               vulkan-validation-layers vulkan-tools
 ```
 
-On Debian and Ubuntu the equivalents are `build-essential cmake ninja-build clang
-libvulkan-dev vulkan-validationlayers vulkan-tools libsdl3-dev libglm-dev
-libspdlog-dev spirv-tools`. You will also need your GPU vendor's driver, which is
-usually already present.
+On Debian and Ubuntu the equivalents are `build-essential cmake ninja-build clang git
+python3 vulkan-validationlayers vulkan-tools`. You will also need your GPU vendor's
+driver, which is usually already present.
 
-Three dependencies are not in that list because CMake fetches them if it cannot find
-them: the Vulkan Memory Allocator and `stb`, which are header-only and rarely packaged,
-and Slang, which is discussed below.
+Every *library* the samples link — SDL3, volk, glm, spdlog, the Vulkan headers, VMA,
+`stb`, Assimp and Slang — comes from **[vcpkg](https://vcpkg.io/)** instead, so set
+`VCPKG_ROOT` to point at your vcpkg checkout and there is nothing else to install.
+`code/vcpkg.json` lists them and is the only place a version is chosen: one pinned set
+of libraries on every machine, so that what this series says a library does is what it
+does for you too.
 
 ### Windows
 
@@ -66,22 +68,20 @@ and Slang, which is discussed below.
 3. **[vcpkg](https://vcpkg.io/)**, with the `VCPKG_ROOT` environment variable pointing
    at it. The rest of the dependencies come from `code/vcpkg.json`.
 
-:::caution[Avoid spaces in the path]
-Several vcpkg ports build through autotools, which mishandles paths containing spaces.
-Put the checkout somewhere like `C:\dev\learn_vulkan` rather than under a folder with
-a space in its name.
+:::note[Spaces in the path]
+Some vcpkg ports build through autotools, which mishandles paths containing spaces.
+This project's dependency set reaches none of them — `vcpkg.json` switches off SDL3's
+default features, which is where the one such port used to come from — so a checkout
+under `C:\Users\Your Name\...` builds fine.
 :::
 
 ### The shader compiler
 
 SPIR-V is the only shader format Vulkan accepts, and this series writes its shaders in
-**Slang**. Unlike every other dependency, you do not have to do anything about this one:
-the samples link Slang's compiler as a library and call it when they start, and CMake
-fetches a pinned official release if it cannot find Slang already installed.
-
-So there is nothing to install. If you *do* have Slang — the Vulkan SDK bundles it from
-version 1.3.296 onward — `find_package(slang CONFIG)` picks it up and the download is
-skipped.
+**Slang**. You do not have to do anything about this one either: it comes from vcpkg
+like every other library, and the samples link Slang's compiler and call it when they
+start. There is no shader build step, no `slangc` invocation and no `.spv` file
+anywhere — editing a shader and re-running the sample is the whole loop.
 
 :::note[Why Slang, and why at startup]
 GLSL still works, and `glslangValidator` is still in every SDK. Slang gives us one file

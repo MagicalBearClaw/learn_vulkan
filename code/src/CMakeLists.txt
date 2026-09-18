@@ -24,20 +24,12 @@ add_subdirectory(2.lighting/lighting_maps)
 add_subdirectory(2.lighting/light_casters)
 add_subdirectory(2.lighting/multiple_lights)
 
-# Part 3 loads models with Assimp, which is the one dependency this project does not
-# fetch or vendor when it is missing (Dependencies.cmake explains why). Everything up
-# to here still builds without it, so the part is skipped rather than fatal.
-if(LVK_HAVE_ASSIMP)
-    add_subdirectory(3.model_loading/assimp)
-    add_subdirectory(3.model_loading/mesh)
-    add_subdirectory(3.model_loading/model)
-    add_subdirectory(3.model_loading/bindless_materials)
-else()
-    message(STATUS "Skipping the model-loading chapters: Assimp was not found")
-endif()
+add_subdirectory(3.model_loading/assimp)
+add_subdirectory(3.model_loading/mesh)
+add_subdirectory(3.model_loading/model)
+add_subdirectory(3.model_loading/bindless_materials)
 
-# Part 4 goes back to the pipeline itself and needs no models, so it sits outside the
-# Assimp gate above and builds in every configuration.
+
 add_subdirectory(4.advanced_vulkan/depth_and_stencil)
 add_subdirectory(4.advanced_vulkan/blending_and_culling)
 add_subdirectory(4.advanced_vulkan/offscreen_rendering)

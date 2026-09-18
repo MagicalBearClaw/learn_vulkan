@@ -16,8 +16,7 @@
       "name": "vcpkg",
       "hidden": true,
       "cacheVariables": {
-        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
-        "LVK_DEPS": "vcpkg"
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
       }
     },
     {
@@ -33,54 +32,42 @@
     },
     {
       "name": "x64-debug",
-      "displayName": "Windows x64 Debug (vcpkg)",
+      "displayName": "Windows x64 Debug",
       "inherits": "windows-base",
       "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
     },
     {
       "name": "x64-release",
-      "displayName": "Windows x64 Release (vcpkg)",
+      "displayName": "Windows x64 Release",
       "inherits": "windows-base",
       "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
     },
     {
       "name": "linux-base",
       "hidden": true,
-      "inherits": "base",
+      "inherits": ["base", "vcpkg"],
       "cacheVariables": {
-        "CMAKE_C_COMPILER": "clang",
-        "CMAKE_CXX_COMPILER": "clang++",
-        "LVK_DEPS": "system"
+        "CMAKE_CXX_COMPILER": "clang++"
       },
       "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" }
     },
     {
       "name": "linux-debug",
-      "displayName": "Linux Debug (system packages)",
+      "displayName": "Linux Debug",
       "inherits": "linux-base",
       "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
     },
     {
       "name": "linux-release",
-      "displayName": "Linux Release (system packages)",
+      "displayName": "Linux Release",
       "inherits": "linux-base",
       "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
-    },
-    {
-      "name": "linux-vcpkg-debug",
-      "displayName": "Linux Debug (vcpkg)",
-      "inherits": ["linux-base", "vcpkg"],
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Debug",
-        "LVK_DEPS": "vcpkg"
-      }
     }
   ],
   "buildPresets": [
     { "name": "x64-debug", "configurePreset": "x64-debug" },
     { "name": "x64-release", "configurePreset": "x64-release" },
     { "name": "linux-debug", "configurePreset": "linux-debug" },
-    { "name": "linux-release", "configurePreset": "linux-release" },
-    { "name": "linux-vcpkg-debug", "configurePreset": "linux-vcpkg-debug" }
+    { "name": "linux-release", "configurePreset": "linux-release" }
   ]
 }

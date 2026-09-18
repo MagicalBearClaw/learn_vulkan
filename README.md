@@ -26,20 +26,21 @@ assets/     Downloaded by tools/bootstrap.py; not committed
 
 ### Linux
 
-Dependencies come from the distribution. On Arch and derivatives:
+Needs CMake, Ninja, clang, the Vulkan validation layers, and vcpkg with `VCPKG_ROOT`
+set. On Arch and derivatives:
 
 ```bash
-sudo pacman -S cmake ninja clang vulkan-headers vulkan-validation-layers \
-               volk sdl3 glm spdlog spirv-tools
+sudo pacman -S cmake ninja clang vulkan-validation-layers
 ```
 
-VMA and stb are header-only and are fetched automatically by CMake if they are not
-already installed.
+Every library the samples link — SDL3, volk, glm, spdlog, VMA, stb, Assimp and Slang —
+comes from **vcpkg**, which installs them into the build tree and nothing system-wide.
+`code/vcpkg.json` is the manifest, and it is the only place a library version is chosen.
+The first configure builds them and takes a while; after that vcpkg serves them from its
+cache.
 
 Shaders are written in **Slang** and are compiled to SPIR-V by the samples themselves,
 at startup, through `libslang` — there is no shader build step and no `.spv` anywhere.
-Nothing to install: `find_package(slang CONFIG)` picks up an existing Slang (the Vulkan
-SDK bundles one) and CMake downloads a pinned official release if there is none.
 
 ```bash
 cd code
@@ -59,10 +60,10 @@ cmake --preset x64-debug
 cmake --build out/build/x64-debug
 ```
 
-> **vcpkg and spaces:** several vcpkg ports build through autotools, which mishandles
-> paths containing spaces. Keep the checkout somewhere without them. The Linux presets
-> avoid vcpkg entirely for this reason; `linux-vcpkg-debug` exists if you want it
-> anyway.
+> **vcpkg and spaces:** some vcpkg ports build through autotools, which mishandles paths
+> containing spaces. This project's dependency set reaches none of them — `vcpkg.json`
+> turns off SDL3's default features for exactly that reason — so a checkout under a path
+> with spaces builds fine.
 
 ### Assets
 

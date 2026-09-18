@@ -241,25 +241,19 @@ because the thing worth sharing is not the `Assimp::Importer` call — it is the
 
 ## Building it
 
-Assimp is the one dependency in this project that CMake does not fetch or vendor when it is
-missing. VMA, stb and Slang all have fallbacks; Assimp is a large C++ library that takes
-minutes to build and brings its own compression dependencies, so a clear message beats a long
-build:
+Assimp is by a wide margin the largest thing this project links: 193 MB of static library
+in a debug build, and it brings zlib, minizip, pugixml, rapidjson and a pair of
+polygon-clipping libraries along with it. It still arrives exactly the way every other
+dependency does:
 
 ```cmake title="code/cmake/Dependencies.cmake"
-find_package(assimp CONFIG QUIET)
-if(TARGET assimp::assimp)
-    set(LVK_HAVE_ASSIMP TRUE)
-else()
-    set(LVK_HAVE_ASSIMP FALSE)
-    message(WARNING "Assimp was not found, so the model-loading chapters ...")
-endif()
+find_package(assimp CONFIG REQUIRED)
 ```
 
-Missing Assimp is a warning, not an error, and `code/src/CMakeLists.txt` skips Part 3 rather
-than failing the build. Everything through 2.6 still compiles. The vcpkg presets have Assimp
-already; a system build needs `assimp` from your distribution, and the warning names the
-package.
+`REQUIRED`, and no fallback. Every library in this series comes from vcpkg, pinned by
+`code/vcpkg.json`, so a missing one is a vcpkg error with a vcpkg message rather than
+something the build tries to work around. The size is a first-configure cost only —
+vcpkg compiles Assimp once and serves it from its cache afterwards.
 
 :::caution[Assimp exports stb's symbols, and it will break your link]
 Adding Assimp broke every Part 3 target with an error that has nothing to do with models:
@@ -294,7 +288,7 @@ surfaces at link time in whatever unlucky target happens to use both.
 
 ```bash
 python3 tools/bootstrap.py          # once, to fetch the model
-./code/out/build/linux-vcpkg-debug/bin/3.1.assimp
+./code/out/build/linux-debug/bin/3.1.assimp
 ```
 
 A grey helmet, lit by a key and a fill. Right-click to capture the mouse, `WASD` to fly.
