@@ -28,6 +28,19 @@ alpha channel means anything, and two details in it are deliberate:
     across the silhouette's edge averages the colours of texels on both sides, and if
     the outside were black the leaf would get a dark fringe that no amount of alpha
     testing removes.
+
+The sky is for chapter 4.4, cubemaps: six faces of one environment. It is the only
+texture here that is not drawn as a picture at all. There is one function, sky_colour(),
+that answers "what is in this direction", and each of the six faces is that function
+evaluated over the directions that face covers. Two things follow from doing it that
+way, and both are the reason it is done that way:
+
+  * the six faces agree along their twelve shared edges automatically, because a texel
+    on either side of an edge asks about very nearly the same direction. Six pictures
+    drawn independently would have to be made to match, and would not quite
+  * the face convention is testable. If the mapping from face texel to direction were
+    wrong, the horizon would step or mirror at a face edge instead of running straight
+    through it, which is obvious at a glance rather than subtle
 """
 
 from __future__ import annotations
@@ -389,7 +402,202 @@ def ground_texture() -> bytearray:
     return pixels
 
 
+# ---------------------------------------------------------------------------
+# The sky cubemap, for chapter 4.4
+# ---------------------------------------------------------------------------
+
+SKY_SIZE = 512
+
+# The six faces in Vulkan's layer order. A cubemap is a six-layer image and the layer
+# index *is* the face, so this order is not a convention of ours to choose: layer 0 is
+# +X, layer 1 is -X, and so on. The sample uploads the files in exactly this sequence.
+CUBE_FACES = ("px", "nx", "py", "ny", "pz", "nz")
+
+# Toward the sun. The scene's directional light travels the other way, so the sky and
+# the lighting agree about where the sun is -- which stops mattering the moment you
+# stop looking and starts mattering again the moment a mirrored surface shows the lit
+# side of an object and the sun itself in the same picture.
+SUN = (0.45, 1.0, 0.38)
+
+ZENITH = (48, 92, 172)
+HORIZON_SKY = (188, 210, 232)
+CLOUD_LIT = (250, 250, 250)
+CLOUD_BASE = (176, 182, 196)
+MOUNTAIN_HIGH = (96, 104, 124)
+MOUNTAIN_LOW = (62, 66, 82)
+GROUND = (58, 54, 48)
+SUN_DISC = (255, 252, 240)
+
+
+def normalise(x: float, y: float, z: float) -> tuple[float, float, float]:
+    length = math.sqrt(x * x + y * y + z * z)
+    return x / length, y / length, z / length
+
+
+def face_direction(face: int, u: float, v: float) -> tuple[float, float, float]:
+    """The direction one texel of one cube face looks along.
+
+    u and v run -1..1 across the face, v downward, which is the order the texels are
+    stored in. The six cases are the Vulkan specification's cube map face selection
+    table read backwards: the spec says which face a direction lands on and where,
+    and this says which direction a given place on a given face came from.
+    """
+
+    if face == 0:
+        return normalise(1.0, -v, -u)  # +X
+    if face == 1:
+        return normalise(-1.0, -v, u)  # -X
+    if face == 2:
+        return normalise(u, 1.0, v)  # +Y
+    if face == 3:
+        return normalise(u, -1.0, -v)  # -Y
+    if face == 4:
+        return normalise(u, -v, 1.0)  # +Z
+    return normalise(-u, -v, -1.0)  # -Z
+
+
+def hash_noise3(x: int, y: int, z: int, seed: int) -> float:
+    n = (
+        x * 374761393 + y * 668265263 + z * 1274126177 + seed * 2147483647
+    ) & 0xFFFFFFFF
+    n = ((n ^ (n >> 13)) * 1274126177) & 0xFFFFFFFF
+    return ((n ^ (n >> 16)) & 0xFFFF) / 65535.0
+
+
+def value_noise3(x: float, y: float, z: float, seed: int) -> float:
+    """Smoothly interpolated noise on a 3D lattice."""
+
+    ix, iy, iz = math.floor(x), math.floor(y), math.floor(z)
+    fx, fy, fz = x - ix, y - iy, z - iz
+    # Smoothstep each axis, otherwise the lattice shows through as diamonds.
+    sx = fx * fx * (3.0 - 2.0 * fx)
+    sy = fy * fy * (3.0 - 2.0 * fy)
+    sz = fz * fz * (3.0 - 2.0 * fz)
+
+    total = 0.0
+    for dz in (0, 1):
+        wz = sz if dz else 1.0 - sz
+        for dy in (0, 1):
+            wy = sy if dy else 1.0 - sy
+            for dx in (0, 1):
+                wx = sx if dx else 1.0 - sx
+                total += wx * wy * wz * hash_noise3(ix + dx, iy + dy, iz + dz, seed)
+    return total
+
+
+def fbm3(x: float, y: float, z: float, seed: int, octaves: int) -> float:
+    total = 0.0
+    amplitude = 1.0
+    norm = 0.0
+    for octave in range(octaves):
+        total += amplitude * value_noise3(x, y, z, seed + octave)
+        norm += amplitude
+        x, y, z = x * 2.03, y * 2.03, z * 2.03
+        amplitude *= 0.5
+    return total / norm
+
+
+def smoothstep(edge0: float, edge1: float, value: float) -> float:
+    t = (value - edge0) / (edge1 - edge0)
+    t = max(0.0, min(1.0, t))
+    return t * t * (3.0 - 2.0 * t)
+
+
+def mix(a, b, t: float):
+    return tuple(ca + (cb - ca) * t for ca, cb in zip(a, b))
+
+
+def ridge_elevation(dx: float, dz: float) -> float:
+    """Height of the mountain horizon in this compass direction, as a sine of elevation.
+
+    A function of the azimuth alone, deliberately. The ridge has to be one continuous
+    silhouette all the way round, and the only way to guarantee that across six
+    separately generated faces is for it to depend on nothing else.
+    """
+
+    length = math.hypot(dx, dz)
+    if length < 1e-6:
+        return 0.0
+    ax, az = dx / length, dz / length
+    coarse = fbm3(ax * 2.6, 0.0, az * 2.6, 83, 3)
+    fine = fbm3(ax * 9.0, 0.0, az * 9.0, 91, 2)
+    return 0.045 + 0.115 * coarse + 0.030 * fine
+
+
+def sky_colour(dx: float, dy: float, dz: float) -> tuple[int, int, int]:
+    """What the environment looks like in one direction. The whole cubemap is this."""
+
+    sun = normalise(*SUN)
+    cos_sun = dx * sun[0] + dy * sun[1] + dz * sun[2]
+
+    ridge = ridge_elevation(dx, dz)
+
+    # The sky itself: a gradient from a pale horizon to a deep zenith. The exponent
+    # compresses the pale band toward the horizon, which is what real aerial
+    # perspective does and what stops the gradient looking like a linear ramp.
+    sky = mix(HORIZON_SKY, ZENITH, max(dy, 0.0) ** 0.55)
+
+    # The sun: a small hard disc inside a broad halo. Two powers of the cosine, one
+    # tight and one wide, because a single one gives either a dot with no glow or a
+    # smear with no sun.
+    if cos_sun > 0.0:
+        halo = 0.85 * cos_sun ** 900 + 0.30 * cos_sun ** 48
+        sky = mix(sky, SUN_DISC, min(1.0, halo))
+        if cos_sun > math.cos(math.radians(1.4)):
+            sky = SUN_DISC
+
+    # Clouds, on a plane above the viewer. The noise is sampled where the view
+    # direction crosses that plane, so they crowd together and flatten toward the
+    # horizon the way clouds actually do, instead of tiling like wallpaper.
+    if dy > 0.0:
+        height = max(dy, 0.06)
+        density = fbm3(dx / height * 1.1, 0.0, dz / height * 1.1, 61, 3)
+        coverage = smoothstep(0.50, 0.76, density) * smoothstep(0.02, 0.20, dy)
+        if coverage > 0.0:
+            cloud = mix(CLOUD_BASE, CLOUD_LIT, smoothstep(0.52, 0.85, density))
+            sky = mix(sky, cloud, coverage)
+
+    # The mountains, and the ground below them. Both are blended in over a narrow band
+    # rather than switched on at a threshold: a hard comparison against the ridge line
+    # would give a staircase silhouette that no amount of mip filtering removes.
+    mountain_mix = smoothstep(ridge + 0.004, ridge - 0.004, dy)
+    if mountain_mix > 0.0:
+        depth = smoothstep(ridge, ridge - 0.26, dy)
+        rock = mix(MOUNTAIN_HIGH, MOUNTAIN_LOW, depth)
+        # Haze: the ridge line sits behind a lot of air, so it washes toward the colour
+        # of the sky beside it and only the nearer, lower slopes keep their own colour.
+        rock = mix(HORIZON_SKY, rock, 0.45 + 0.55 * depth)
+
+        # The ground, on a plane below the viewer, sampled exactly the way the clouds
+        # are sampled on a plane above it. Faint on purpose: the scene has a floor of
+        # its own, and this is only what a mirrored surface sees underneath itself.
+        drop = max(-dy, 0.04)
+        patch = fbm3(dx / drop * 0.9, 0.0, dz / drop * 0.9, 29, 3)
+        ground = mix(GROUND, mix(GROUND, HORIZON_SKY, 0.20), patch)
+        rock = mix(rock, ground, smoothstep(-0.22, -0.52, dy))
+        sky = mix(sky, rock, mountain_mix)
+
+    return tuple(max(0, min(255, int(channel))) for channel in sky)
+
+
+def sky_face(face: int) -> bytearray:
+    pixels = bytearray(SKY_SIZE * SKY_SIZE * 4)
+    for y in range(SKY_SIZE):
+        v = 2.0 * (y + 0.5) / SKY_SIZE - 1.0
+        for x in range(SKY_SIZE):
+            u = 2.0 * (x + 0.5) / SKY_SIZE - 1.0
+            r, g, b = sky_colour(*face_direction(face, u, v))
+            offset = (y * SKY_SIZE + x) * 4
+            pixels[offset : offset + 4] = bytes((r, g, b, 255))
+    return pixels
+
+
 def main() -> int:
+    for index, face in enumerate(CUBE_FACES):
+        target = OUT_DIR / f"lvk_sky_{face}.png"
+        write_png(target, SKY_SIZE, SKY_SIZE, sky_face(index))
+        print(f"wrote {target.relative_to(ROOT)} ({target.stat().st_size} bytes)")
+
     for name, pixels in (
         ("lvk_grid.png", grid_texture()),
         ("lvk_crate_diffuse.png", crate_diffuse()),

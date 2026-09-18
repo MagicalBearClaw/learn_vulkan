@@ -1,0 +1,394 @@
+---
+title: "Cubemaps"
+description: One image with six faces, addressed by a direction instead of a texture coordinate. First as a sky, then as a render target the scene is drawn into six times a frame.
+sidebar:
+  order: 4
+---
+
+<figure>
+  <img src="/img/reference/4.4.cubemaps.png" alt="A mirrored sphere standing on a tiled floor between two wooden crates, reflecting the sky above, the crates and ferns around it, and the floor below" />
+  <figcaption>Chapter 4.4. The sky is a cubemap loaded from six files. The sphere is
+  reflecting a second cubemap, which did not exist when the frame began — the scene was
+  drawn into it six times, one face per axis, a few microseconds earlier.</figcaption>
+</figure>
+
+Every texture so far has been addressed by a pair of numbers. A cubemap is addressed by a
+*direction*: you hand the sampler an arbitrary `float3`, it works out which of six square
+faces that vector points at and where on that face it lands, and returns a colour. There
+is no `uv` anywhere in either shader in this chapter.
+
+That one change is what makes two apparently unrelated things the same thing. A sky is a
+lookup by view direction. A mirror is a lookup by reflected direction. They differ only in
+which vector is handed over.
+
+- <kbd>1</kbd> reflect, refract, or a Fresnel mix of the two
+- <kbd>2</kbd> where the sphere's environment comes from
+- <kbd>3</kbd> what the sphere is made of, when it is refracting
+
+## Six faces are six array layers
+
+There is no `VkCubemapImage`, in the same way that 4.3 found there was no render target
+type. A cubemap is an ordinary 2D image with two things asked of it at creation:
+
+```cpp
+const VkImageCreateInfo image_info{
+    .flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT,
+    .imageType = VK_IMAGE_TYPE_2D,
+    .format = format,
+    .extent = {size, size, 1},
+    .mipLevels = 1,
+    .arrayLayers = 6,
+    ...
+};
+```
+
+`arrayLayers = 6` stacks six images inside one. `CUBE_COMPATIBLE` is what permits a view
+to call that stack a cube, and it must be asked for here — a view cannot add it later.
+
+Note what is *not* special. The image type is still `2D`: a cubemap is not a 3D image, it
+is six 2D images plus a rule for choosing between them. The faces must be square and all
+the same size, and the layer order is fixed by the specification rather than chosen by
+you:
+
+| Layer | Face | Points toward |
+|---|---|---|
+| 0 | `+X` | right |
+| 1 | `-X` | left |
+| 2 | `+Y` | up |
+| 3 | `-Y` | down |
+| 4 | `+Z` | forward |
+| 5 | `-Z` | back |
+
+Everything in this chapter that could be got wrong is a consequence of that table.
+
+## Seven views onto one image
+
+The live cubemap is written as six separate rendering passes and read as one texture, and
+those two uses want different views of the same memory:
+
+```cpp
+// For sampling: all six layers, type CUBE.
+.viewType = VK_IMAGE_VIEW_TYPE_CUBE,
+.subresourceRange = {.baseArrayLayer = 0, .layerCount = 6, ...},
+
+// For rendering: one layer each, type 2D.
+.viewType = VK_IMAGE_VIEW_TYPE_2D,
+.subresourceRange = {.baseArrayLayer = face, .layerCount = 1, ...},
+```
+
+A rendering pass attaches a single 2D image. It has no concept of a cube and needs none.
+"Render to a cubemap" is six views onto six layers of one image, and nothing else.
+
+:::note[The descriptor set layout does not change]
+The sky, the live cubemap, the crates and the floor are all bound through the *same*
+`VkDescriptorSetLayout`: one `COMBINED_IMAGE_SAMPLER`, visible to the fragment shader. A
+set layout says nothing whatever about 2D versus cube.
+
+The dimensionality lives in two other places — the view the descriptor was written with,
+and the type the shader declares (`SamplerCube` rather than `Sampler2D`). The layout
+cannot tell them apart and does not need to, which is why this chapter adds no descriptor
+plumbing at all.
+:::
+
+## Uploading six files
+
+The six faces go up through one staging buffer, with one copy region each:
+
+```cpp
+regions[face] = VkBufferImageCopy{
+    .bufferOffset = face_bytes * face,
+    .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, face, 1},
+    .imageExtent = {size, size, 1},
+};
+```
+
+`baseArrayLayer` — the third field of `imageSubresource` — is the only thing that differs
+between the six, and it is how each block of the staging buffer finds its face.
+
+The barriers around the copy are 4.3's `vkc::image_barrier`, unchanged, and they work here
+for a reason worth noticing: their subresource range says `VK_REMAINING_ARRAY_LAYERS`. A
+barrier that named layer 0 alone would move one face to `TRANSFER_DST_OPTIMAL` and leave
+the other five in `UNDEFINED`, and copying into those five would be undefined behaviour
+that happens to work.
+
+## A cubemap is addressed by a direction
+
+The skybox is a unit cube drawn around the camera. Its vertex shader needs no texture
+coordinate because the vertex position already is one:
+
+```slang
+output.direction = input.position;
+```
+
+A vertex of a unit cube centred on the origin *is* the direction from the centre out to
+that vertex. Interpolating it across a triangle gives every fragment the direction it
+looks along, and that is the whole texture coordinate.
+
+Three other things in that shader are specific to drawing a sky.
+
+```slang
+float4 clip = mul(globals.projection,
+                  mul(globals.view_rotation, float4(input.position, 1.0)));
+output.position = clip.xyww;
+```
+
+`view_rotation` is the camera's view matrix with the translation dropped — built on the
+CPU as `glm::mat4(glm::mat3(view))`. The box therefore turns when you turn your head and
+never moves when you walk, which is what makes it read as infinitely far away instead of
+as a room you are standing in. Leave the translation in and you can walk out through the
+wall.
+
+`clip.xyww` forces `z = w`, so after the perspective divide the depth is exactly 1.0: the
+furthest value the buffer can hold. Against a depth buffer cleared to 1.0 a `LESS` test
+would then reject every single sky fragment, so the pipeline tests `LESS_OR_EQUAL`. That
+in turn is what makes it cheap to draw the sky *last*: every pixel the scene already
+covered fails the depth test before the fragment shader runs.
+
+And the sky is culled `FRONT` rather than `BACK`, because the camera is inside the box.
+The cube's triangles wind counter-clockwise seen from outside, so from the inside they are
+back faces, and the usual setting would cull the entire sky away.
+
+## Rendering into the faces
+
+This is 4.3 done six times. Between a barrier into `COLOR_ATTACHMENT_OPTIMAL` and a
+barrier back out to `SHADER_READ_ONLY_OPTIMAL`, the sample opens six rendering passes,
+each attached to one face view, each with a camera at the centre of the sphere looking
+along one axis.
+
+Two details decide whether that produces an environment map or an expensive mess.
+
+### The six cameras
+
+```cpp
+constexpr std::array<CubeFace, 6> kCubeFaces{{
+    {{1.0F, 0.0F, 0.0F}, {0.0F, -1.0F, 0.0F}, "+X"},
+    {{-1.0F, 0.0F, 0.0F}, {0.0F, -1.0F, 0.0F}, "-X"},
+    {{0.0F, 1.0F, 0.0F}, {0.0F, 0.0F, 1.0F}, "+Y"},
+    {{0.0F, -1.0F, 0.0F}, {0.0F, 0.0F, -1.0F}, "-Y"},
+    {{0.0F, 0.0F, 1.0F}, {0.0F, -1.0F, 0.0F}, "+Z"},
+    {{0.0F, 0.0F, -1.0F}, {0.0F, -1.0F, 0.0F}, "-Z"},
+}};
+```
+
+The up vectors look wrong and are not. A face stores its rows top to bottom, and "down the
+face" is the direction that face's own v axis points — which for the four side faces is
+world `-Y`. The camera's up is therefore `-Y` too, and the two faces that look along Y
+have to break the tie with Z instead.
+
+### The projection has no Y-flip
+
+Every other projection in this series ends with the same line, first written in chapter
+1.14:
+
+```cpp
+projection[1][1] *= -1.0F;  // Vulkan's clip-space y points down.
+```
+
+The face projection deliberately omits it:
+
+```cpp
+[[nodiscard]] static glm::mat4 face_projection() {
+    return glm::perspective(glm::radians(90.0F), 1.0F, 0.1F, 100.0F);
+}
+```
+
+That flip exists because Vulkan's clip space has `+y` pointing down the screen while
+everyone writing a scene wants `+y` to be up. A window is looked at, so it gets the flip.
+A cube face is never looked at — it is sampled by direction, and the convention it is
+sampled with stores each face with its v axis running downward, which is exactly what
+unflipped Vulkan clip space already produces. Add the flip here and all six faces are
+stored upside down, and the sphere reflects an upside-down world convincingly enough to be
+missed.
+
+The 90° field of view and the square aspect are forced: six frusta have to tile the sphere
+of directions exactly, with no gap and no overlap.
+
+:::caution[Cube faces are left-handed, so the winding flips]
+A cubemap is specified in a left-handed coordinate system. A face is therefore stored
+*mirrored* compared with what an ordinary camera would record — which is the same fact as
+the missing Y-flip above, seen from the other side. A mirror reverses the apparent winding
+of every triangle it shows, so geometry that is counter-clockwise on screen is clockwise
+in a face.
+
+Nothing about the meshes, the shaders or the vertex order changes. The only thing that
+changes is the sentence the pipeline uses to say which side is the front, which is why the
+sample builds the scene and sky pipelines twice — `VK_FRONT_FACE_COUNTER_CLOCKWISE` for
+the screen and `VK_FRONT_FACE_CLOCKWISE` for a face.
+
+The symptom of forgetting is very specific, and it is worth recognising because it does
+not look like a winding problem:
+
+<figure>
+  <img src="/img/4.4/wrong-winding.png" alt="The sphere showing only a thin band of tiny crates and ferns against flat dark blue, with no sky and no floor in the reflection" />
+  <figcaption>The same frame with the face pipelines left counter-clockwise. The ferns
+  survive in the reflection because they are drawn with culling off; the floor and the
+  inside of the skybox — both single-sided — are gone, leaving the clear colour.</figcaption>
+</figure>
+:::
+
+### One depth buffer, six passes
+
+The six faces are six different layers, so there is no hazard between them on the colour
+attachment. They share one depth buffer, though, and that does need saying explicitly:
+
+```cpp
+vkc::image_barrier(frame.cmd, face_depth_.handle(),
+                   VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                   VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                   VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                   VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                   VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT,
+                   VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                   VK_IMAGE_ASPECT_DEPTH_BIT);
+```
+
+This face's depth clear must not begin before the previous face's depth writes have
+finished. Nothing in dynamic rendering implies that: two rendering passes in a row are not
+ordered against each other merely for being in the same command buffer. Note that the
+layout is the same on both sides — a barrier is not only for changing layouts, and this
+one changes nothing but the ordering.
+
+Six depth buffers would avoid it and cost six times the memory for something that is never
+used by two passes at once.
+
+## Checking the face convention
+
+Everything above is a convention that can be got wrong in about a dozen ways, most of
+which look *nearly* right. So the sample carries its own test, on <kbd>2</kbd>: render the
+static sky, and nothing else, into the live cubemap, then have the sphere reflect that
+instead of the original.
+
+If every face camera agrees with the convention Vulkan samples with, the round trip is the
+identity. Each destination texel samples the source at exactly its own texel centre, and
+the two frames should be not merely similar but *identical*.
+
+They are. Comparing the two captures pixel by pixel:
+
+```text
+1280x720 = 921600 px
+any difference : 0 (0.00%)
+worst channel  : 0
+```
+
+Zero pixels differ, and the worst channel difference is zero. A mis-ordered, rotated or
+mirrored face would scramble the round trip and show up here immediately.
+
+That verifies the rendering side against the sampling side. The *generating* side —
+`tools/make_textures.py`, which drew the six PNGs — was checked separately and
+independently: the sun sits at direction `(0.45, 1.0, 0.38)`, which predicts that it lands
+on the `+Y` face at pixel `(371, 353)`, and that is where it is. The unbroken horizon in
+every frame above is the same check made visually, since a face-order mistake steps or
+mirrors the ridge line at a face edge.
+
+## Reflection and refraction
+
+With the environment in hand, the sphere is a few lines:
+
+```slang
+float3 incident = normalize(input.world_position - globals.view_position.xyz);
+float3 reflected = environment.Sample(reflect(incident, normal)).rgb;
+```
+
+The incident vector points *from the eye toward the surface*, because that is how
+`reflect` and `refract` are both defined. Getting it backwards is the classic
+environment-mapping bug: the reflection still slides around as you move, so it looks
+plausible, and it is mirrored.
+
+`refract` takes the ratio of the two indices of refraction — the medium the light is
+leaving over the one it is entering, so air into glass is `1.00 / 1.52`. It returns the
+zero vector past the critical angle, where light cannot leave at all; those fragments fall
+back to the reflection, which is also the physically correct answer, because total
+internal reflection is what actually happens there.
+
+<figure>
+  <img src="/img/4.4/refract-vs-fresnel.png" alt="Two crops of the sphere side by side: the left is uniformly glassy with the floor visible through it, the right is the same but with a bright reflective rim" />
+  <figcaption>Left: pure refraction. Right: the Fresnel mix. The difference is almost
+  entirely at the rim.</figcaption>
+</figure>
+
+Mixing the two by Schlick's approximation is what makes glass look like glass: a surface
+seen face-on is mostly transparent, and the same surface seen edge-on is mostly a mirror.
+It is why a pond at your feet shows the gravel and the same pond across the park shows the
+sky. The effect is easy to underrate from a description, and easy to measure: switching
+from pure refraction to the Fresnel mix changes **5.74%** of the frame, of which only
+**1.43%** changes by more than 8/255. The sphere covers about 7% of the frame, so nearly
+all of it moves a little and the rim moves a lot — worst channel difference 122.
+
+## What the live cubemap buys and what it costs
+
+Key <kbd>2</kbd> also switches between the six loaded PNGs and the live cubemap. The
+difference is the whole argument for rendering one:
+
+<figure>
+  <img src="/img/4.4/static-sky.png" alt="The sphere reflecting only sky and a plain grey ground, with no crates or ferns visible in the reflection" />
+  <figcaption>The sphere reflecting the static sky. The crates and the ferns standing a
+  metre away are simply not in the image being sampled, so the reflection cannot show
+  them.</figcaption>
+</figure>
+
+Measured against the live capture at the top of this chapter, **3.30%** of the frame
+differs, and almost all of it — 3.24% — differs by more than 8/255, with a worst channel
+difference of 222. That is confined to the sphere, and it is the room appearing in it.
+
+The cost is arithmetic. The scene is drawn seven times per frame instead of once: six
+faces at 512×512 is 1,572,864 extra pixels of rasterisation, against 921,600 for a
+720p window. It is also why the faces are 512 rather than 2048, and why real engines update
+such maps every few frames, at lower resolutions, or only for objects near the camera.
+
+Two limits are worth being explicit about, because they are properties of the technique and
+not of this implementation:
+
+- **The map is correct for exactly one point.** It was rendered from the centre of the
+  sphere, so the reflection is right there and progressively wrong everywhere else on the
+  surface. A second reflective object standing elsewhere needs its own cubemap.
+- **Reflections cannot recurse.** The sphere is not drawn into its own faces — it would
+  fill all six with the inside of itself — so it never appears in its own reflection, and
+  a second mirror would not show this one reflecting it.
+
+:::note[What moved into vkcommon]
+`vkc::ImageDesc` gains `array_layers` and `cube`, so `vkc::Image` can now build the
+six-layer, `CUBE_COMPATIBLE` image with a `VK_IMAGE_VIEW_TYPE_CUBE` view that this chapter
+wrote out by hand. `Image::transition` follows: it now covers every layer instead of
+assuming one.
+
+`vkc::load_cubemap()` takes six paths in face order and returns a finished cubemap.
+
+The sample keeps its own hand-written copies of both, because they are the chapter. The
+six *face* views stay hand-written everywhere — nothing before Part 6 needs them again.
+:::
+
+## What changed since 4.3
+
+- one image with `arrayLayers = 6` and `VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT`, and seven
+  views onto it
+- a `SamplerCube` sampled by direction, through the same descriptor set layout as every
+  2D texture in the sample
+- a skybox: `xyww`, `LESS_OR_EQUAL`, no depth writes, front-face culling, drawn last
+- six rendering passes into six layers, sharing one depth buffer and one barrier between
+  each pair
+- the one projection in this series with no Y-flip, and the front-face reversal that goes
+  with it
+- reflection, refraction and a Fresnel mix of the two
+- 29 chapters in the build now
+
+## Exercises
+
+1. Put the Y-flip back into `face_projection()` and predict, before running it, which way
+   the reflection turns and whether the skybox on screen is affected at all. Then check.
+2. Delete the depth barrier between the six face passes and run with synchronization
+   validation on. Work out which two passes it names and why the picture is unharmed.
+3. Give the live cubemap `VK_IMAGE_VIEW_TYPE_2D_ARRAY` for its sampling view instead of
+   `CUBE`, and change the shader to `Sampler2DArray`. You now have to write the face
+   selection yourself. Doing it is the best possible explanation of what the hardware was
+   doing for you.
+4. Move the sphere off the origin without moving the face cameras, and describe exactly
+   how the reflection is wrong. Then fix it, and say why a *second* sphere still cannot
+   share the map.
+5. Drop `kFaceSize` to 64 and then raise it to 2048. Find the point at which you stop being
+   able to tell, and consider what that says about the resolution the sky needs.
+6. Draw the sphere into its own cubemap and describe what the faces now contain. The
+   result is not subtle, and understanding why is the point.
+
+Next: 4.5 stops passing data to shaders through descriptors and starts handing them a raw
+64-bit address instead. The cubemap stays; how the shader is told where things live is what
+changes.

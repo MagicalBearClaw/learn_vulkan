@@ -110,7 +110,7 @@ cd site && npx astro build < /dev/null
   output that a distro's version bump can invalidate, so the library set has to be
   pinned. A missing library is a vcpkg error, not something CMake works around.
 - **Two presets on each platform.** `linux-debug` / `linux-release` and
-  `x64-debug` / `x64-release`. All of them build **all 28 chapters**, Part 3 included.
+  `x64-debug` / `x64-release`. All of them build **all 29 chapters**, Part 3 included.
   Verified by building every chapter warning-free and running `tools/capture.py --all`
   against the build tree: every chapter renders 0.00% different.
 - **Part 3 is no longer gated.** Assimp was once optional, because it is large and slow
@@ -122,10 +122,10 @@ cd site && npx astro build < /dev/null
 - **Assimp exports stb_image's symbols.** Its static library defines all 43 `stbi_*`
   names, so a second global definition anywhere in this project makes every Part 3
   target fail to link with `multiple definition of stbi_load`. `stb_impl.cpp` therefore
-  holds only `STB_IMAGE_WRITE_IMPLEMENTATION`; the two TUs that read images -- vkcommon's
-  `image.cpp` and chapter 1.11 -- compile their own copy with `STB_IMAGE_STATIC`. stb is
-  an `-isystem` include, so those TUs stay warning-free. Do not put a global
-  `STB_IMAGE_IMPLEMENTATION` back.
+  holds only `STB_IMAGE_WRITE_IMPLEMENTATION`; the three TUs that read images --
+  vkcommon's `image.cpp`, chapter 1.11 and chapter 4.4 -- compile their own copy with
+  `STB_IMAGE_STATIC`. stb is an `-isystem` include, so those TUs stay warning-free. Do
+  not put a global `STB_IMAGE_IMPLEMENTATION` back.
 - The repository path contains spaces. This was long recorded here as breaking vcpkg,
   and it does not, for this dependency set: the build tree and `vcpkg_installed` both
   live under the spaced path and install fine. The one autotools port that ever

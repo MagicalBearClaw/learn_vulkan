@@ -32,12 +32,14 @@ Image::Image(Context& context, const ImageDesc& desc)
     const VkImageCreateInfo image_info{
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .pNext = nullptr,
-        .flags = 0,
+        .flags = desc_.cube ? static_cast<VkImageCreateFlags>(
+                                  VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT)
+                            : 0U,
         .imageType = VK_IMAGE_TYPE_2D,
         .format = desc_.format,
         .extent = {desc_.extent.width, desc_.extent.height, 1},
         .mipLevels = desc_.mip_levels,
-        .arrayLayers = 1,
+        .arrayLayers = desc_.array_layers,
         .samples = VK_SAMPLE_COUNT_1_BIT,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
         .usage = desc_.usage,
@@ -66,7 +68,7 @@ Image::Image(Context& context, const ImageDesc& desc)
         .pNext = nullptr,
         .flags = 0,
         .image = image_,
-        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .viewType = desc_.cube ? VK_IMAGE_VIEW_TYPE_CUBE : VK_IMAGE_VIEW_TYPE_2D,
         .format = desc_.format,
         .components = {},
         .subresourceRange =
@@ -75,7 +77,7 @@ Image::Image(Context& context, const ImageDesc& desc)
                 .baseMipLevel = 0,
                 .levelCount = desc_.mip_levels,
                 .baseArrayLayer = 0,
-                .layerCount = 1,
+                .layerCount = desc_.array_layers,
             },
     };
     VK_CHECK(vkCreateImageView(device_, &view_info, nullptr, &view_));
@@ -136,7 +138,10 @@ void Image::transition(VkCommandBuffer cmd, VkImageLayout from, VkImageLayout to
                 .baseMipLevel = base_mip,
                 .levelCount = mip_count,
                 .baseArrayLayer = 0,
-                .layerCount = 1,
+                // Every layer. A cubemap transitioned one face at a time would leave
+                // the other five in whatever layout they were in, and the mismatch is
+                // undefined behaviour rather than a validation error on most paths.
+                .layerCount = desc_.array_layers,
             },
     };
 
@@ -265,6 +270,100 @@ Image load_texture(Context& context, const std::filesystem::path& path,
     return create_texture(context, pixels.get(),
                           {static_cast<uint32_t>(width), static_cast<uint32_t>(height)},
                           format);
+}
+
+Image load_cubemap(Context& context, const std::array<std::filesystem::path, 6>& faces,
+                   VkFormat format) {
+    // Decode all six first, so that a missing or mis-sized file is discovered before any
+    // GPU memory is committed to it.
+    std::array<std::unique_ptr<stbi_uc, void (*)(void*)>, 6> pixels{
+        {{nullptr, stbi_image_free},
+         {nullptr, stbi_image_free},
+         {nullptr, stbi_image_free},
+         {nullptr, stbi_image_free},
+         {nullptr, stbi_image_free},
+         {nullptr, stbi_image_free}}};
+    int size = 0;
+
+    for (size_t face = 0; face < faces.size(); ++face) {
+        int width = 0;
+        int height = 0;
+        int channels = 0;
+        pixels[face] = {stbi_load(faces[face].string().c_str(), &width, &height,
+                                  &channels, STBI_rgb_alpha),
+                        stbi_image_free};
+        if (pixels[face] == nullptr) {
+            throw std::runtime_error(
+                std::format("Could not load cubemap face '{}': {}",
+                            faces[face].string(), stbi_failure_reason()));
+        }
+        if (width != height) {
+            throw std::runtime_error(std::format(
+                "Cubemap face '{}' is {}x{}; every face must be square.",
+                faces[face].string(), width, height));
+        }
+        if (face == 0) {
+            size = width;
+        } else if (width != size) {
+            throw std::runtime_error(std::format(
+                "Cubemap face '{}' is {}x{}, but the first face is {}x{}; all six must "
+                "match.",
+                faces[face].string(), width, height, size, size));
+        }
+    }
+
+    const auto extent_side = static_cast<uint32_t>(size);
+    Image image(context, ImageDesc{
+                             .format = format,
+                             .extent = {extent_side, extent_side},
+                             .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                      VK_IMAGE_USAGE_SAMPLED_BIT,
+                             .mip_levels = 1,
+                             .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
+                             .array_layers = 6,
+                             .cube = true,
+                         });
+
+    const VkDeviceSize face_bytes =
+        static_cast<VkDeviceSize>(extent_side) * extent_side * 4;
+
+    // One staging buffer holding the six faces back to back: one allocation and one
+    // submit rather than six of each.
+    Buffer staging(context.allocator(), face_bytes * 6, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                   VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                       VMA_ALLOCATION_CREATE_MAPPED_BIT);
+    for (size_t face = 0; face < faces.size(); ++face) {
+        std::memcpy(static_cast<std::byte*>(staging.mapped()) +
+                        static_cast<size_t>(face_bytes) * face,
+                    pixels[face].get(), static_cast<size_t>(face_bytes));
+    }
+
+    immediate_submit(context, [&](VkCommandBuffer cmd) {
+        image.transition(cmd, VK_IMAGE_LAYOUT_UNDEFINED,
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+        // One region per face. baseArrayLayer is the only field that differs between
+        // them, and it is how the six blocks of the staging buffer find their faces.
+        std::array<VkBufferImageCopy, 6> regions{};
+        for (uint32_t face = 0; face < 6; ++face) {
+            regions[face] = VkBufferImageCopy{
+                .bufferOffset = face_bytes * face,
+                .bufferRowLength = 0,
+                .bufferImageHeight = 0,
+                .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, face, 1},
+                .imageOffset = {0, 0, 0},
+                .imageExtent = {extent_side, extent_side, 1},
+            };
+        }
+        vkCmdCopyBufferToImage(cmd, staging.handle(), image.handle(),
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                               static_cast<uint32_t>(regions.size()), regions.data());
+
+        image.transition(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    });
+
+    return image;
 }
 
 VkFormat choose_depth_format(VkPhysicalDevice physical_device) {
