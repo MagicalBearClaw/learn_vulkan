@@ -39,3 +39,4 @@ endif()
 # Part 4 goes back to the pipeline itself and needs no models, so it sits outside the
 # Assimp gate above and builds in every configuration.
 add_subdirectory(4.advanced_vulkan/depth_and_stencil)
+add_subdirectory(4.advanced_vulkan/blending_and_culling)

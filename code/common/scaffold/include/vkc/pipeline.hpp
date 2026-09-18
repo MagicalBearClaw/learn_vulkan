@@ -87,6 +87,12 @@ public:
     // output simply replaces whatever was in the attachment.
     PipelineBuilder& alpha_blending(bool enabled);
 
+    // The whole blend attachment state, for chapters that need a mode alpha_blending()
+    // does not cover -- additive, premultiplied, a write mask that drops a channel.
+    // Chapter 4.2 writes the struct out in full and explains every field; setting this
+    // overrides alpha_blending().
+    PipelineBuilder& colour_blend(const VkPipelineColorBlendAttachmentState& state);
+
     // Bakes constant values into the fragment shader at pipeline-creation time.
     // Chapter 1.9 builds the entries and the data block; this only carries them
     // through to VkPipelineShaderStageCreateInfo::pSpecializationInfo.
@@ -129,6 +135,8 @@ private:
     VkStencilOpState stencil_back_{};
 
     bool blending_ = false;
+    bool custom_blend_ = false;
+    VkPipelineColorBlendAttachmentState blend_state_{};
 
     std::vector<VkSpecializationMapEntry> specialisation_entries_;
     std::vector<std::byte> specialisation_data_;

@@ -309,6 +309,11 @@ void Context::create_device() {
     features13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
     features13.synchronization2 = VK_TRUE;
     features13.dynamicRendering = VK_TRUE;
+    // `discard` in Slang compiles to OpDemoteToHelperInvocation rather than the older
+    // OpKill, and that SPIR-V capability has to be asked for by name. Without it
+    // vkCreateShaderModule rejects the module -- which is how chapter 4.2 found out it
+    // was needed, since nothing in the series discards a fragment before then.
+    features13.shaderDemoteToHelperInvocation = VK_TRUE;
 
     VkPhysicalDeviceVulkan12Features features12{};
     features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;

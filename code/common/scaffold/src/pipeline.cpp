@@ -266,6 +266,13 @@ PipelineBuilder& PipelineBuilder::alpha_blending(bool enabled) {
     return *this;
 }
 
+PipelineBuilder& PipelineBuilder::colour_blend(
+    const VkPipelineColorBlendAttachmentState& state) {
+    blend_state_ = state;
+    custom_blend_ = true;
+    return *this;
+}
+
 PipelineBuilder& PipelineBuilder::fragment_specialisation(
     std::span<const VkSpecializationMapEntry> entries,
     std::span<const std::byte> data) {
@@ -399,17 +406,27 @@ VkPipeline PipelineBuilder::build() const {
         .maxDepthBounds = 1.0F,
     };
 
-    const VkPipelineColorBlendAttachmentState blend_attachment{
-        .blendEnable = blending_ ? VK_TRUE : VK_FALSE,
-        .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA,
-        .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
-        .colorBlendOp = VK_BLEND_OP_ADD,
-        .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
-        .dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
-        .alphaBlendOp = VK_BLEND_OP_ADD,
-        .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                          VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
-    };
+    // alpha_blending() picks between these two; colour_blend() replaces the choice with
+    // a struct the chapter filled in itself. Chapter 4.2 explains what every field here
+    // does and why source-over is the arrangement almost everything uses.
+    const VkPipelineColorBlendAttachmentState blend_attachment =
+        custom_blend_ ? blend_state_
+                      : VkPipelineColorBlendAttachmentState{
+                            .blendEnable = blending_ ? VK_TRUE : VK_FALSE,
+                            .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA,
+                            .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+                            .colorBlendOp = VK_BLEND_OP_ADD,
+                            // Keep the attachment's own alpha rather than storing the
+                            // fragment's. Chapter 4.2 explains what goes wrong the other
+                            // way round: the rendered image itself ends up transparent
+                            // wherever a blended fragment happened to be.
+                            .srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
+                            .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+                            .alphaBlendOp = VK_BLEND_OP_ADD,
+                            .colorWriteMask =
+                                VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+                        };
 
     const VkPipelineColorBlendStateCreateInfo blend{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,

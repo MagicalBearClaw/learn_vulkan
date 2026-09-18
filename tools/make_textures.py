@@ -18,10 +18,21 @@ The crate pair is for chapter 2.4, lighting maps. It is two textures that descri
 surface: a diffuse map (what colour it is) and a specular map (how shiny each part of it
 is). The design makes the specular map's job unmistakable -- a steel frame and rivets
 that should gleam, wooden planks between them that should not.
+
+The fern is for chapter 4.2, blending and culling. It is the first texture here whose
+alpha channel means anything, and two details in it are deliberate:
+
+  * the silhouette is intricate, with gaps between the leaflets, so that the difference
+    between discarding a fragment and blending it is visible rather than theoretical
+  * every fully transparent texel still carries a leaf-green rgb. A sampler filtering
+    across the silhouette's edge averages the colours of texels on both sides, and if
+    the outside were black the leaf would get a dark fringe that no amount of alpha
+    testing removes.
 """
 
 from __future__ import annotations
 
+import math
 import struct
 import zlib
 from pathlib import Path
@@ -212,11 +223,179 @@ def crate_specular() -> bytearray:
     return pixels
 
 
+# The fern: a stem with LEAFLET_PAIRS pairs of leaflets swept upward off it.
+LEAFLET_PAIRS = 11
+LEAF_BLEED = (58, 96, 44)  # rgb of every transparent texel; see the module docstring
+
+
+def stem_centre(h: float) -> float:
+    """Horizontal centre of the stem at height h, in 0..1. A slight lean, more at the top."""
+
+    return 0.5 + 0.055 * math.sin(h * 2.2) * h
+
+
+def leaflets() -> list[tuple[float, float, float, float, float, float, int]]:
+    """(ox, oy, ax, ay, length, width, index) for every leaflet, both sides."""
+
+    out = []
+    for i in range(LEAFLET_PAIRS):
+        base_h = 0.08 + i * 0.079
+        # Leaflets near the tip sweep up harder, which is what makes a fern read as a
+        # fern rather than as a feather duster.
+        angle = math.radians(44.0 - 24.0 * base_h)
+        length = 0.36 * (1.0 - base_h) ** 0.8 + 0.045
+        # Narrow enough that neighbouring leaflets do not touch. The gaps between them
+        # are the point: they are what makes a cutout silhouette intricate rather than
+        # a blob, and what makes the sorting artefacts in this chapter visible.
+        width = 0.030 * (1.0 - base_h) + 0.008
+        for side in (-1.0, 1.0):
+            ax = side * math.cos(angle)
+            ay = math.sin(angle)
+            out.append((stem_centre(base_h), base_h, ax, ay, length, width, i))
+    return out
+
+
+def leaf_hit(u: float, h: float, leaf) -> float | None:
+    """Distance along the leaflet if (u, h) is inside it, else None."""
+
+    ox, oy, ax, ay, length, width, _ = leaf
+    dx, dy = u - ox, h - oy
+    t = dx * ax + dy * ay
+    if t < 0.0 or t > length:
+        return None
+    n = -dx * ay + dy * ax
+    # Half-width tapers to nothing at both ends, fattest a third of the way along.
+    half = width * math.sin(math.pi * (t / length) ** 0.7)
+    return t if abs(n) <= half else None
+
+
+def foliage_texture() -> bytearray:
+    pixels = bytearray(SIZE * SIZE * 4)
+
+    leaves = leaflets()
+    # A generous circular bound per leaflet, so most pixels reject most leaflets with
+    # one comparison instead of the full frame transform.
+    bounds = [
+        (ox + 0.5 * length * ax, oy + 0.5 * length * ay, (0.5 * length + width) ** 2)
+        for ox, oy, ax, ay, length, width, _ in leaves
+    ]
+
+    stem_dark = (74, 88, 40)
+    stem_light = (108, 126, 58)
+    leaf_dark = (30, 74, 30)
+    leaf_light = (116, 168, 66)
+
+    # Half a texel, expressed in the 0..1 coordinates the shapes are defined in. Two
+    # subsamples per axis is enough to soften the silhouette without hiding the
+    # aliasing that alpha testing reintroduces -- which chapter 4.2 discusses.
+    step = 0.5 / SIZE
+
+    for y in range(SIZE):
+        h_centre = 1.0 - (y + 0.5) / SIZE
+        for x in range(SIZE):
+            u_centre = (x + 0.5) / SIZE
+
+            nearby = [
+                leaves[i]
+                for i, (bx, by, r2) in enumerate(bounds)
+                if (u_centre - bx) ** 2 + (h_centre - by) ** 2 <= r2
+            ]
+            stem_possible = 0.01 < h_centre < 0.97 and abs(
+                u_centre - stem_centre(h_centre)
+            ) < 0.03
+
+            covered = 0
+            r = g = b = 0
+            if nearby or stem_possible:
+                for sy in (-step, step):
+                    for sx in (-step, step):
+                        u, h = u_centre + sx, h_centre + sy
+
+                        hit = None
+                        for leaf in nearby:
+                            t = leaf_hit(u, h, leaf)
+                            if t is not None:
+                                hit = (t, leaf)
+                                break
+
+                        if hit is not None:
+                            t, leaf = hit
+                            length, index = leaf[4], leaf[6]
+                            # Greener at the base of each leaflet, paler at its tip, and
+                            # paler again toward the top of the plant.
+                            mix = 0.35 * (t / length) + 0.55 * (index / LEAFLET_PAIRS)
+                            mix = min(1.0, mix + 0.1 * hash_noise(x // 4, y // 4, 17))
+                            covered += 1
+                            r += int(leaf_dark[0] + (leaf_light[0] - leaf_dark[0]) * mix)
+                            g += int(leaf_dark[1] + (leaf_light[1] - leaf_dark[1]) * mix)
+                            b += int(leaf_dark[2] + (leaf_light[2] - leaf_dark[2]) * mix)
+                            continue
+
+                        half = 0.016 * (1.0 - 0.8 * h) + 0.002
+                        if 0.01 < h < 0.97 and abs(u - stem_centre(h)) <= half:
+                            # A lit edge down one side of the stem, so it reads as round.
+                            side = (u - stem_centre(h)) / half
+                            mix = max(0.0, min(1.0, 0.5 + 0.5 * side))
+                            covered += 1
+                            r += int(stem_dark[0] + (stem_light[0] - stem_dark[0]) * mix)
+                            g += int(stem_dark[1] + (stem_light[1] - stem_dark[1]) * mix)
+                            b += int(stem_dark[2] + (stem_light[2] - stem_dark[2]) * mix)
+
+            offset = (y * SIZE + x) * 4
+            if covered == 0:
+                pixels[offset : offset + 4] = bytes((*LEAF_BLEED, 0))
+            else:
+                alpha = (covered * 255) // 4
+                pixels[offset : offset + 4] = bytes(
+                    (r // covered, g // covered, b // covered, alpha)
+                )
+
+    return pixels
+
+
+def ground_texture() -> bytearray:
+    """A floor that keeps quiet.
+
+    The grid texture above is the opposite of this on purpose: it is loud because
+    chapter 1.11 needs every filtering artefact to be obvious. From Part 4 on, the floor
+    is scenery rather than subject, and a scene about transparent surfaces cannot afford
+    a ground plane that competes with them. Low contrast, no markers, nothing saturated.
+    """
+
+    pixels = bytearray(SIZE * SIZE * 4)
+
+    base = (104, 99, 92)
+    stone = 128  # one flagstone every 128 texels, so four across the texture
+    joint_width = 4
+
+    for y in range(SIZE):
+        for x in range(SIZE):
+            # Three scales of variation, none of them strong: a per-flagstone tint, a
+            # coarse mottle, and a fine grain. Together they stop the tiling from
+            # reading as one flat colour without drawing the eye to anything.
+            tint = 0.92 + 0.16 * hash_noise(x // stone, y // stone, 41)
+            mottle = 0.93 + 0.14 * hash_noise(x // 16, y // 16, 67)
+            grain = 0.94 + 0.12 * hash_noise(x // 2, y // 2, 53)
+            shade = tint * mottle * grain
+
+            if (x % stone) < joint_width or (y % stone) < joint_width:
+                shade *= 0.72
+
+            offset = (y * SIZE + x) * 4
+            pixels[offset : offset + 4] = bytes(
+                (*(min(255, int(c * shade)) for c in base), 255)
+            )
+
+    return pixels
+
+
 def main() -> int:
     for name, pixels in (
         ("lvk_grid.png", grid_texture()),
         ("lvk_crate_diffuse.png", crate_diffuse()),
         ("lvk_crate_specular.png", crate_specular()),
+        ("lvk_foliage.png", foliage_texture()),
+        ("lvk_ground.png", ground_texture()),
     ):
         target = OUT_DIR / name
         write_png(target, SIZE, SIZE, pixels)
