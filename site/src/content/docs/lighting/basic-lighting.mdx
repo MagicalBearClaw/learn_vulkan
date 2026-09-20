@@ -1,6 +1,6 @@
 ---
 title: Basic Lighting
-description: The Phong reflection model - ambient, diffuse and specular light - plus normals, the normal matrix, and a 3x3 matrix layout trap.
+description: The Phong reflection model - ambient, diffuse and specular - with Lambert's cosine law and the normal matrix derived from scratch, plus a 3x3 matrix layout trap.
 sidebar:
   order: 2
 ---
@@ -58,6 +58,35 @@ A corner of a cube belongs to three faces pointing three different ways. It need
 normals, a vertex is the whole bundle of attributes, so it needs three vertices. A mesh
 with hard edges always duplicates its vertices along them.
 
+Each face's four corners now carry the direction that face points:
+
+```cpp title="code/src/2.lighting/basic_lighting/main.cpp"
+constexpr float kH = 0.5F;
+constexpr std::array<Vertex, 24> kVertices{{
+    // front (+z)
+    {{-kH, -kH, kH}, {0, 0, 1}}, {{kH, -kH, kH}, {0, 0, 1}},
+    {{kH, kH, kH}, {0, 0, 1}},   {{-kH, kH, kH}, {0, 0, 1}},
+    // back (-z)
+    {{kH, -kH, -kH}, {0, 0, -1}}, {{-kH, -kH, -kH}, {0, 0, -1}},
+    {{-kH, kH, -kH}, {0, 0, -1}}, {{kH, kH, -kH}, {0, 0, -1}},
+    // left (-x)
+    {{-kH, -kH, -kH}, {-1, 0, 0}}, {{-kH, -kH, kH}, {-1, 0, 0}},
+    {{-kH, kH, kH}, {-1, 0, 0}},   {{-kH, kH, -kH}, {-1, 0, 0}},
+    // right (+x)
+    {{kH, -kH, kH}, {1, 0, 0}},  {{kH, -kH, -kH}, {1, 0, 0}},
+    {{kH, kH, -kH}, {1, 0, 0}},  {{kH, kH, kH}, {1, 0, 0}},
+    // top (+y)
+    {{-kH, kH, kH}, {0, 1, 0}},  {{kH, kH, kH}, {0, 1, 0}},
+    {{kH, kH, -kH}, {0, 1, 0}},  {{-kH, kH, -kH}, {0, 1, 0}},
+    // bottom (-y)
+    {{-kH, -kH, -kH}, {0, -1, 0}}, {{kH, -kH, -kH}, {0, -1, 0}},
+    {{kH, -kH, kH}, {0, -1, 0}},   {{-kH, -kH, kH}, {0, -1, 0}},
+}};
+```
+
+The normals are exact axis directions because a cube's faces are axis-aligned in model
+space. The indices are unchanged from 2.1 and 1.13, and so is the winding.
+
 On the Vulkan side this is one more `VkVertexInputAttributeDescription` at location 1, and
 one more field in the shader's input struct. Nothing new.
 
@@ -66,11 +95,21 @@ one more field in the shader's input struct. Nothing new.
 Before any lighting arithmetic: every vector in a dot product has to be in the same
 coordinate space, or the answer means nothing.
 
-This sample does its lighting in **world space**. The light's position is in world space
+A coordinate space is just a choice of origin and axes, and 1.13 already built three of
+them. **World space** is the shared space the whole scene lives in, after the model matrix
+and before the view matrix. **View space** is what the view matrix produces: the same
+scene expressed with the camera at the origin.
+
+This sample does its lighting in world space. The light's position is in world space
 already, the camera's position is in world space already, so the vertex stage hands the
 fragment stage a world-space position and a world-space normal:
 
 ```slang title="code/src/2.lighting/basic_lighting/lighting.slang"
+struct VSInput {
+    [[vk::location(0)]] float3 position;
+    [[vk::location(1)]] float3 normal;
+};
+
 struct VSOutput {
     float4 position : SV_Position;
     [[vk::location(0)]] float3 world_position;
@@ -82,17 +121,118 @@ View space is an equally valid choice — the camera sits at the origin there, w
 the eye vector trivial. What is not valid is mixing them, and a world-space light position
 against a view-space normal is one of the most common lighting bugs there is.
 
+The per-frame block gains the two positions the model needs:
+
+```slang title="code/src/2.lighting/basic_lighting/lighting.slang"
+struct Globals {
+    float4x4 view;
+    float4x4 projection;
+    float4 light_colour;
+    float4 light_position;  // xyz; w unused
+    float4 view_position;   // xyz; w unused
+};
+[[vk::binding(0, 0)]] ConstantBuffer<Globals> globals;
+```
+
+Both are `float4` rather than `float3`. A `float3` would work — std140 aligns it to 16
+bytes and the next member would land in the same place — but only by a rule you have to
+remember, and the unused `w` costs nothing.
+
 ## The normal matrix
 
-The position is transformed by the model matrix. The normal is **not**.
+The position is transformed by the model matrix. The normal is **not**. This is the one
+piece of real mathematics in the chapter, and it is worth deriving rather than quoting.
+
+### Why the model matrix is wrong
 
 Picture a surface tilted at 45° and stretch the object to twice its width. The surface
 flattens out — so its normal has to tilt *toward* vertical. Apply the stretch to the
 normal itself and it tilts the other way, becoming less vertical as the surface becomes
-more so. Positions and normals respond oppositely to a stretch.
+more so:
 
-The matrix that transforms normals correctly is the **inverse transpose** of the upper
-3×3 of the model matrix, and this sample computes it on the CPU:
+```
+   before:  surface at 45°          after a 2x stretch along x:
+
+      n                                  n_correct
+       ↖  ╱                                 ↑   ____
+        ╲╱                                  │ ╱        the surface flattened,
+        ╱                                   │╱         so its normal stands up
+
+                                       n_wrong = M·n
+                                            ↗  leans further over instead
+```
+
+Positions and normals respond **oppositely** to a stretch, so whatever matrix transforms
+normals, it is not `M`.
+
+### Deriving the right one
+
+The property that defines a normal is perpendicularity: `n` is perpendicular to every
+tangent `t` lying in the surface. Written as a dot product, which is the appendix's
+`a · b = |a||b|cos θ` at θ = 90°:
+
+```
+   n · t = 0        for every tangent t in the surface
+```
+
+After the transform, the tangent is a difference of two transformed positions, so it
+genuinely does transform by `M`: the new tangent is `M·t`. Call the unknown normal matrix
+`G`. We need the transformed normal to stay perpendicular to the transformed tangent:
+
+```
+   (G·n) · (M·t) = 0        for every tangent t
+```
+
+Write a dot product as a row times a column — `a · b = aᵀb` — and the left side becomes:
+
+```
+   (G·n)ᵀ (M·t)  =  nᵀ Gᵀ M t
+```
+
+We know `nᵀt = 0` and want `nᵀGᵀMt = 0` for *every* tangent `t`. The way to guarantee
+that is for `GᵀM` to be the identity, which leaves `nᵀt` unchanged:
+
+```
+   Gᵀ M = I        →        Gᵀ = M⁻¹        →        G = (M⁻¹)ᵀ
+```
+
+The **inverse transpose** of the model matrix's upper 3×3. That is the whole derivation,
+and it explains the shape of the answer: the inverse undoes what the stretch did, and the
+transpose puts the result back in the right orientation to multiply a normal.
+
+Only the upper 3×3 is used, because a normal is a direction and has no business being
+translated — the `w = 0` rule from 1.12 saying the same thing a different way.
+
+:::note[Checked, not assumed]
+Take a surface with two tangents, transform everything by `M`, and measure
+`(G·n) · (M·t)` — which should be zero if the derivation is right:
+
+| `M` | with `G = (M⁻¹)ᵀ` | with the naive `M·n` |
+|---|---|---|
+| non-uniform scale | 5.6 × 10⁻¹⁷ | 1.125 |
+| pure rotation | 4.8 × 10⁻¹⁶ | 0.000 |
+| rotate × scale | 1.1 × 10⁻¹⁶ | 0.626 |
+| scale × rotate | 6.2 × 10⁻¹⁵ | 3.226 |
+
+The inverse transpose is perpendicular to machine precision in every case. The naive
+version is perpendicular only for the pure rotation — which is the next point.
+:::
+
+### When it does not matter
+
+For a **pure rotation**, the inverse transpose *is* the rotation. Rotation matrices are
+orthonormal, which by the appendix's `R⁻¹ = Rᵀ` gives `(R⁻¹)ᵀ = (Rᵀ)ᵀ = R`. Inverting and
+transposing cancel exactly, and the check above confirms it.
+
+For a **uniform scale** by `s`, the inverse transpose is `(1/s)·I` — a different length
+but the same direction, and normals get renormalised anyway.
+
+So the normal matrix only differs from the model matrix when there is a **non-uniform**
+scale, and less often even then than you might expect; exercise 3 shows exactly when.
+
+### Computing it
+
+This sample computes it on the CPU:
 
 ```cpp title="code/src/2.lighting/basic_lighting/main.cpp"
 [[nodiscard]] std::array<glm::vec4, 3> normal_matrix_of(const glm::mat4& model) {
@@ -101,8 +241,13 @@ The matrix that transforms normals correctly is the **inverse transpose** of the
 }
 ```
 
+`glm::mat3(model)` takes the upper 3×3 by dropping the fourth row and column.
+`m[0]`, `m[1]`, `m[2]` are its three columns — glm indexes column first, as 1.12
+established — and each is widened to a `vec4`. Why three `vec4`s rather than a `glm::mat3`
+is the trap below.
+
 It is computed once per object rather than once per vertex, which would be the right call
-anyway. But there is a second reason, which is worth knowing if you are coming from GLSL:
+anyway. But there is a second reason, worth knowing if you are coming from GLSL:
 
 :::caution[Slang has no `inverse()`]
 GLSL has a built-in `inverse()`, and a lot of tutorial code computes the normal matrix in
@@ -111,73 +256,142 @@ the vertex shader with it. Slang does not — try it and you get
 matrices in a shader has to move that work to the CPU, which is where it belonged.
 :::
 
-For a pure rotation, the inverse transpose *is* the rotation — rotations are orthogonal,
-so inverting and transposing cancel. It only differs once a scale is involved, and less
-often than you might expect; exercise 3 shows exactly when.
+The vertex stage therefore just applies it:
 
-The normal is renormalised in the fragment shader, not the vertex shader. Interpolating
-between unit vectors produces vectors shorter than unit length, and every term below
-assumes unit vectors.
+```slang title="code/src/2.lighting/basic_lighting/lighting.slang"
+[shader("vertex")]
+VSOutput vertexMain(VSInput input) {
+    VSOutput output;
+
+    float4 world = mul(push.model, float4(input.position, 1.0));
+    output.world_position = world.xyz;
+    output.position = mul(globals.projection, mul(globals.view, world));
+
+    output.normal = mul(push.normal_matrix, input.normal);
+    return output;
+}
+```
+
+The normal is renormalised in the fragment shader, not here. Interpolating between unit
+vectors produces vectors shorter than unit length — the interpolated value lands on the
+straight line between two points on the unit sphere, which passes inside it — and every
+term below assumes unit vectors.
 
 ## Ambient
 
 ```slang title="code/src/2.lighting/basic_lighting/lighting.slang"
-const float kAmbientStrength = 0.1;
-float3 ambient = kAmbientStrength * globals.light_colour.rgb;
+    float3 normal = normalize(input.normal);
+    float3 to_light = normalize(globals.light_position.xyz - input.world_position);
+
+    const float kAmbientStrength = 0.1;
+    float3 ambient = kAmbientStrength * globals.light_colour.rgb;
 ```
 
 A constant. It is a crude stand-in for indirect light, and its job is modest: stop the
 faces turned away from the lamp going pure black, which no real surface does. In the
 screenshot it is what you are seeing on the left-hand face.
 
+`to_light` is the unit vector **from the fragment toward the light** — subtract the
+fragment's position from the light's, then normalise. Getting the subtraction the wrong
+way round points it at the floor and is a classic silent bug.
+
 ## Diffuse
 
 ```slang title="code/src/2.lighting/basic_lighting/lighting.slang"
-float3 to_light = normalize(globals.light_position.xyz - input.world_position);
-float diffuse_amount = max(dot(normal, to_light), 0.0);
-float3 diffuse = diffuse_amount * globals.light_colour.rgb;
+    float diffuse_amount = max(dot(normal, to_light), 0.0);
+    float3 diffuse = diffuse_amount * globals.light_colour.rgb;
 ```
 
 This is **Lambert's cosine law**, and it is the term doing almost all the work in the
 screenshot.
 
 A beam of light of fixed width lands on a patch of surface. Facing the beam squarely, the
-patch catches all of it. Tilted, the same beam spreads over a larger area, so each unit of
-area receives less. The fraction received falls off with the cosine of the angle between
-the surface normal and the direction to the light — and for two unit vectors, the cosine
-of the angle between them is exactly their dot product.
+patch catches all of it. Tilted by θ, the same beam spreads over a larger patch:
 
-The `max` matters. A negative dot product means the surface faces away from the light,
-and the right amount of light for that is zero, not negative. Leave it out and faces
-turned away from the lamp subtract the ambient term and go blacker than black — which,
-after clamping, is just black, and a silent loss of the ambient floor.
+```
+   beam of width w, surface facing it:      beam of width w, surface tilted by θ:
+
+     │ │ │ │  light                           │ │ │ │
+     ▼ ▼ ▼ ▼                                  ▼ ▼ ▼ ▼
+   ──────────  area = w                     ╱──────────╱  area = w / cos θ
+      n ↑                                  ╱  n ↗     ╱
+                                          ╱          ╱
+
+   energy per unit area = 1               energy per unit area = cos θ
+```
+
+The same energy spread over `w / cos θ` of surface gives `cos θ` as much per unit area.
+And for two unit vectors, the appendix's `a · b = |a||b| cos θ` collapses to
+`a · b = cos θ` — the cosine we want *is* the dot product, with no trigonometry called at
+all.
+
+The `max` matters. A negative dot product means θ exceeds 90°, so the surface faces away
+from the light, and the right amount of light for that is zero, not negative. Leave it out
+and faces turned away from the lamp subtract the ambient term and go blacker than black —
+which, after clamping, is just black, and a silent loss of the ambient floor.
 
 ## Specular
 
 ```slang title="code/src/2.lighting/basic_lighting/lighting.slang"
-float3 to_eye = normalize(globals.view_position.xyz - input.world_position);
-float3 reflected = reflect(-to_light, normal);
-float specular_amount = pow(max(dot(to_eye, reflected), 0.0), kShininess);
-float3 specular = kSpecularStrength * specular_amount * globals.light_colour.rgb;
+    const float kSpecularStrength = 0.5;
+    const float kShininess = 32.0;
+    float3 to_eye = normalize(globals.view_position.xyz - input.world_position);
+    float3 reflected = reflect(-to_light, normal);
+    float specular_amount = pow(max(dot(to_eye, reflected), 0.0), kShininess);
+    float3 specular = kSpecularStrength * specular_amount * globals.light_colour.rgb;
 ```
 
 The highlight. Reflect the incoming light about the normal as if the surface were a
-mirror, then ask how closely that reflected ray points at the eye. Dead on, the highlight
-is at full strength; the further off, the dimmer.
+mirror, then ask how closely that **reflection vector** points at the eye. Dead on, the
+highlight is at full strength; the further off, the dimmer.
 
-`reflect` wants the direction the light is travelling, which is from the light *toward*
+The reflection itself is worth seeing written out. For a unit normal `n`, an incoming
+direction `d` splits into a part along the normal and a part in the surface, and reflecting
+flips only the first:
+
+```
+   reflect(d, n)  =  d - 2 (d · n) n
+```
+
+`(d · n) n` is the component of `d` along the normal; subtracting it once removes that
+component, subtracting it twice sends it out the other side. Slang's `reflect` is exactly
+this.
+
+`reflect` wants the direction the light is *travelling*, which is from the light toward
 the surface — the opposite of `to_light`, hence the negation. Forget it and the highlight
 turns up on the wrong side of the object: in this scene, the face turned *away* from the
 lamp starts to glow.
 
 The exponent is the surface's **shininess**. A dot product falls off gently; raised to the
-32nd power it falls off steeply, and the highlight tightens into a small bright spot.
+32nd power it falls off steeply, and the highlight tightens into a small bright spot:
+
+```
+   cos θ           at θ = 0    0.5    1.0    (radians)
+   cos θ           1.000     0.878  0.540
+   (cos θ)^2       1.000     0.771  0.292
+   (cos θ)^32      1.000     0.017  0.0000019
+```
+
 Higher is glossier. 2.3 makes this a property of the material rather than a constant.
 
 This is the only term that depends on where the camera is, which is why `view_position`
 joined the per-frame block. It is also the physical difference between matte and shiny:
 a matte surface looks the same from every angle because it has no specular, and a shiny
 one does not.
+
+## The three together
+
+```slang title="code/src/2.lighting/basic_lighting/lighting.slang"
+    float3 result = (ambient + diffuse + specular) * push.object_colour.rgb;
+    return float4(result, 1.0);
+```
+
+The three terms add up to the light arriving at the eye from this point, and the object's
+colour multiplies it exactly as in 2.1. The multiply was right; what was missing was how
+much light actually reaches each fragment.
+
+The lamp's fragment stage is untouched from 2.1 — it still draws at the light's own
+colour, and it still ignores the whole model.
 
 ## The layout trap: a 3×3 matrix is 48 bytes
 
@@ -191,6 +405,7 @@ struct PushConstants {
     float3x3 normal_matrix;
     float4 object_colour;
 };
+[[vk::push_constant]] PushConstants push;
 ```
 
 The natural C++ counterpart would use `glm::mat3`. **Do not.** Look at what the compiler
@@ -203,10 +418,20 @@ OpMemberDecorate %PushConstants_std430 1 MatrixStride 16
 OpMemberDecorate %PushConstants_std430 2 Offset 112
 ```
 
-`MatrixStride 16`. Each column of a 3×3 matrix is a three-component vector, and the
-layout rules align three-component vectors to 16 bytes — so the matrix takes 48 bytes,
-and `object_colour` starts at 112. A `glm::mat3` packs its columns into 12 bytes each, 36
-in all.
+`MatrixStride 16` is the **matrix stride**: the distance in bytes from the start of one
+column to the start of the next. Each column of a 3×3 matrix is a three-component vector,
+and the layout rules align three-component vectors to 16 bytes — so the matrix takes
+3 × 16 = 48 bytes, and `object_colour` starts at 112. A `glm::mat3` packs its columns into
+12 bytes each, 36 in all:
+
+```
+   the shader's float3x3, stride 16:     glm::mat3, stride 12:
+
+   0    col 0   xyz _                    0    col 0   xyz
+   16   col 1   xyz _                    12   col 1   xyz
+   32   col 2   xyz _                    24   col 2   xyz
+   48   ends                             36   ends
+```
 
 Send a `glm::mat3` and the second column arrives 4 bytes early, the third 8 bytes early.
 Try it: the lighting changes visibly, and nothing — not the compiler, not the driver, not
@@ -226,6 +451,9 @@ static_assert(offsetof(PushConstants, object_colour) == 112);
 static_assert(sizeof(PushConstants) == 128);
 ```
 
+Three `glm::vec4`s are 16 bytes each by construction, which is exactly the stride the
+shader expects — the padding is no longer something to remember, it is the type.
+
 The `static_assert`s are the habit 1.10 recommended, and here they earn their keep twice
 over. They pin the layout, and the last one records that this struct is now **exactly**
 128 bytes — the push constant size every Vulkan device guarantees. There is no room left.
@@ -237,6 +465,125 @@ The offsets above came from disassembling the compiled shader, not from memorisi
 rules. That is the reliable way to settle a layout question: the compiler's answer is the
 one the GPU will use.
 :::
+
+## The sample
+
+Everything else is 2.1's file with the new data threaded through it. Two includes appear:
+
+```cpp title="code/src/2.lighting/basic_lighting/main.cpp"
+#include <glm/gtc/matrix_inverse.hpp>
+#include <cmath>
+```
+
+`matrix_inverse.hpp` is where `glm::inverseTranspose` lives; `<cmath>` is for the `std::sin`
+and `std::cos` of the lamp's orbit.
+
+The per-frame block gains its two positions on the C++ side, matching the shader field for
+field:
+
+```cpp title="code/src/2.lighting/basic_lighting/main.cpp"
+struct Globals {
+    glm::mat4 view;            // offset 0
+    glm::mat4 projection;      // offset 64
+    glm::vec4 light_colour;    // offset 128
+    glm::vec4 light_position;  // offset 144
+    glm::vec4 view_position;   // offset 160
+};
+static_assert(sizeof(Globals) == 176);
+```
+
+Every offset is a multiple of 16 without any padding being inserted, because each member
+is either a `mat4` (64 bytes) or a `vec4` (16). 176 bytes in total.
+
+The class, and the one changed call in the frame:
+
+```cpp title="code/src/2.lighting/basic_lighting/main.cpp"
+class BasicLightingApp : public vkc::App {
+```
+
+```cpp title="code/src/2.lighting/basic_lighting/main.cpp"
+        update_globals(slot, frame.extent, light_position);
+```
+
+`update_globals` now needs the lamp's position, because the shader does:
+
+```cpp title="code/src/2.lighting/basic_lighting/main.cpp"
+    void update_globals(size_t slot, VkExtent2D extent, const glm::vec3& light_position) {
+        const Globals globals{
+            .view = camera_.view(),
+            .projection = build_projection(extent),
+            .light_colour = kLightColour,
+            .light_position = glm::vec4(light_position, 1.0F),
+            .view_position = glm::vec4(camera_.position, 1.0F),
+        };
+        std::memcpy(uniform_buffers_[slot].mapped(), &globals, sizeof(globals));
+    }
+```
+
+Both positions are widened to `vec4` with `w = 1`, matching the block. The camera's
+position comes straight from `vkc::Camera`, and it is needed only because of the specular
+term.
+
+`draw_cube` computes the normal matrix per object, alongside the model matrix it already
+had:
+
+```cpp title="code/src/2.lighting/basic_lighting/main.cpp"
+        const PushConstants push{
+            .model = model,
+            .normal_matrix = normal_matrix_of(model),
+            .object_colour = colour,
+        };
+```
+
+The vertex layout gains its second attribute, at location 1, pointing at the new field:
+
+```cpp title="code/src/2.lighting/basic_lighting/main.cpp"
+        const std::array<VkVertexInputAttributeDescription, 2> attributes{{
+            {
+                .location = 0,
+                .binding = 0,
+                .format = VK_FORMAT_R32G32B32_SFLOAT,
+                .offset = offsetof(Vertex, position),
+            },
+            {
+                .location = 1,
+                .binding = 0,
+                .format = VK_FORMAT_R32G32B32_SFLOAT,
+                .offset = offsetof(Vertex, normal),
+            },
+        }};
+```
+
+`offsetof` is doing the work that matters: the normal sits 12 bytes into the vertex, and
+saying so by name rather than by number survives anyone reordering the struct. Both
+attributes read from binding 0, because both live in the same interleaved buffer.
+
+The pipeline builder takes the array rather than 2.1's single attribute, and loads this
+chapter's shader:
+
+```cpp title="code/src/2.lighting/basic_lighting/main.cpp"
+            vkc::load_shader(device, LVK_CHAPTER_ID, "lighting.slang");
+```
+
+```cpp title="code/src/2.lighting/basic_lighting/main.cpp"
+                .vertex_input(std::span(&binding, 1), attributes)
+```
+
+And `main` names the new class:
+
+```cpp title="code/src/2.lighting/basic_lighting/main.cpp"
+        options.title = "LearnVulkan 2.2 - Basic Lighting";
+        BasicLightingApp app(vkc::App::parse_args(argc, argv, options));
+```
+
+### The build file
+
+```cmake title="code/src/2.lighting/basic_lighting/CMakeLists.txt"
+add_chapter(2.2.basic_lighting
+    SOURCES main.cpp
+    SHADERS lighting.slang
+)
+```
 
 ## What changed since 2.1
 
@@ -256,6 +603,24 @@ Watch a face as it turns toward the lamp and away again, and fly around to the f
 the face lit from your side goes dark from the other. Get close to a face angled between
 you and the lamp to catch the specular highlight sliding across it as you move — it
 follows your eye, not the light.
+
+## Words introduced in this chapter
+
+| | |
+|---|---|
+| **Phong reflection model** | the three-term approximation — ambient plus diffuse plus specular — that this chapter implements |
+| **normal** | a unit vector perpendicular to a surface, pointing outward; what tells a fragment which way it faces |
+| **ambient** | a constant floor standing in for light that has bounced too many times to trace |
+| **diffuse** | light scattered equally in all directions by a matte surface; depends on the light's direction only |
+| **specular** | the mirror-like highlight; the only term that depends on where the eye is |
+| **Lambert's cosine law** | a tilted surface catches a beam over a larger area, so brightness falls with `cos θ` — which for unit vectors is the dot product |
+| **normal matrix** | the matrix that transforms normals correctly, `(M⁻¹)ᵀ` of the model matrix's upper 3×3 |
+| **inverse transpose** | inverting then transposing; for an orthonormal matrix the two cancel and it changes nothing |
+| **reflection vector** | `d - 2(d · n)n`, the incoming direction mirrored about the normal |
+| **shininess** | the specular exponent; higher values tighten the highlight and read as glossier |
+| **world space** | the shared space the scene lives in after the model matrix; where this sample does its lighting |
+| **view space** | the same scene with the camera at the origin; an equally valid choice, but never mix the two |
+| **matrix stride** | the byte distance between one column of a shader matrix and the next — 16 for a `float3x3`, not 12 |
 
 ## Exercises
 
@@ -287,3 +652,7 @@ follows your eye, not the light.
    bring the light position into view space on the CPU, and replace `view_position` with
    the origin. The picture should not change at all — which is how you know you did it
    right.
+6. Drop the `normalize` on `input.normal` in the fragment shader and look closely at the
+   middle of a large lit face. The interpolated normals are shorter than unit length
+   there, so the diffuse term comes out slightly too dark — a gradient that should not
+   exist on a flat face.

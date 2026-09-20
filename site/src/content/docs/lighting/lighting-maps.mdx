@@ -1,6 +1,6 @@
 ---
 title: Lighting Maps
-description: Diffuse and specular maps, a descriptor set with mixed types, pools sized per type, one sampler for many textures, and why a specular map is UNORM.
+description: Diffuse and specular maps, the sRGB transfer function derived, a descriptor set with mixed types, pools sized per type, and one sampler for many textures.
 sidebar:
   order: 4
 ---
@@ -35,7 +35,73 @@ rivets, and five wooden planks. In the specular map the steel is bright with scu
 duller patches; the rivets are pure white; the wood is almost black, keeping a faint
 varnish sheen; the gaps between planks are zero.
 
-The shader samples both and uses them where 2.3 used constants:
+The vertex gains its texture coordinate back, so there is something to look the maps up
+with:
+
+```slang title="code/src/2.lighting/lighting_maps/lighting_maps.slang"
+struct VSInput {
+    [[vk::location(0)]] float3 position;
+    [[vk::location(1)]] float3 normal;
+    [[vk::location(2)]] float2 uv;
+};
+
+struct VSOutput {
+    float4 position : SV_Position;
+    [[vk::location(0)]] float3 world_position;
+    [[vk::location(1)]] float3 normal;
+    [[vk::location(2)]] float2 uv;
+};
+```
+
+Set 1 now holds three things, of two different types:
+
+```slang title="code/src/2.lighting/lighting_maps/lighting_maps.slang"
+[[vk::binding(0, 1)]] Sampler2D diffuse_map;
+```
+
+```slang title="code/src/2.lighting/lighting_maps/lighting_maps.slang"
+[[vk::binding(1, 1)]] Sampler2D specular_map;
+```
+
+```slang title="code/src/2.lighting/lighting_maps/lighting_maps.slang"
+struct MaterialParams {
+    float shininess;
+};
+[[vk::binding(2, 1)]] ConstantBuffer<MaterialParams> material;
+```
+
+`shininess` is all that remains of 2.3's `Material` once its colours became textures, and it
+still needs somewhere to live. It stays in the material set, beside the maps it belongs
+with, rather than drifting into push constants just because a single float would fit —
+it changes when the material changes, so it goes where the material goes.
+
+Set 0 is unchanged from 2.3, light and all:
+
+```slang title="code/src/2.lighting/lighting_maps/lighting_maps.slang"
+struct Light {
+    float4 position;
+    float4 ambient;
+    float4 diffuse;
+    float4 specular;
+};
+
+struct Globals {
+    float4x4 view;
+    float4x4 projection;
+    float4 view_position;
+    Light light;
+};
+[[vk::binding(0, 0)]] ConstantBuffer<Globals> globals;
+```
+
+The vertex stage passes the uv straight through, interpolated across the triangle exactly
+as 1.11 described:
+
+```slang title="code/src/2.lighting/lighting_maps/lighting_maps.slang"
+    output.uv = input.uv;
+```
+
+And the fragment stage samples both maps and uses them where 2.3 used constants:
 
 ```slang title="code/src/2.lighting/lighting_maps/lighting_maps.slang"
 float3 surface = diffuse_map.Sample(input.uv).rgb;
@@ -55,33 +121,77 @@ Here is the part of this chapter that has nothing to do with Vulkan's API and ev
 to do with what numbers mean.
 
 ```cpp title="code/src/2.lighting/lighting_maps/main.cpp"
-diffuse_map_ = vkc::load_texture(context(),
-    vkc::asset_path("textures/lvk_crate_diffuse.png"), VK_FORMAT_R8G8B8A8_SRGB);
-
-specular_map_ = vkc::load_texture(context(),
-    vkc::asset_path("textures/lvk_crate_specular.png"), VK_FORMAT_R8G8B8A8_UNORM);
+        diffuse_map_ = vkc::load_texture(context(),
+                                         vkc::asset_path("textures/lvk_crate_diffuse.png"),
+                                         VK_FORMAT_R8G8B8A8_SRGB);
 ```
 
-Same loader, same kind of file, different formats.
+```cpp title="code/src/2.lighting/lighting_maps/main.cpp"
+        specular_map_ = vkc::load_texture(context(),
+                                          vkc::asset_path("textures/lvk_crate_specular.png"),
+                                          VK_FORMAT_R8G8B8A8_UNORM);
+```
+
+Same loader, same kind of file, different formats. To see why that matters, the curve
+behind `_SRGB` is worth writing down.
+
+### What the curve actually is
+
+Human vision is far more sensitive to differences among dark tones than among bright ones.
+Storing brightness in a byte *linearly* would therefore waste most of the 256 values on
+bright tones nobody can tell apart, and leave visible banding in the shadows. So image
+formats do not store linear light. They store a **gamma**-encoded value: light raised to a
+fractional power, which spends more codes on the dark end.
+
+Decoding is the inverse, and the exact rule sRGB uses — its **transfer function** — is
+piecewise, a short linear segment near black and a power curve above it:
+
+```
+   given c = byte / 255,
+
+                    ⎧  c / 12.92                    if c ≤ 0.04045
+   linear(c)   =    ⎨
+                    ⎩  ((c + 0.055) / 1.055)^2.4    otherwise
+```
+
+The threshold sits at byte 10.3, so the linear segment covers only the first ten codes; it
+is there because a pure power curve has an infinite slope at zero, which quantises badly.
+Everywhere else the exponent 2.4 dominates, and the whole thing approximates `c^2.2`.
+
+Run some bytes through it:
+
+| byte | `c = byte/255` | linear light | as a percentage |
+|---|---|---|---|
+| 22 | 0.0863 | 0.0080 | 0.8% |
+| 64 | 0.2510 | 0.0513 | 5.1% |
+| 128 | 0.5020 | 0.2159 | 21.6% |
+| 186 | 0.7294 | 0.4910 | 49.1% |
+| 255 | 1.0000 | 1.0000 | 100% |
+
+The middle row is the one to remember. **A byte of 128 is not half the light — it is about
+22% of it.** The byte that really means half is 186.
+
+### Why that decides the format
 
 The diffuse map is **colour**. It was authored to look right on a display, and displays are
-sRGB, so its bytes are sRGB-encoded: a value of 128 means "the grey that *looks* halfway
-between black and white", which is only about 22% of the light. `_SRGB` tells the GPU to
-decode that curve when sampling, so the shader receives linear light — the only kind it
-makes sense to multiply and add. Chapter 1.11 explained this for the test grid.
+sRGB, so its bytes carry that encoding. `_SRGB` tells the GPU to apply the decode above when
+sampling, so the shader receives **linear colour space** values — the only kind it makes
+sense to multiply and add. Adding two encoded values would be adding two numbers that are
+not proportional to light, and the answer would mean nothing. Chapter 1.11 explained this
+for the test grid.
 
 The specular map is **data**. A value of 128 means "reflect half the specular light". It
 was never a colour and it was never encoded for a display. Load it as `_SRGB` and the GPU
-would run every value through the decode curve anyway: 128 would arrive as about 0.22,
-every mid-grey would shrink towards black, and the steel would lose most of its shine.
-Nothing errors. The picture is just wrong.
+would run every value through the decode curve anyway: 128 would arrive as 0.216 instead of
+0.502, every mid-grey would shrink towards black, and the steel would lose most of its
+shine. Nothing errors. The picture is just wrong.
 
 This is not hypothetical, and it is not subtle once you know where to look. Rendering this
 chapter's captured frame with the specular map loaded as `_SRGB` changes about 4.5% of the
 pixels. The bright highlight along the middle crate's frame breaks up into speckles, because
 the scuffed patches — mid-greys in the map — are pushed far darker than the clean steel
 around them. And the faint varnish sheen on the planks vanishes entirely: the wood's values
-of around 22 out of 255 decode to less than 1%.
+of around 22 out of 255 decode to 0.8%, as the table above shows.
 
 The rule generalises, and later chapters depend on it: **colour textures are `_SRGB`;
 everything else is `_UNORM`.** Specular maps, roughness maps, metalness maps, normal maps,
@@ -89,83 +199,297 @@ height maps, masks — all data, all `_UNORM`. `vkc::load_texture` defaults to `
 because colour is the common case, which makes the `_UNORM` in this chapter a deliberate
 line you have to write.
 
-## A set with two kinds of descriptor
+`_UNORM` itself is just "divide the byte by 255", with no curve at all — the numbers arrive
+as written.
 
-Set 1 now holds three things, of two types:
-
-```slang title="code/src/2.lighting/lighting_maps/lighting_maps.slang"
-[[vk::binding(0, 1)]] Sampler2D diffuse_map;
-[[vk::binding(1, 1)]] Sampler2D specular_map;
-
-struct MaterialParams {
-    float shininess;
-};
-[[vk::binding(2, 1)]] ConstantBuffer<MaterialParams> material;
-```
-
-`shininess` is all that remains of 2.3's `Material` once its colours became textures, and it
-still needs somewhere to live. It stays in the material set, beside the maps it belongs
-with, rather than drifting into push constants just because a single float would fit —
-it changes when the material changes, so it goes where the material goes.
-
-The C++ layout mirrors the shader binding for binding: two
-`VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER`s at bindings 0 and 1, and a
-`VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER` at binding 2. A set has no single type. Each binding
-has its own, and the binding numbers and types must agree with the shader.
-
-Filling the set is one `vkUpdateDescriptorSets` call with three writes. The image writes
-name the layout each image will be in **when it is sampled** — `SHADER_READ_ONLY_OPTIMAL`,
-where `load_texture` already left them — not whatever layout they happen to be in while
-you write the descriptor.
-
-## Pools are sized per type
-
-With two descriptor types in play, the pool needs one size entry per type:
+## Loading the two maps
 
 ```cpp title="code/src/2.lighting/lighting_maps/main.cpp"
-const std::array<VkDescriptorPoolSize, 2> pool_sizes{{
-    {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, vkc::kFramesInFlight + 1},
-    {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2},
-}};
+    void load_textures() {
 ```
-
-Each entry counts **descriptors of that type across every set the pool will hold** —
-uniform buffers for the two per-frame sets plus the material's, image samplers for the
-material's two. `maxSets` is separate, and counts sets. Chapter 2.3 showed what running
-out looks like; with several types, it is per type, so you can have room for sets and still
-run out of one kind of descriptor.
-
-## One sampler, two textures
-
-Both maps are sampled through the same `VkSampler`:
 
 ```cpp title="code/src/2.lighting/lighting_maps/main.cpp"
-sampler_ = vkc::Sampler(context(), vkc::SamplerDesc{});
+        sampler_ = vkc::Sampler(context(), vkc::SamplerDesc{});
+
+        context().name(diffuse_map_.handle(), VK_OBJECT_TYPE_IMAGE, "crate diffuse map");
+        context().name(specular_map_.handle(), VK_OBJECT_TYPE_IMAGE, "crate specular map");
+    }
 ```
+
+`vkc::load_texture`, `vkc::Sampler` and `vkc::asset_path` are all chapter 1.11's and 1.7's,
+which is why this chapter adds two textures in four lines. The include list gains
+`<vkc/paths.hpp>` for `asset_path`:
+
+```cpp title="code/src/2.lighting/lighting_maps/main.cpp"
+#include <vkc/paths.hpp>
+```
+
+### One sampler, two textures
 
 A sampler describes **how** to read a texture — filtering, mipmapping, what happens past
 the edge — and not **which** texture. Chapter 1.11 kept them as separate objects for
 exactly this reason. Any number of textures that want the same filtering can share one,
 and a real scene typically needs only a handful of samplers for thousands of textures.
 
-## One material, three crates
-
-All three crates use the one material, so set 1 is bound once, outside the loop:
+### What is left of the material
 
 ```cpp title="code/src/2.lighting/lighting_maps/main.cpp"
-vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                        pipeline_layout_, 1, 1, &material_set_, 0, nullptr);
-
-for (size_t i = 0; i < kCrates.size(); ++i) {
-    draw_cube(frame.cmd, model);
-}
+struct MaterialParams {
+    float shininess;
+    float padding[3];
+};
+static_assert(sizeof(MaterialParams) == 16);
 ```
 
-This is 2.3's lifetime rule with the numbers changed. The material did not change between
-the crates, so nothing about set 1 is rebound. Only the per-object data varies, and that is
-still what push constants are for.
+```cpp title="code/src/2.lighting/lighting_maps/main.cpp"
+    void create_material_buffer() {
+        material_buffer_ = vkc::Buffer(context().allocator(), sizeof(MaterialParams),
+                                       VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                                       VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                                           VMA_ALLOCATION_CREATE_MAPPED_BIT);
+        const MaterialParams params{.shininess = kShininess, .padding = {}};
+        std::memcpy(material_buffer_.mapped(), &params, sizeof(params));
+    }
+```
+
+The shader's block is 4 bytes; this is padded to 16 for the same reason 2.3's `Material`
+was padded to 64 — so it stays correct if a later chapter packs several into one buffer.
+Written once, like 2.3's materials.
+
+## A set with two kinds of descriptor
+
+The C++ layout mirrors the shader binding for binding: two
+`VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER`s at bindings 0 and 1, and a
+`VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER` at binding 2. A set has no single type. Each binding
+has its own, and the binding numbers and types must agree with the shader — a sampler
+declared where a uniform buffer is expected is a validation error at pipeline creation.
+
+```cpp title="code/src/2.lighting/lighting_maps/main.cpp"
+        const std::array<VkDescriptorSetLayoutBinding, 3> material_bindings{{
+            {
+                .binding = 0,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .descriptorCount = 1,
+                .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+                .pImmutableSamplers = nullptr,
+            },
+            {
+                .binding = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .descriptorCount = 1,
+                .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+                .pImmutableSamplers = nullptr,
+            },
+            {
+                .binding = 2,
+                .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                .descriptorCount = 1,
+                .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+                .pImmutableSamplers = nullptr,
+            },
+        }};
+        const VkDescriptorSetLayoutCreateInfo material_layout_info{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .bindingCount = static_cast<uint32_t>(material_bindings.size()),
+            .pBindings = material_bindings.data(),
+        };
+        VK_CHECK(vkCreateDescriptorSetLayout(device, &material_layout_info, nullptr,
+                                             &material_set_layout_));
+```
+
+All three are fragment-stage only. The vertex shader reads none of them — it only passes
+the uv along.
+
+## Pools are sized per type
+
+With two descriptor types in play, the pool needs one size entry per type:
+
+```cpp title="code/src/2.lighting/lighting_maps/main.cpp"
+        const std::array<VkDescriptorPoolSize, 2> pool_sizes{{
+            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, vkc::kFramesInFlight + 1},
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2},
+        }};
+```
+
+```cpp title="code/src/2.lighting/lighting_maps/main.cpp"
+            .maxSets = vkc::kFramesInFlight + 1,
+            .poolSizeCount = static_cast<uint32_t>(pool_sizes.size()),
+            .pPoolSizes = pool_sizes.data(),
+```
+
+Each entry counts **descriptors of that type across every set the pool will hold** —
+uniform buffers for the two per-frame sets plus the material's, image samplers for the
+material's two. `maxSets` is separate, and counts sets: two frame sets plus one material
+set. Chapter 2.3 showed what running out looks like; with several types, it is per type, so
+you can have room for sets and still run out of one kind of descriptor.
+
+There is one material set rather than 2.3's five, so it is allocated on its own:
+
+```cpp title="code/src/2.lighting/lighting_maps/main.cpp"
+            .descriptorSetCount = 1,
+            .pSetLayouts = &material_set_layout_,
+```
+
+```cpp title="code/src/2.lighting/lighting_maps/main.cpp"
+        VK_CHECK(vkAllocateDescriptorSets(device, &material_alloc, &material_set_));
+```
+
+## Writing three descriptors at once
+
+Filling the set is one `vkUpdateDescriptorSets` call with three writes. Each image write
+names the layout the image will be in **when it is sampled** —
+`VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`, where `load_texture` already left both — not
+whatever layout it happens to be in while you write the descriptor.
+
+```cpp title="code/src/2.lighting/lighting_maps/main.cpp"
+        const VkDescriptorImageInfo diffuse_info{
+            .sampler = sampler_.handle(),
+            .imageView = diffuse_map_.view(),
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
+        const VkDescriptorImageInfo specular_info{
+            .sampler = sampler_.handle(),
+            .imageView = specular_map_.view(),
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
+        const VkDescriptorBufferInfo params_info{
+            .buffer = material_buffer_.handle(),
+            .offset = 0,
+            .range = sizeof(MaterialParams),
+        };
+```
+
+Both image infos name the same sampler handle — that is the sharing made concrete.
+
+```cpp title="code/src/2.lighting/lighting_maps/main.cpp"
+        const auto image_write = [&](uint32_t binding, const VkDescriptorImageInfo& info) {
+            return VkWriteDescriptorSet{
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .pNext = nullptr,
+                .dstSet = material_set_,
+                .dstBinding = binding,
+                .dstArrayElement = 0,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = &info,
+                .pBufferInfo = nullptr,
+                .pTexelBufferView = nullptr,
+            };
+        };
+
+        const std::array<VkWriteDescriptorSet, 3> material_writes{{
+            image_write(0, diffuse_info),
+            image_write(1, specular_info),
+            {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .pNext = nullptr,
+                .dstSet = material_set_,
+                .dstBinding = 2,
+                .dstArrayElement = 0,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                .pImageInfo = nullptr,
+                .pBufferInfo = &params_info,
+                .pTexelBufferView = nullptr,
+            },
+        }};
+        vkUpdateDescriptorSets(device, static_cast<uint32_t>(material_writes.size()),
+                               material_writes.data(), 0, nullptr);
+
+        context().name(material_set_, VK_OBJECT_TYPE_DESCRIPTOR_SET, "crate material");
+```
+
+The lambda exists because the two image writes differ in exactly two fields. Note that it
+captures `info` **by reference** and stores its address — which is fine here only because
+`diffuse_info` and `specular_info` outlive the `vkUpdateDescriptorSets` call. Vulkan reads
+through those pointers during the call and never after it.
+
+## The vertex, the crates and the lamp
+
+The vertex gains its uv on the C++ side too, and the cube array grows a third column:
+
+```cpp title="code/src/2.lighting/lighting_maps/main.cpp"
+    glm::vec2 uv;
+```
+
+```cpp title="code/src/2.lighting/lighting_maps/main.cpp"
+constexpr float kH = 0.5F;
+constexpr std::array<Vertex, 24> kVertices{{
+    // front (+z)
+    {{-kH, -kH, kH}, {0, 0, 1}, {0, 1}},  {{kH, -kH, kH}, {0, 0, 1}, {1, 1}},
+    {{kH, kH, kH}, {0, 0, 1}, {1, 0}},    {{-kH, kH, kH}, {0, 0, 1}, {0, 0}},
+    // back (-z)
+    {{kH, -kH, -kH}, {0, 0, -1}, {0, 1}}, {{-kH, -kH, -kH}, {0, 0, -1}, {1, 1}},
+    {{-kH, kH, -kH}, {0, 0, -1}, {1, 0}}, {{kH, kH, -kH}, {0, 0, -1}, {0, 0}},
+    // left (-x)
+    {{-kH, -kH, -kH}, {-1, 0, 0}, {0, 1}}, {{-kH, -kH, kH}, {-1, 0, 0}, {1, 1}},
+    {{-kH, kH, kH}, {-1, 0, 0}, {1, 0}},   {{-kH, kH, -kH}, {-1, 0, 0}, {0, 0}},
+    // right (+x)
+    {{kH, -kH, kH}, {1, 0, 0}, {0, 1}},  {{kH, -kH, -kH}, {1, 0, 0}, {1, 1}},
+    {{kH, kH, -kH}, {1, 0, 0}, {1, 0}},  {{kH, kH, kH}, {1, 0, 0}, {0, 0}},
+    // top (+y)
+    {{-kH, kH, kH}, {0, 1, 0}, {0, 1}},  {{kH, kH, kH}, {0, 1, 0}, {1, 1}},
+    {{kH, kH, -kH}, {0, 1, 0}, {1, 0}},  {{-kH, kH, -kH}, {0, 1, 0}, {0, 0}},
+    // bottom (-y)
+    {{-kH, -kH, -kH}, {0, -1, 0}, {0, 1}}, {{kH, -kH, -kH}, {0, -1, 0}, {1, 1}},
+    {{kH, -kH, kH}, {0, -1, 0}, {1, 0}},   {{-kH, -kH, kH}, {0, -1, 0}, {0, 0}},
+}};
+```
+
+Each face is listed bottom-left, bottom-right, top-right, top-left seen from outside, and
+maps the whole texture onto itself the right way up. Note `{0, 1}` at the bottom-left: v
+runs downward in Vulkan, the convention 1.11 settled.
+
+The attribute list gains a third entry to match, this one a two-component format:
+
+```cpp title="code/src/2.lighting/lighting_maps/main.cpp"
+        const std::array<VkVertexInputAttributeDescription, 3> attributes{{
+```
+
+```cpp title="code/src/2.lighting/lighting_maps/main.cpp"
+                .location = 2,
+                .binding = 0,
+                .format = VK_FORMAT_R32G32_SFLOAT,
+                .offset = offsetof(Vertex, uv),
+```
+
+The scene's constants:
+
+```cpp title="code/src/2.lighting/lighting_maps/main.cpp"
+constexpr float kShininess = 32.0F;
+
+constexpr glm::vec4 kLightAmbient{0.2F, 0.2F, 0.2F, 1.0F};
+constexpr glm::vec4 kLightDiffuse{0.6F, 0.6F, 0.6F, 1.0F};
+constexpr glm::vec4 kLightSpecular{1.0F, 1.0F, 1.0F, 1.0F};
+
+constexpr std::array<glm::vec3, 3> kCrates{{
+    {-1.8F, 0.0F, -0.4F},
+    {0.0F, 0.0F, 0.4F},
+    {1.8F, 0.0F, -0.4F},
+}};
+```
+
+The ambient and diffuse components are well below 1.0 now, because they multiply a texture
+that already carries the surface's colour. In 2.3 they multiplied a material colour that was
+itself dark; here the diffuse map supplies that, so the light has to be dimmer or everything
+washes out. The specular component stays at 1.0 because the specular map decides on its own
+how much any texel reflects.
 
 ## Where the light goes matters
+
+```cpp title="code/src/2.lighting/lighting_maps/main.cpp"
+constexpr float kLightSweep = 1.2F;     // half-width of the sweep along x
+constexpr float kLightHeight = 0.25F;
+constexpr float kLightDistance = 3.0F;  // z, in front of the crates
+```
+
+```cpp title="code/src/2.lighting/lighting_maps/main.cpp"
+    [[nodiscard]] static glm::vec3 orbit_position(float time) {
+        return {kLightSweep * std::sin(time * 0.5F - 0.48F), kLightHeight, kLightDistance};
+    }
+```
 
 One practical note from building this sample. The first version put the lamp where 2.3 had
 it, circling above the scene, and the captured frame had **no specular highlights at all** —
@@ -176,6 +500,95 @@ With the camera and the lamp both above the crates, that mirror point lies above
 front face, off the edge of the geometry. So this sample's lamp sweeps from side to side
 low down in front of the crates, where the mirror points land on the steel. If you move the
 camera high and find the highlights gone, that is geometry, not a bug.
+
+## One material, three crates
+
+All three crates use the one material, so set 1 is bound once, outside the loop:
+
+```cpp title="code/src/2.lighting/lighting_maps/main.cpp"
+        vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                pipeline_layout_, 1, 1, &material_set_, 0, nullptr);
+```
+
+```cpp title="code/src/2.lighting/lighting_maps/main.cpp"
+        for (size_t i = 0; i < kCrates.size(); ++i) {
+            const glm::mat4 model =
+                glm::translate(glm::mat4(1.0F), kCrates[i]) *
+                glm::rotate(glm::mat4(1.0F), (time * 0.25F - 0.375F) + (static_cast<float>(i) - 1.0F) * 0.65F,
+                            glm::normalize(glm::vec3(0.2F, 1.0F, 0.1F)));
+            draw_cube(frame.cmd, model);
+        }
+```
+
+This is 2.3's lifetime rule with the numbers changed. The material did not change between
+the crates, so nothing about set 1 is rebound. Only the per-object data varies, and that is
+still what push constants are for. The `-0.375F` and `-0.48F` phase offsets exist so the
+captured frame lands with the lamp and the crates in a telling position.
+
+The lamp is smaller than 2.3's, because it now sits between the camera and the crates:
+
+```cpp title="code/src/2.lighting/lighting_maps/main.cpp"
+                                        glm::vec3(0.08F)));
+```
+
+## The rest of the sample
+
+```cpp title="code/src/2.lighting/lighting_maps/main.cpp"
+class LightingMapsApp : public vkc::App {
+```
+
+`on_start` gains two calls, and the camera drops to near the crates' level:
+
+```cpp title="code/src/2.lighting/lighting_maps/main.cpp"
+        load_textures();
+```
+
+```cpp title="code/src/2.lighting/lighting_maps/main.cpp"
+        create_material_buffer();
+```
+
+```cpp title="code/src/2.lighting/lighting_maps/main.cpp"
+        camera_.position = {0.0F, 0.35F, 5.0F};
+        camera_.pitch = -3.0F;
+```
+
+`on_shutdown` destroys the four new objects, in reverse order of creation:
+
+```cpp title="code/src/2.lighting/lighting_maps/main.cpp"
+        material_buffer_.destroy();
+        sampler_.destroy();
+        specular_map_.destroy();
+        diffuse_map_.destroy();
+```
+
+The members, the shader name and `main`:
+
+```cpp title="code/src/2.lighting/lighting_maps/main.cpp"
+    vkc::Image diffuse_map_;
+    vkc::Image specular_map_;
+    vkc::Sampler sampler_;
+
+    vkc::Buffer material_buffer_;
+    VkDescriptorSet material_set_ = VK_NULL_HANDLE;
+```
+
+```cpp title="code/src/2.lighting/lighting_maps/main.cpp"
+            vkc::load_shader(device, LVK_CHAPTER_ID, "lighting_maps.slang");
+```
+
+```cpp title="code/src/2.lighting/lighting_maps/main.cpp"
+        options.title = "LearnVulkan 2.4 - Lighting Maps";
+        LightingMapsApp app(vkc::App::parse_args(argc, argv, options));
+```
+
+### The build file
+
+```cmake title="code/src/2.lighting/lighting_maps/CMakeLists.txt"
+add_chapter(2.4.lighting_maps
+    SOURCES main.cpp
+    SHADERS lighting_maps.slang
+)
+```
 
 ## What changed since 2.3
 
@@ -195,6 +608,16 @@ camera high and find the highlights gone, that is geometry, not a bug.
 Watch the steel as the lamp sweeps: highlights slide along the frames and catch the rivets,
 while the planks beside them keep only a faint sheen.
 
+## Words introduced in this chapter
+
+| | |
+|---|---|
+| **diffuse map** | a texture supplying the surface's colour per texel; replaces a single material colour |
+| **specular map** | a texture saying how much specular light each texel reflects; data, not colour |
+| **transfer function** | the curve relating a stored value to actual light — sRGB's is a short linear segment plus a 2.4 power |
+| **gamma** | the fractional power an image is encoded with, so that byte values are spread to match how eyes see |
+| **linear colour space** | values proportional to actual light, which is the only space in which adding and multiplying them is meaningful |
+
 ## Exercises
 
 1. Load the specular map as `VK_FORMAT_R8G8B8A8_SRGB` and compare. Then load the *diffuse*
@@ -210,3 +633,6 @@ while the planks beside them keep only a faint sheen.
 5. Add a second material — reuse the diffuse map but make a specular map that is uniformly
    bright, a "polished" crate — and draw the middle crate with it. Resize the pool, allocate a
    second set, and rebind set 1 inside the loop only when the material actually changes.
+6. Work out, from the table above, which byte value means "reflect a quarter of the specular
+   light" in a `_UNORM` map, and which byte would mean the same thing if the map were
+   mistakenly `_SRGB`. The gap between those two numbers is the size of the bug.

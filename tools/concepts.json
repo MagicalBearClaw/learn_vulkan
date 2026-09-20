@@ -1,0 +1,47 @@
+{
+  "_comment": [
+    "Which chapter has to define each idea. `terms.py` gates Vulkan names; this gates",
+    "the concepts and mathematics those names sit on top of, which no amount of API",
+    "vocabulary teaches. A reader meeting 'the normal matrix' needs it derived, not",
+    "mentioned.",
+    "",
+    "The check is that the concept appears in the chapter's `Words introduced in this",
+    "chapter` table, because that table is where this series defines its terms.",
+    "",
+    "Two different jobs are being done here, and they are worth telling apart:",
+    "",
+    "  * Part 1's lists were read back out of the tables that already exist, so the gate",
+    "    proves nothing about Part 1 that Part 1 did not already say. It is a ratchet:",
+    "    it fails if a term is ever dropped from a table it currently sits in.",
+    "",
+    "  * Part 2 onward is curated before the article is written, from what the sample",
+    "    and its shaders actually do. There the gate is a real check -- it fails until",
+    "    the chapter defines what it uses.",
+    "",
+    "A concept is listed against the chapter that FIRST needs it. `specialisation",
+    "constant` belongs to 1.9 even though 2.5 and 2.6 are what finally use it."
+  ],
+  "chapters": {
+    "1.1.creating_a_window": ["compositor", "event", "event loop", "RAII", "stack unwinding", "point vs pixel", "translation unit", "forward declaration", "function-local static", "instance extension", "surface", "bit flag", "allocation callbacks"],
+    "1.2.the_instance": ["loader", "ICD", "layer", "extension", "handle", "sType", "pNext", "calling convention", "VkResult", "VK_CHECK", "two-call idiom", "designated initialiser"],
+    "1.3.devices_and_queues": ["physical device", "logical device", "queue", "queue family", "submit", "feature", "heap", "dispatch table", "device-local memory"],
+    "1.4.the_swapchain": ["swapchain", "presentation engine", "tearing", "present mode", "image view", "sRGB", "out of date", "colour space", "sharing mode"],
+    "1.5.command_buffers": ["command buffer", "command pool", "image layout", "barrier", "fence", "dynamic rendering", "host-visible memory"],
+    "1.6.synchronisation": ["semaphore", "binary semaphore", "timeline semaphore", "frames in flight", "stage mask"],
+    "1.7.hello_triangle": ["SPIR-V", "shader module", "entry point", "pipeline", "pipeline layout", "dynamic state", "rasterisation", "interpolation", "input assembly", "multisampling", "scissor"],
+    "1.8.memory_and_buffers": ["buffer", "allocation", "staging buffer", "vertex binding", "vertex attribute", "index buffer", "device-local", "host-visible", "move semantics"],
+    "1.9.shaders": ["system-value semantic", "provoking vertex", "specialisation constant"],
+    "1.10.descriptors": ["push constant", "uniform buffer", "descriptor", "descriptor set", "descriptor set layout", "descriptor pool", "std140"],
+    "1.11.textures": ["texel", "tiling", "subresource", "mip chain", "blit", "sampler", "anisotropic filtering", "array layer", "trilinear filtering", "combined image sampler"],
+    "1.12.transformations": ["basis vectors", "columns of a matrix", "homogeneous coordinates", "point vs direction", "model matrix", "identity matrix", "orthonormal", "column-major"],
+    "1.13.coordinate_systems": ["model / view / projection", "field of view", "normalised device coordinates", "perspective divide", "hyperbolic depth", "near / far plane", "depth buffer", "z-fighting", "back-face culling", "reversed-z"],
+    "1.14.camera": ["view matrix", "yaw / pitch", "spherical coordinates", "cross product", "right-hand rule", "world up", "relative mouse mode", "delta time", "gimbal lock"],
+
+    "2.1.colours": ["reflectance", "component-wise multiply", "shading model", "pipeline variant", "per-frame data"],
+    "2.2.basic_lighting": ["Phong reflection model", "normal", "normal matrix", "inverse transpose", "Lambert's cosine law", "ambient", "diffuse", "specular", "shininess", "reflection vector", "world space", "view space", "matrix stride"],
+    "2.3.materials": ["material", "data lifetime", "per-material data", "pipeline layout compatibility", "pool size", "shader stage flags"],
+    "2.4.lighting_maps": ["diffuse map", "specular map", "transfer function", "linear colour space", "gamma"],
+    "2.5.light_casters": ["directional light", "point light", "spotlight", "attenuation", "inverse-square law", "cone cutoff", "inner / outer cone"],
+    "2.6.multiple_lights": ["superposition", "additive light", "array stride", "light accumulation"]
+  }
+}

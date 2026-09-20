@@ -68,7 +68,13 @@ def new_lines(sample: pathlib.Path, previous: pathlib.Path | None) -> list[str]:
     for tag, _, _, start, end in matcher.get_opcodes():
         if tag in ("insert", "replace"):
             added.extend(current[start:end])
-    return [line for line in added if significant(line)]
+    # A `replace` opcode spans a whole changed block, so adding one field to a struct
+    # marks every line of it new. Those lines are not new to the reader: they typed
+    # them in the previous chapter and the article points back at them. Keep only what
+    # was not in front of the reader before, wherever it falls in the diff.
+    carried = {line.strip() for line in earlier if significant(line)}
+    return [line for line in added
+            if significant(line) and line.strip() not in carried]
 
 
 # Fenced blocks only. An indented block inside a list item is still fenced in MDX.

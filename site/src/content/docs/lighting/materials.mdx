@@ -26,7 +26,7 @@ surface in the scene shared those numbers except the colour.
 
 Real surfaces differ in all of them, independently. Gold has a warm, tinted highlight;
 plastic has a white one. Rubber has almost no highlight at all; polished metal has a small,
-intense one. So the constants become data:
+intense one. So the constants become data — a **material**:
 
 ```slang title="code/src/2.lighting/materials/materials.slang"
 struct Material {
@@ -35,6 +35,7 @@ struct Material {
     float4 specular;
     float shininess;
 };
+[[vk::binding(0, 1)]] ConstantBuffer<Material> material;
 ```
 
 Each colour says how much of the matching component of the light the surface sends back.
@@ -43,11 +44,14 @@ same hue, darker. `specular` is the colour of the highlight — near-white for p
 tinted for metals, which is most of what makes gold read as gold rather than as yellow
 plastic. `shininess` is 2.2's exponent.
 
+Note the binding: `[[vk::binding(0, 1)]]` is binding 0 of **set 1**. 2.1 promised set 1
+would mean per-material data, and this is it.
+
 Lights get the same three components, for the same reason:
 
 ```slang title="code/src/2.lighting/materials/materials.slang"
 struct Light {
-    float4 position;
+    float4 position;   // xyz; w unused
     float4 ambient;
     float4 diffuse;
     float4 specular;
@@ -55,22 +59,76 @@ struct Light {
 ```
 
 A dim ambient with a bright diffuse is one lamp in a dark room. A strong ambient with a weak
-diffuse is an overcast afternoon. The shader multiplies the two, term by term:
+diffuse is an overcast afternoon.
+
+The light struct nests inside the per-frame block, and the standalone `light_colour` and
+`light_position` of 2.2 are gone into it:
 
 ```slang title="code/src/2.lighting/materials/materials.slang"
-float3 ambient = globals.light.ambient.rgb * material.ambient.rgb;
-float3 diffuse = globals.light.diffuse.rgb * (diffuse_amount * material.diffuse.rgb);
-float3 specular = globals.light.specular.rgb * (specular_amount * material.specular.rgb);
+struct Globals {
+    float4x4 view;
+    float4x4 projection;
+    float4 view_position;  // xyz; w unused
+    Light light;
+};
+[[vk::binding(0, 0)]] ConstantBuffer<Globals> globals;
 ```
 
-The five materials in the sample come from a classic table in McReynolds and Blythe's
-*Advanced Graphics Programming Using OpenGL*. The values were tuned for a white light at
-full strength in every component, which is what the sample supplies.
+The push constants lose the object colour, which was a material property all along:
+
+```slang title="code/src/2.lighting/materials/materials.slang"
+struct PushConstants {
+    float4x4 model;
+    float3x3 normal_matrix;
+};
+[[vk::push_constant]] PushConstants push;
+```
+
+## The shading, term by term
+
+The vertex stage is 2.2's, unchanged. The fragment stage is 2.2's arithmetic with every
+constant replaced by a product of what the light emits and what the material reflects:
+
+```slang title="code/src/2.lighting/materials/materials.slang"
+[shader("fragment")]
+float4 fragmentMain(VSOutput input) : SV_Target {
+    float3 normal = normalize(input.normal);
+    float3 to_light = normalize(globals.light.position.xyz - input.world_position);
+    float3 to_eye = normalize(globals.view_position.xyz - input.world_position);
+
+    float3 ambient = globals.light.ambient.rgb * material.ambient.rgb;
+
+    float diffuse_amount = max(dot(normal, to_light), 0.0);
+    float3 diffuse = globals.light.diffuse.rgb * (diffuse_amount * material.diffuse.rgb);
+
+    float3 reflected = reflect(-to_light, normal);
+    float specular_amount = pow(max(dot(to_eye, reflected), 0.0), material.shininess);
+    float3 specular = globals.light.specular.rgb * (specular_amount * material.specular.rgb);
+
+    return float4(ambient + diffuse + specular, 1.0);
+}
+```
+
+Every one of the three terms is now `light_component × material_component`, which is 2.1's
+component-wise multiply applied three times instead of once. `material.shininess` replaces
+2.2's `kShininess`. And the object colour no longer multiplies the sum at the end, because
+it has been absorbed into the three material colours — a surface that reflects half the red
+it receives says so in `material.diffuse`, not in a separate colour.
+
+```slang title="code/src/2.lighting/materials/materials.slang"
+[shader("fragment")]
+float4 lampFragmentMain(VSOutput input) : SV_Target {
+    return float4(globals.light.specular.rgb, 1.0);
+}
+```
+
+The lamp draws at the light's specular colour: the full, unscaled colour of what the light
+emits, which is what you see when you look straight at it.
 
 ## Three lifetimes
 
 Now the Vulkan part. This sample has three kinds of data, and they change at three
-different rates:
+different rates. That rate is the data's **lifetime**, and it decides where the data lives:
 
 | Data | Changes | Lives in |
 |---|---|---|
@@ -86,16 +144,23 @@ rebinding the camera too. Split them, and each piece is bound exactly as often a
 changes:
 
 ```cpp title="code/src/2.lighting/materials/main.cpp"
-// Set 0, once for the whole frame.
-vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                        pipeline_layout_, 0, 1, &frame_sets_[slot], 0, nullptr);
+        vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                pipeline_layout_, 0, 1, &frame_sets_[slot], 0, nullptr);
+```
 
-for (size_t i = 0; i < kMaterials.size(); ++i) {
-    // Set 1 only.
-    vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            pipeline_layout_, 1, 1, &material_sets_[i], 0, nullptr);
-    draw_cube(frame.cmd, model);
-}
+```cpp title="code/src/2.lighting/materials/main.cpp"
+        for (size_t i = 0; i < kMaterials.size(); ++i) {
+            vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                    pipeline_layout_, 1, 1, &material_sets_[i], 0,
+                                    nullptr);
+
+            const float x = (static_cast<float>(i) - 2.0F) * kCubeSpacing;
+            const glm::mat4 model =
+                glm::translate(glm::mat4(1.0F), glm::vec3(x, 0.0F, 0.0F)) *
+                glm::rotate(glm::mat4(1.0F), time * 0.3F + static_cast<float>(i),
+                            glm::normalize(glm::vec3(0.3F, 1.0F, 0.15F)));
+            draw_cube(frame.cmd, model);
+        }
 ```
 
 The fourth argument is `firstSet`. The first call writes set 0; each call in the loop
@@ -103,12 +168,18 @@ writes set 1 and **leaves set 0 alone**. That is the whole point of numbered set
 is worth ordering them so that the rarest-changing data has the lowest number: binding set
 *N* is designed to leave the sets below it undisturbed.
 
+The five cubes stand in a row: `i - 2` runs from −2 to +2, so cube 2 sits at the origin and
+the others spread either side at `kCubeSpacing` intervals. Adding `i` to the rotation angle
+gives each cube a different starting orientation, so the highlights do not all land in the
+same place. Read the model matrix right to left, as always: rotate about a tilted axis,
+then translate along x.
+
 Order is also how sets are numbered on the C++ side. There is no set-number field
 anywhere; the index into `pSetLayouts` *is* the set number:
 
 ```cpp title="code/src/2.lighting/materials/main.cpp"
-const std::array<VkDescriptorSetLayout, 2> set_layouts{frame_set_layout_,
-                                                       material_set_layout_};
+        const std::array<VkDescriptorSetLayout, 2> set_layouts{frame_set_layout_,
+                                                               material_set_layout_};
 ```
 
 ## Switching pipelines without losing your sets
@@ -117,8 +188,9 @@ After the five cubes, the sample switches to the lamp pipeline and draws — wit
 rebinding anything:
 
 ```cpp title="code/src/2.lighting/materials/main.cpp"
-vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, lamp_pipeline_);
-draw_cube(frame.cmd, lamp_model);
+        vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, lamp_pipeline_);
+        draw_cube(frame.cmd, glm::scale(glm::translate(glm::mat4(1.0F), light_position),
+                                        glm::vec3(0.2F)));
 ```
 
 That works because descriptor sets are not bound *to a pipeline*. They are bound to the
@@ -126,12 +198,12 @@ command buffer, through a pipeline layout, and they survive a pipeline switch as
 the new pipeline's layout is **compatible** with the one they were bound through. Both
 pipelines here share one `VkPipelineLayout`, so the sets carry straight over.
 
-"Compatible" is precise. Two pipeline layouts are compatible for set *N* if they were
-created with identically defined set layouts for sets 0 through *N* **and** the same push
-constant ranges. The second half is the surprising one — a layout that differs only in
-which stages can see the push constants is incompatible for every set, and the sets you
-bound stop counting. The validation layers catch it at the draw, and the message is a
-good one to recognise:
+**Pipeline layout compatibility** is precise. Two pipeline layouts are compatible for set
+*N* if they were created with identically defined set layouts for sets 0 through *N* **and**
+the same push constant ranges. The second half is the surprising one — a layout that
+differs only in which stages can see the push constants is incompatible for every set, and
+the sets you bound stop counting. The validation layers catch it at the draw, and the
+message is a good one to recognise:
 
 ```
 vkCmdDrawIndexed(): The VkPipeline [lamp pipeline] (created with VkPipelineLayout ...)
@@ -145,6 +217,26 @@ The practical rule is simple: give pipelines that are drawn together one pipelin
 even if some of them do not use every set. The lamp's fragment stage never reads set 1, and
 that is fine.
 
+## Drawing, and what the vertex stage needs
+
+```cpp title="code/src/2.lighting/materials/main.cpp"
+    void draw_cube(VkCommandBuffer cmd, const glm::mat4& model) {
+        const PushConstants push{
+            .model = model,
+            .normal_matrix = normal_matrix_of(model),
+        };
+        vkCmdPushConstants(cmd, pipeline_layout_, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                           sizeof(push), &push);
+        vkCmdDrawIndexed(cmd, static_cast<uint32_t>(kIndices.size()), 1, 0, 0, 0);
+    }
+```
+
+`draw_cube` loses its colour parameter, and the push constants are now visible to the
+**vertex stage only**. Both the model matrix and the normal matrix are consumed there; with
+the object colour gone, the fragment stage reads nothing out of the block. Narrowing the
+range to the stages that actually read it is not an optimisation so much as a statement of
+intent — and, as the compatibility rule above says, it is part of the layout's identity.
+
 ## Materials do not need a copy per frame
 
 The per-frame buffers still come in pairs, one per frame in flight, because they are
@@ -154,7 +246,16 @@ from chapter 1.10.
 Material buffers are written **once**, at start-up, and never again:
 
 ```cpp title="code/src/2.lighting/materials/main.cpp"
-std::memcpy(material_buffers_[i].mapped(), &kMaterials[i].material, sizeof(Material));
+    void create_material_buffers() {
+        for (size_t i = 0; i < kMaterials.size(); ++i) {
+            material_buffers_[i] = vkc::Buffer(
+                context().allocator(), sizeof(Material), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                    VMA_ALLOCATION_CREATE_MAPPED_BIT);
+            std::memcpy(material_buffers_[i].mapped(), &kMaterials[i].material,
+                        sizeof(Material));
+        }
+    }
 ```
 
 So there is one buffer and one set per material, full stop. The rule is not "one per frame
@@ -162,15 +263,104 @@ in flight for everything" but "one per frame in flight for anything the CPU writ
 the GPU might be reading it". A material that changed at run time would need the pairs
 back.
 
-## One pool, sized for everything
+## Two set layouts, and one helper
 
-Both kinds of set come out of one pool, and the pool has to be sized for the total:
+Both set layouts are one uniform buffer at binding 0, so the sample builds them with a
+helper that takes the stages as a parameter:
 
 ```cpp title="code/src/2.lighting/materials/main.cpp"
-const auto set_count =
-    static_cast<uint32_t>(vkc::kFramesInFlight + kMaterials.size());
-const VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, set_count};
+    [[nodiscard]] VkDescriptorSetLayout create_set_layout(VkShaderStageFlags stages) {
+        const VkDescriptorSetLayoutBinding binding{
+            .binding = 0,
+            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = stages,
+            .pImmutableSamplers = nullptr,
+        };
+        const VkDescriptorSetLayoutCreateInfo info{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .bindingCount = 1,
+            .pBindings = &binding,
+        };
+        VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+        VK_CHECK(vkCreateDescriptorSetLayout(context().device(), &info, nullptr, &layout));
+        return layout;
+    }
 ```
+
+`VkShaderStageFlags` is worth a sentence, because it is the first time this series names
+one of these types rather than just using it. Vulkan's bit flags come in pairs: a
+`*FlagBits` enum holding the individual values — `VK_SHADER_STAGE_VERTEX_BIT` and friends —
+and a `*Flags` type, a plain 32-bit integer, holding **any combination** of them OR'd
+together. The `FlagBits` type is one flag; the `Flags` type is a set of them. So a parameter
+that should accept "vertex and fragment" is typed `VkShaderStageFlags`, and passing a single
+`VK_SHADER_STAGE_VERTEX_BIT` is just a set with one member. This is the "bit flag" idea from
+1.1 with its naming convention finally spelled out.
+
+Writing a descriptor gets the same treatment, since both kinds of set hold one uniform
+buffer:
+
+```cpp title="code/src/2.lighting/materials/main.cpp"
+    void write_uniform(VkDescriptorSet set, VkBuffer buffer, VkDeviceSize size) {
+        const VkDescriptorBufferInfo buffer_info{.buffer = buffer, .offset = 0, .range = size};
+        const VkWriteDescriptorSet write{
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .pNext = nullptr,
+            .dstSet = set,
+            .dstBinding = 0,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .pImageInfo = nullptr,
+            .pBufferInfo = &buffer_info,
+            .pTexelBufferView = nullptr,
+        };
+        vkUpdateDescriptorSets(context().device(), 1, &write, 0, nullptr);
+    }
+```
+
+This is 2.1's `VkWriteDescriptorSet` with the set, buffer and size lifted out as
+parameters. Nothing about it is new; it is the same call made five plus two times instead
+of twice.
+
+## One pool, sized for everything
+
+```cpp title="code/src/2.lighting/materials/main.cpp"
+    void create_descriptors() {
+        const VkDevice device = context().device();
+
+        frame_set_layout_ =
+            create_set_layout(VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT);
+        material_set_layout_ = create_set_layout(VK_SHADER_STAGE_FRAGMENT_BIT);
+```
+
+Two layouts that happen to look identical but mean different things. The frame block is
+read by both stages — the vertex shader wants the matrices, the fragment shader wants the
+light — while the material is read only by the fragment stage.
+
+Both kinds of set come out of one pool, and the **pool size** has to cover the total:
+
+```cpp title="code/src/2.lighting/materials/main.cpp"
+        const auto set_count = static_cast<uint32_t>(vkc::kFramesInFlight + kMaterials.size());
+        const VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, set_count};
+        const VkDescriptorPoolCreateInfo pool_info{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .maxSets = set_count,
+            .poolSizeCount = 1,
+            .pPoolSizes = &pool_size,
+        };
+        VK_CHECK(vkCreateDescriptorPool(device, &pool_info, nullptr, &descriptor_pool_));
+```
+
+Two different counts happen to be equal here and it is worth not confusing them.
+`maxSets` is how many **sets** the pool can hand out: two frame sets plus five material
+sets, seven. The `VkDescriptorPoolSize` is how many **descriptors** of one type it holds,
+summed over every set — and since each set here holds exactly one uniform buffer, that is
+also seven. A set with two uniform buffers in it would make these numbers differ.
 
 Get it wrong and there is no validation warning. Set the count one short and the last
 allocation simply fails:
@@ -184,10 +374,78 @@ A fixed-size pool is fine for a fixed scene. A scene that loads materials as it 
 pools that grow — allocate a new pool when one runs out and keep a list — and that is where
 chapter 3.4 eventually replaces per-material sets altogether.
 
+Allocation needs one layout per set, so each array repeats its layout handle:
+
+```cpp title="code/src/2.lighting/materials/main.cpp"
+        const std::array<VkDescriptorSetLayout, vkc::kFramesInFlight> frame_layouts{
+            frame_set_layout_, frame_set_layout_};
+        const VkDescriptorSetAllocateInfo frame_alloc{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .pNext = nullptr,
+            .descriptorPool = descriptor_pool_,
+            .descriptorSetCount = vkc::kFramesInFlight,
+            .pSetLayouts = frame_layouts.data(),
+        };
+        VK_CHECK(vkAllocateDescriptorSets(device, &frame_alloc, frame_sets_.data()));
+
+        std::array<VkDescriptorSetLayout, kMaterials.size()> material_layouts{};
+        material_layouts.fill(material_set_layout_);
+        const VkDescriptorSetAllocateInfo material_alloc{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .pNext = nullptr,
+            .descriptorPool = descriptor_pool_,
+            .descriptorSetCount = static_cast<uint32_t>(kMaterials.size()),
+            .pSetLayouts = material_layouts.data(),
+        };
+        VK_CHECK(vkAllocateDescriptorSets(device, &material_alloc, material_sets_.data()));
+```
+
+`fill` is doing for five what the brace-initialiser above does for two.
+
+```cpp title="code/src/2.lighting/materials/main.cpp"
+        for (size_t i = 0; i < vkc::kFramesInFlight; ++i) {
+            write_uniform(frame_sets_[i], uniform_buffers_[i].handle(), sizeof(Globals));
+        }
+        for (size_t i = 0; i < kMaterials.size(); ++i) {
+            write_uniform(material_sets_[i], material_buffers_[i].handle(), sizeof(Material));
+            context().name(material_sets_[i], VK_OBJECT_TYPE_DESCRIPTOR_SET,
+                           kMaterials[i].name);
+        }
+    }
+```
+
+Naming each material set after its material is the debugging habit from 1.3, and it pays
+here: a validation message or a capture says "gold" rather than a handle.
+
 ## Layouts, once more
 
-The material block is 52 bytes: three `float4`s and a lone `float` at offset 48, which the
-disassembly confirms. The C++ struct pads it to 64:
+The C++ structs have to match the shader's, and this chapter has three of them. The light
+first:
+
+```cpp title="code/src/2.lighting/materials/main.cpp"
+struct Light {
+    glm::vec4 position;  // offset 0 within Light
+    glm::vec4 ambient;   // 16
+    glm::vec4 diffuse;   // 32
+    glm::vec4 specular;  // 48
+};
+
+struct Globals {
+    glm::mat4 view;           // offset 0
+    glm::mat4 projection;     // offset 64
+    glm::vec4 view_position;  // offset 128
+    Light light;              // offset 144
+};
+static_assert(offsetof(Globals, light) == 144);
+static_assert(sizeof(Globals) == 208);
+```
+
+`Light` is nested inside `Globals`, and lands at offset 144 with no padding at all, because
+every member is a `float4`. Members largest-first, `float4` over `float3`: the habits from
+1.10 keep paying. 144 + 64 = 208.
+
+The material block is 52 bytes in the shader: three `float4`s and a lone `float` at offset
+48, which the disassembly confirms. The C++ struct pads it to 64:
 
 ```cpp title="code/src/2.lighting/materials/main.cpp"
 struct Material {
@@ -197,6 +455,7 @@ struct Material {
     float shininess;     // offset 48
     float padding[3];
 };
+static_assert(offsetof(Material, shininess) == 48);
 static_assert(sizeof(Material) == 64);
 ```
 
@@ -204,9 +463,152 @@ The shader would accept 52. The padding is there because `std140` rounds a *nest
 up to a multiple of 16, so a later chapter that puts an array of these in one buffer needs
 the 64-byte version — and it costs nothing to have it right from the start.
 
-`Light` is nested inside `Globals`, and lands at offset 144 with no padding at all, because
-every member is a `float4`. Members largest-first, `float4` over `float3`: the habits from
-1.10 keep paying.
+And the push constants shrink:
+
+```cpp title="code/src/2.lighting/materials/main.cpp"
+struct PushConstants {
+    glm::mat4 model;                         // offset 0
+    std::array<glm::vec4, 3> normal_matrix;  // offset 64
+};
+static_assert(offsetof(PushConstants, normal_matrix) == 64);
+static_assert(sizeof(PushConstants) == 112);
+```
+
+112 bytes, with 16 to spare again. 2.2 had none.
+
+## The five materials
+
+```cpp title="code/src/2.lighting/materials/main.cpp"
+struct NamedMaterial {
+    const char* name;
+    Material material;
+};
+
+constexpr std::array<NamedMaterial, 5> kMaterials{{
+    {"emerald",
+     {{0.0215F, 0.1745F, 0.0215F, 1}, {0.07568F, 0.61424F, 0.07568F, 1},
+      {0.633F, 0.727811F, 0.633F, 1}, 76.8F, {}}},
+    {"gold",
+     {{0.24725F, 0.1995F, 0.0745F, 1}, {0.75164F, 0.60648F, 0.22648F, 1},
+      {0.628281F, 0.555802F, 0.366065F, 1}, 51.2F, {}}},
+    {"ruby",
+     {{0.1745F, 0.01175F, 0.01175F, 1}, {0.61424F, 0.04136F, 0.04136F, 1},
+      {0.727811F, 0.626959F, 0.626959F, 1}, 76.8F, {}}},
+    {"obsidian",
+     {{0.05375F, 0.05F, 0.06625F, 1}, {0.18275F, 0.17F, 0.22525F, 1},
+      {0.332741F, 0.328634F, 0.346435F, 1}, 38.4F, {}}},
+    {"cyan plastic",
+     {{0.0F, 0.1F, 0.06F, 1}, {0.0F, 0.50980392F, 0.50980392F, 1},
+      {0.50196078F, 0.50196078F, 0.50196078F, 1}, 32.0F, {}}},
+}};
+```
+
+These come from a classic table in McReynolds and Blythe's *Advanced Graphics Programming
+Using OpenGL* (2005), with shininess scaled from 0..1 to an exponent. The final `{}` in each
+is the padding array, zeroed.
+
+Read down the specular column and the physics shows through. Gold's is `(0.63, 0.56, 0.37)`
+— warm, tinted, because a metal's highlight takes the metal's colour. Cyan plastic's is
+`(0.50, 0.50, 0.50)`, perfectly neutral, because a dielectric reflects the light's own
+colour regardless of what pigment sits underneath. That single difference is most of what
+makes one read as metal and the other as plastic.
+
+```cpp title="code/src/2.lighting/materials/main.cpp"
+constexpr glm::vec4 kLightAmbient{1.0F, 1.0F, 1.0F, 1.0F};
+constexpr glm::vec4 kLightDiffuse{1.0F, 1.0F, 1.0F, 1.0F};
+constexpr glm::vec4 kLightSpecular{1.0F, 1.0F, 1.0F, 1.0F};
+
+constexpr float kCubeSpacing = 1.6F;
+
+constexpr float kLightOrbitRadius = 3.0F;
+constexpr float kLightHeight = 2.0F;
+```
+
+The light is white at full strength in all three components, which is what the material
+table assumes. The lamp's orbit is wider and higher than 2.2's, because the scene is now
+five cubes across.
+
+## The rest of the sample
+
+```cpp title="code/src/2.lighting/materials/main.cpp"
+class MaterialsApp : public vkc::App {
+```
+
+`on_start` gains one call and moves the camera back to take in the row:
+
+```cpp title="code/src/2.lighting/materials/main.cpp"
+        create_material_buffers();
+```
+
+```cpp title="code/src/2.lighting/materials/main.cpp"
+        camera_.position = {0.0F, 1.2F, 7.0F};
+        camera_.pitch = -8.0F;
+```
+
+`on_shutdown` destroys two set layouts instead of one, and the material buffers alongside
+the per-frame ones:
+
+```cpp title="code/src/2.lighting/materials/main.cpp"
+        vkDestroyDescriptorSetLayout(device, material_set_layout_, nullptr);
+        vkDestroyDescriptorSetLayout(device, frame_set_layout_, nullptr);
+
+        for (vkc::Buffer& buffer : material_buffers_) {
+            buffer.destroy();
+        }
+```
+
+`update_globals` fills the nested light instead of two loose fields:
+
+```cpp title="code/src/2.lighting/materials/main.cpp"
+            .light =
+                {
+                    .position = glm::vec4(light_position, 1.0F),
+                    .ambient = kLightAmbient,
+                    .diffuse = kLightDiffuse,
+                    .specular = kLightSpecular,
+                },
+```
+
+The pipeline layout takes both set layouts and the narrowed push constant range:
+
+```cpp title="code/src/2.lighting/materials/main.cpp"
+            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+```
+
+```cpp title="code/src/2.lighting/materials/main.cpp"
+            .setLayoutCount = static_cast<uint32_t>(set_layouts.size()),
+            .pSetLayouts = set_layouts.data(),
+```
+
+```cpp title="code/src/2.lighting/materials/main.cpp"
+            vkc::load_shader(device, LVK_CHAPTER_ID, "materials.slang");
+```
+
+The members grow by a set of material buffers, a set of material sets and a second layout:
+
+```cpp title="code/src/2.lighting/materials/main.cpp"
+    std::array<VkDescriptorSet, vkc::kFramesInFlight> frame_sets_{};
+
+    std::array<vkc::Buffer, kMaterials.size()> material_buffers_;
+    std::array<VkDescriptorSet, kMaterials.size()> material_sets_{};
+
+    VkDescriptorSetLayout frame_set_layout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout material_set_layout_ = VK_NULL_HANDLE;
+```
+
+```cpp title="code/src/2.lighting/materials/main.cpp"
+        options.title = "LearnVulkan 2.3 - Materials";
+        MaterialsApp app(vkc::App::parse_args(argc, argv, options));
+```
+
+### The build file
+
+```cmake title="code/src/2.lighting/materials/CMakeLists.txt"
+add_chapter(2.3.materials
+    SOURCES main.cpp
+    SHADERS materials.slang
+)
+```
 
 ## What changed since 2.2
 
@@ -224,6 +626,17 @@ every member is a `float4`. Members largest-first, `float4` over `float3`: the h
 
 Fly close to each cube and watch the highlights. The emerald's and ruby's are tight; the
 obsidian's is broad and dim; the gold's is warm where the plastic's is neutral grey.
+
+## Words introduced in this chapter
+
+| | |
+|---|---|
+| **material** | a surface's response to light as data — ambient, diffuse and specular colours plus a shininess |
+| **data lifetime** | how often a piece of data changes; the property that decides whether it belongs in a set, a second set, or push constants |
+| **per-material data** | data that changes once per material rather than per frame or per object; set 1 from here on |
+| **pipeline layout compatibility** | the rule deciding whether bound sets survive a pipeline switch: identical set layouts 0..N *and* identical push constant ranges |
+| **pool size** | how many descriptors of each type a pool holds, counted across every set it will hand out — distinct from `maxSets` |
+| **shader stage flags** | `VkShaderStageFlags`, a bitmask of stages; the `*Flags` type is a set, the `*FlagBits` enum is one member of it |
 
 ## Exercises
 
@@ -247,3 +660,6 @@ obsidian's is broad and dim; the gold's is warm where the plastic's is neutral g
    again. Then look at the render loop: which call now has to happen per material, which
    once per frame, and why is the original order — rarest-changing data in the lowest set —
    the one to keep?
+6. Set the pool's `maxSets` to 7 but its descriptor count to 6. Allocation fails at the last
+   material with `VK_ERROR_OUT_OF_POOL_MEMORY`, and the two numbers being different is the
+   whole lesson: one counts sets, the other counts descriptors inside them.

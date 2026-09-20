@@ -1,6 +1,6 @@
 ---
 title: Multiple Lights
-description: Six lights of three kinds in one array, summed in a loop - and the specialisation constant swapping jobs, from the kind of light to how many there are.
+description: Six lights of three kinds in one array, summed in a loop - superposition, array stride, and the specialisation constant swapping jobs from the kind of light to how many there are.
 sidebar:
   order: 6
 ---
@@ -23,10 +23,23 @@ constant is for.
 
 Start with the physics, because it is unusually kind here. Two lights shining on a surface
 deliver the sum of what each delivers alone. There is no interaction term, no blending
-mode, no order dependence. Photons from the sun and photons from a torch arrive
-independently and the surface reflects both.
+mode, no order dependence.
 
-So "multiple lights" is a loop and a `+=`:
+The principle has a name — **superposition** — and it holds because light at the
+intensities we care about does not interact with itself. Two beams crossing pass straight
+through each other; photons from the sun and photons from a torch arrive independently, and
+the surface reflects both according to the same rule. So the total is a plain sum:
+
+```
+   reflected(fragment) = Σ  contribution(light i, fragment)
+                        i
+```
+
+Nothing in that sum depends on the order, and nothing couples one term to another. This is
+what makes **light accumulation** a `+=` rather than a blend equation, and it is the entire
+reason this chapter is short.
+
+So "multiple lights" is a loop:
 
 ```slang title="code/src/2.lighting/multiple_lights/multiple_lights.slang"
 float3 colour = float3(0.0);
@@ -47,9 +60,19 @@ for (int i = 0; i < kLightCount; ++i) {
 }
 ```
 
+```slang title="code/src/2.lighting/multiple_lights/multiple_lights.slang"
+    return float4(colour, 1.0);
+```
+
 That is the whole idea. Everything else in this chapter is about getting six lights into
 the shader in the first place, and about the two things that stop being free once you have
 more than one.
+
+:::note[Where superposition stops]
+The sum is exact for the light *arriving*. It stops being exact once the sum exceeds what
+the display can show — six lights can easily push a channel past 1.0, and clamping is not
+a physical operation. That is chapter 5.2's subject, and it is why an HDR pipeline exists.
+:::
 
 ## One struct, one array, one `type`
 
@@ -58,10 +81,22 @@ promised that this was what would let them share an array. Here is the payoff �
 gains exactly one field:
 
 ```slang title="code/src/2.lighting/multiple_lights/multiple_lights.slang"
+struct Light {
+    float4 position;
+    float4 direction;
+    float4 ambient;
+    float4 diffuse;
+    float4 specular;
+
+    float constant_term;
+    float linear_term;
+    float quadratic_term;
+
     float inner_cutoff;
     float outer_cutoff;
 
     int type;  // 0 directional, 1 point, 2 spot
+};
 ```
 
 That field is free. 2.5's five trailing floats packed from offset 80 in steps of four and
@@ -69,14 +104,33 @@ left the block at 100 bytes, which std140 then rounded up to 112. `type` lands a
 100, inside padding that was already being paid for:
 
 ```cpp title="code/src/2.lighting/multiple_lights/main.cpp"
+struct Light {
+    glm::vec4 position;    // 0
+    glm::vec4 direction;   // 16
+    glm::vec4 ambient;     // 32
+    glm::vec4 diffuse;     // 48
+    glm::vec4 specular;    // 64
+    float constant_term;   // 80
+    float linear_term;     // 84
+    float quadratic_term;  // 88
+    float inner_cutoff;    // 92, a cosine
+    float outer_cutoff;    // 96, a cosine
+    int32_t type;          // 100
+    float padding[2];      // 104
+};
 static_assert(offsetof(Light, type) == 100);
 static_assert(sizeof(Light) == 112);
 ```
 
-The array inherits that 112-byte stride, which is worth checking rather than assuming —
-disassembling the SPIR-V shows `OpDecorate %_arr_Light ArrayStride 112`, matching the C++
-array exactly. A struct that can describe three kinds of light costs the same as one that
-could describe a single kind.
+An `int32_t` is four bytes and aligns to four, so it slots in at 100 exactly where the
+third padding float used to sit. 2.5 had `float padding[3]`; this has `float padding[2]`
+and a `type`. Same 112 bytes.
+
+The array inherits that 112-byte stride. **Array stride** is the byte distance from one
+element to the next, and it is worth checking rather than assuming — disassembling the
+SPIR-V shows `OpDecorate %_arr_Light ArrayStride 112`, matching the C++ array exactly. Had
+the struct been 100 bytes with no padding, std140 would still have used a stride of 112,
+and a C++ array of 100-byte structs would have desynchronised from element one onward.
 
 The array itself has a fixed length:
 
@@ -91,10 +145,27 @@ struct Globals {
 };
 ```
 
+```cpp title="code/src/2.lighting/multiple_lights/main.cpp"
+constexpr size_t kMaxLights = 8;
+
+struct Globals {
+    glm::mat4 view;                        // 0
+    glm::mat4 projection;                  // 64
+    glm::vec4 view_position;               // 128
+    std::array<Light, kMaxLights> lights;  // 144
+};
+static_assert(offsetof(Globals, lights) == 144);
+static_assert(sizeof(Globals) == 144 + kMaxLights * sizeof(Light));
+```
+
 A uniform block cannot have a run-time length, and — less obviously — it cannot be sized by
 a specialisation constant either, because the block's layout has to be settled when the
 block is declared. So the array is sized for the worst case the program will ever ask for,
 and something else decides how much of it is real.
+
+The two `kMaxLights` must agree, and nothing checks that for you. The final `static_assert`
+is the nearest thing to a check: it states the size in terms of the count and the stride,
+so if either changes on the C++ side the arithmetic has to be redone deliberately.
 
 ## The specialisation constant changes jobs
 
@@ -106,6 +177,20 @@ and constant 0 takes the other job:
 ```slang title="code/src/2.lighting/multiple_lights/multiple_lights.slang"
 [[vk::constant_id(0)]] const int kLightCount = 6;
 ```
+
+The C++ side computes the same number from the scene rather than writing `6` twice:
+
+```cpp title="code/src/2.lighting/multiple_lights/main.cpp"
+constexpr int32_t kLightCount = 1 + static_cast<int32_t>(kPointLights.size()) + 1;
+static_assert(kLightCount <= static_cast<int32_t>(kMaxLights));
+```
+
+```cpp title="code/src/2.lighting/multiple_lights/main.cpp"
+    int32_t light_count = kLightCount;
+```
+
+One sun, four bulbs, one torch. The `static_assert` is the guard that matters: add a fifth
+bulb without raising `kMaxLights` and it is a build error rather than an array overrun.
 
 This is a better fit than it might look. The loop bound is fixed when the pipeline is
 created, so the loop has a constant trip count and the compiler is free to unroll it
@@ -156,7 +241,7 @@ floor, the floors add up, and the scene washes out to flat grey — six times th
 everywhere, regardless of where any of the lights actually are. So ambient moves inside:
 
 ```slang title="code/src/2.lighting/multiple_lights/multiple_lights.slang"
-return intensity * (ambient + diffuse + specular);
+    return intensity * (ambient + diffuse + specular);
 ```
 
 The scene-wide fill job then falls to the one light whose intensity is always exactly 1.0 —
@@ -176,8 +261,28 @@ Instead the terms live in one function, and the three kinds differ only in the t
 they feed it — the direction the light arrives from, and how much of it arrives:
 
 ```slang title="code/src/2.lighting/multiple_lights/multiple_lights.slang"
-float3 shade(Light light, Surface surface, float3 to_light, float intensity) { ... }
+float3 shade(Light light, Surface surface, float3 to_light, float intensity) {
+    float3 ambient = light.ambient.rgb * surface.albedo;
 
+    float diffuse_amount = max(dot(surface.normal, to_light), 0.0);
+    float3 diffuse = light.diffuse.rgb * diffuse_amount * surface.albedo;
+
+    float3 reflected = reflect(-to_light, surface.normal);
+    float specular_amount = pow(max(dot(surface.to_eye, reflected), 0.0), material.shininess);
+    float3 specular = light.specular.rgb * specular_amount * surface.shine;
+```
+
+Line for line, that is 2.4's fragment shader, with `surface.` in front of the values it
+used to compute inline.
+
+```slang title="code/src/2.lighting/multiple_lights/multiple_lights.slang"
+float attenuation_of(Light light, float distance) {
+    return 1.0 / (light.constant_term + light.linear_term * distance +
+                  light.quadratic_term * distance * distance);
+}
+```
+
+```slang title="code/src/2.lighting/multiple_lights/multiple_lights.slang"
 float3 directional_contribution(Light light, Surface surface) {
     return shade(light, surface, normalize(-light.direction.xyz), 1.0);
 }
@@ -188,6 +293,24 @@ float3 point_contribution(Light light, Surface surface) {
     return shade(light, surface, offset / distance, attenuation_of(light, distance));
 }
 ```
+
+```slang title="code/src/2.lighting/multiple_lights/multiple_lights.slang"
+float3 spot_contribution(Light light, Surface surface) {
+```
+
+```slang title="code/src/2.lighting/multiple_lights/multiple_lights.slang"
+    float3 to_light = offset / distance;
+```
+
+```slang title="code/src/2.lighting/multiple_lights/multiple_lights.slang"
+    float cone = saturate((theta - light.outer_cutoff) /
+                          (light.inner_cutoff - light.outer_cutoff));
+
+    return shade(light, surface, to_light, attenuation_of(light, distance) * cone);
+```
+
+The directional light passes `1.0` where the others pass an attenuation — that single
+argument is the whole difference between a sun and a bulb.
 
 `Surface` bundles what the fragment knows about itself — world position, normal, view
 direction, and the two texture samples — so it is gathered once instead of six times:
@@ -202,9 +325,248 @@ struct Surface {
 };
 ```
 
+```slang title="code/src/2.lighting/multiple_lights/multiple_lights.slang"
+    Surface surface;
+    surface.world_position = input.world_position;
+    surface.normal = normalize(input.normal);
+    surface.to_eye = normalize(globals.view_position.xyz - input.world_position);
+    surface.albedo = diffuse_map.Sample(input.uv).rgb;
+    surface.shine = specular_map.Sample(input.uv).rgb;
+```
+
 Those two texture samples are the reason this matters. Sampling is expensive; sampling the
 same two textures once per light would be six times the memory traffic for identical
-results.
+results. It also keeps both `Sample` calls outside the loop and outside any branch, which
+is 1.11's derivative rule still being obeyed.
+
+## The lamps get their own colour
+
+Each bulb is marked by a cube in that bulb's colour, so the push block gains a colour and
+is read by both stages again:
+
+```slang title="code/src/2.lighting/multiple_lights/multiple_lights.slang"
+struct PushConstants {
+    float4x4 model;
+    float3x3 normal_matrix;
+    float4 colour;
+};
+```
+
+```slang title="code/src/2.lighting/multiple_lights/multiple_lights.slang"
+    return push.colour;
+```
+
+```cpp title="code/src/2.lighting/multiple_lights/main.cpp"
+struct PushConstants {
+    glm::mat4 model;                         // 0
+    std::array<glm::vec4, 3> normal_matrix;  // 64
+    glm::vec4 colour;                        // 112
+};
+static_assert(offsetof(PushConstants, colour) == 112);
+static_assert(sizeof(PushConstants) == 128);
+```
+
+Exactly 128 bytes again — the whole of the guaranteed range, as in 2.2.
+
+```cpp title="code/src/2.lighting/multiple_lights/main.cpp"
+    void draw_cube(VkCommandBuffer cmd, const glm::mat4& model, const glm::vec4& colour) {
+```
+
+```cpp title="code/src/2.lighting/multiple_lights/main.cpp"
+            .colour = colour,
+```
+
+```cpp title="code/src/2.lighting/multiple_lights/main.cpp"
+        vkCmdPushConstants(cmd, pipeline_layout_,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+```
+
+```cpp title="code/src/2.lighting/multiple_lights/main.cpp"
+            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+```
+
+The range's stage flags have to cover every stage that reads any part of the block, so
+adding one field the fragment stage reads widens the range — and, by 2.3's compatibility
+rule, changes the pipeline layout's identity.
+
+The crates pass white and the lamps pass their own colour:
+
+```cpp title="code/src/2.lighting/multiple_lights/main.cpp"
+            draw_cube(frame.cmd, model, glm::vec4(1.0F));
+```
+
+```cpp title="code/src/2.lighting/multiple_lights/main.cpp"
+        for (const PointLight& light : kPointLights) {
+            const glm::mat4 model = glm::scale(
+                glm::translate(glm::mat4(1.0F), light.position), glm::vec3(0.12F));
+            draw_cube(frame.cmd, model, glm::vec4(light.colour, 1.0F));
+        }
+```
+
+The lamp pipeline is now built explicitly rather than through 2.5's lambda, since that
+lambda no longer exists:
+
+```cpp title="code/src/2.lighting/multiple_lights/main.cpp"
+        lamp_pipeline_ =
+```
+
+```cpp title="code/src/2.lighting/multiple_lights/main.cpp"
+                .shaders(shader, "vertexMain", "lampFragmentMain")
+```
+
+```cpp title="code/src/2.lighting/multiple_lights/main.cpp"
+            vkc::load_shader(device, LVK_CHAPTER_ID, "multiple_lights.slang");
+```
+
+```cpp title="code/src/2.lighting/multiple_lights/main.cpp"
+                .offset = offsetof(ShaderConstants, light_count),
+                .size = sizeof(ShaderConstants::light_count),
+```
+
+## Building six lights every frame
+
+One function per kind, each filling in only the fields that kind uses and leaving the rest
+at zero:
+
+```cpp title="code/src/2.lighting/multiple_lights/main.cpp"
+    [[nodiscard]] static Light make_directional() {
+        return Light{
+            .position = {},
+            .direction = glm::vec4(glm::normalize(kSunDirection), 0.0F),
+            .ambient = glm::vec4(kSunColour * 0.22F, 1.0F),
+            .diffuse = glm::vec4(kSunColour, 1.0F),
+            .specular = glm::vec4(kSunColour * 1.3F, 1.0F),
+            .constant_term = 0.0F,
+            .linear_term = 0.0F,
+            .quadratic_term = 0.0F,
+            .inner_cutoff = 0.0F,
+            .outer_cutoff = 0.0F,
+            .type = static_cast<int32_t>(LightType::directional),
+            .padding = {},
+        };
+    }
+```
+
+The sun's attenuation terms are all zero, and that is safe only because
+`directional_contribution` never calls `attenuation_of` — it passes `1.0` directly. A zero
+`constant_term` reaching that function would be a division by zero, which exercise 1 turns
+into a real bug on purpose.
+
+```cpp title="code/src/2.lighting/multiple_lights/main.cpp"
+    [[nodiscard]] static Light make_point(const PointLight& bulb) {
+        return Light{
+            .position = glm::vec4(bulb.position, 1.0F),
+            .direction = {},
+            .ambient = glm::vec4(bulb.colour * 0.04F, 1.0F),
+            .diffuse = glm::vec4(bulb.colour * kBulbStrength, 1.0F),
+            .specular = glm::vec4(bulb.colour * kBulbStrength, 1.0F),
+            .constant_term = kConstant,
+            .linear_term = kLinear,
+            .quadratic_term = kQuadratic,
+            .inner_cutoff = 0.0F,
+            .outer_cutoff = 0.0F,
+            .type = static_cast<int32_t>(LightType::point),
+            .padding = {},
+        };
+    }
+```
+
+A bulb's ambient is scaled right down to `0.04`: four of them add up, and each is already
+carrying a diffuse term at full colour.
+
+```cpp title="code/src/2.lighting/multiple_lights/main.cpp"
+    [[nodiscard]] Light make_spot() const {
+        return Light{
+            .position = glm::vec4(camera_.position, 1.0F),
+            .direction = glm::vec4(camera_.front(), 0.0F),
+            .ambient = {},
+            .diffuse = glm::vec4(kTorchColour, 1.0F),
+            .specular = glm::vec4(1.0F),
+            .constant_term = kConstant,
+            .linear_term = kLinear,
+            .quadratic_term = kQuadratic,
+            .inner_cutoff = std::cos(glm::radians(kInnerCutoffDegrees)),
+            .outer_cutoff = std::cos(glm::radians(kOuterCutoffDegrees)),
+            .type = static_cast<int32_t>(LightType::spot),
+            .padding = {},
+        };
+    }
+```
+
+```cpp title="code/src/2.lighting/multiple_lights/main.cpp"
+    [[nodiscard]] std::array<Light, kMaxLights> make_lights() const {
+        std::array<Light, kMaxLights> lights{};
+        size_t next = 0;
+        lights[next++] = make_directional();
+        for (const PointLight& bulb : kPointLights) {
+            lights[next++] = make_point(bulb);
+        }
+        lights[next++] = make_spot();
+        return lights;
+    }
+```
+
+```cpp title="code/src/2.lighting/multiple_lights/main.cpp"
+            .lights = make_lights(),
+```
+
+`std::array<Light, kMaxLights> lights{}` zero-initialises all eight, so the two entries
+past `kLightCount` are zeroed rather than uninitialised. The shader never reads them — and
+exercise 1 explores what happens when it does.
+
+The order the lights go into the array does not matter, because addition commutes. Keeping
+it fixed just makes the shader easier to reason about when something looks wrong.
+
+## The scene
+
+```cpp title="code/src/2.lighting/multiple_lights/main.cpp"
+constexpr glm::vec3 kSunColour{0.24F, 0.26F, 0.30F};
+```
+
+```cpp title="code/src/2.lighting/multiple_lights/main.cpp"
+struct PointLight {
+    glm::vec3 position;
+    glm::vec3 colour;
+};
+```
+
+```cpp title="code/src/2.lighting/multiple_lights/main.cpp"
+constexpr float kBulbStrength = 2.2F;
+
+constexpr std::array<PointLight, 4> kPointLights{{
+    {{1.6F, 1.2F, -1.5F}, {1.00F, 0.55F, 0.18F}},    // warm
+    {{-2.6F, 0.4F, -3.4F}, {0.16F, 0.75F, 0.95F}},   // cyan
+    {{2.6F, -1.2F, -6.0F}, {0.25F, 0.90F, 0.35F}},   // green
+    {{-1.0F, 2.0F, -7.5F}, {0.85F, 0.25F, 0.80F}},   // magenta
+}};
+
+constexpr glm::vec3 kTorchColour{0.55F, 0.55F, 0.52F};
+```
+
+The sun is cool and dim — blue-ish, and under a third strength — so that the coloured bulbs
+have somewhere to show. `kBulbStrength` exists because the bulb colours are hues normalised
+so their brightest channel is 1.0; without the multiplier, a bulb four units from a crate
+lands at about a third of that, which the sun and the torch simply drown out. The torch is
+dimmer than 2.5's for the same reason: there it was the only light, here its white erases
+the bulbs wherever it points.
+
+```cpp title="code/src/2.lighting/multiple_lights/main.cpp"
+class MultipleLightsApp : public vkc::App {
+```
+
+### The build file
+
+```cmake title="code/src/2.lighting/multiple_lights/CMakeLists.txt"
+add_chapter(2.6.multiple_lights
+    SOURCES main.cpp
+    SHADERS multiple_lights.slang
+)
+```
+
+```cpp title="code/src/2.lighting/multiple_lights/main.cpp"
+        options.title = "LearnVulkan 2.6 - Multiple Lights";
+        MultipleLightsApp app(vkc::App::parse_args(argc, argv, options));
+```
 
 ## What it costs
 
@@ -251,6 +613,15 @@ Fly through the cluster and watch the coloured pools slide across the crates as 
 changes. Point the torch away from a crate and you can see exactly which bulb was lighting
 it.
 
+## Words introduced in this chapter
+
+| | |
+|---|---|
+| **superposition** | light does not interact with light, so what several sources deliver is the plain sum of what each delivers alone |
+| **additive light** | the consequence in code: combining lights is `+=`, with no blend mode and no order dependence |
+| **light accumulation** | summing every light's contribution into one colour per fragment, which is the whole of this chapter's loop |
+| **array stride** | the byte distance from one array element to the next — 112 here, decided by std140 and not by `sizeof` |
+
 ## Exercises
 
 1. Change `light_count` in `ShaderConstants` to 1, then 5, and rebuild each time — you have
@@ -278,3 +649,5 @@ it.
 5. Add a second spotlight, fixed in the world rather than held by the camera, pointing at
    the central crate. It needs one more array entry and one more line in `make_lights()` —
    and nothing at all in the shader. That is the point of the array.
+6. Reorder `make_lights()` so the torch goes in first and the sun last. The image is
+   identical, because addition commutes — superposition in one experiment.

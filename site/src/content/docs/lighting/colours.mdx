@@ -1,6 +1,6 @@
 ---
 title: Colours
-description: What a colour physically means, why lighting is a multiply, and the first sample with two pipelines.
+description: What a colour physically means, why lighting is a multiply, and the first sample with two pipelines built from one shader module - written out in full.
 sidebar:
   order: 1
 ---
@@ -24,11 +24,23 @@ reflects the rest. What reaches your eye is what is left.
 
 That is the whole model, and it gives you the arithmetic immediately. Call the light's
 colour a triple of how much red, green and blue it emits, and the object's colour a
-triple of what **fraction** of each it reflects. Then the result is the two multiplied
-component by component:
+triple of what **fraction** of each it reflects. That fraction is the surface's
+**reflectance**, and it is the quantity every chapter in this part is really about.
+Then the result is the two multiplied component by component:
 
 ```
 result = light ⊗ object
+```
+
+The symbol `⊗` here means **component-wise multiply**: red times red, green times green,
+blue times blue, each channel independent of the others. It is not a dot product, which
+would collapse three numbers into one and throw the colour away. Written out, it is
+just:
+
+```
+result.r = light.r × object.r
+result.g = light.g × object.g
+result.b = light.b × object.b
 ```
 
 Coral is `(1.0, 0.5, 0.31)`: it reflects all the red that falls on it, half the green,
@@ -37,7 +49,89 @@ green light `(0.0, 1.0, 0.0)` the red and blue terms multiply by zero and it loo
 green — because a surface cannot reflect a wavelength that never arrived.
 
 This is why the multiply is the right operation and addition is not. An object's colour
-is not something it *has*, it is something it **does to light**.
+is not something it *has*, it is something it **does to light**. Addition would let a
+surface emit light it never received: add `(0, 1, 0)` to coral and you get something
+brighter than either the light or the surface, which is a lamp, not a crate.
+
+Both numbers live in `[0, 1]`, so their product does too — a surface can never reflect
+more light than arrives. That property is what makes the multiply safe, and it is the
+first thing to break when Part 2 reaches six lights and starts adding their
+contributions together.
+
+## The whole shader
+
+This chapter's shading model is one line, so the entire shader fits comfortably in one
+piece and is worth reading before anything else. Three entry points, one file:
+
+```slang title="code/src/2.lighting/colours/colours.slang"
+struct VSInput {
+    [[vk::location(0)]] float3 position;
+};
+
+struct VSOutput {
+    float4 position : SV_Position;
+};
+```
+
+A position in, a clip-space position out, and nothing else. 1.14's vertex carried a
+texture coordinate; there is no texture here, so it is gone. The `normal` that 2.2 needs
+is not here yet — adding it is most of what the next chapter does.
+
+### Per-frame data, and a convention that lasts
+
+```slang title="code/src/2.lighting/colours/colours.slang"
+struct Globals {
+    float4x4 view;
+    float4x4 projection;
+
+    // The colour of the light. White here, and changing it is the first exercise.
+    float4 light_colour;
+};
+[[vk::binding(0, 0)]] ConstantBuffer<Globals> globals;
+```
+
+This is the chapter to fix a convention, because Part 2 is about to need it.
+
+**Set 0 is per-frame data**: data that is identical for every draw in the frame and is
+written once at the top of it. The camera's two matrices, and from 2.5 the lights.
+
+**Push constants are per-object data**: this chapter's model matrix and object colour.
+
+**Set 1 will be per-material data**, and that is chapter 2.3's subject.
+
+The reason to split them is lifetime. The camera changes once per frame; a material
+changes once per object; rebinding the cheap one should not mean rewriting the expensive
+one. Vulkan rewards this directly — binding set 1 does not disturb set 0, so you can
+bind the camera once and then walk the scene rebinding only materials.
+
+```slang title="code/src/2.lighting/colours/colours.slang"
+struct PushConstants {
+    float4x4 model;
+    float4 object_colour;
+};
+[[vk::push_constant]] PushConstants push;
+```
+
+### The three entry points
+
+The vertex stage is shared by both pipelines, because both objects are the same cube
+drawn from the same camera:
+
+```slang title="code/src/2.lighting/colours/colours.slang"
+[shader("vertex")]
+VSOutput vertexMain(VSInput input) {
+    VSOutput output;
+    float4 world = mul(push.model, float4(input.position, 1.0));
+    output.position = mul(globals.projection, mul(globals.view, world));
+    return output;
+}
+```
+
+Model, then view, then projection, exactly as 1.13 built it — and `mul(M, v)` rather
+than `M * v`, which is the rule from 1.9 that keeps Slang's matrix convention matching
+glm's.
+
+The lit object's fragment stage is this chapter's whole shading model:
 
 ```slang title="code/src/2.lighting/colours/colours.slang"
 [shader("fragment")]
@@ -47,48 +141,36 @@ float4 fragmentMain(VSOutput input) : SV_Target {
 }
 ```
 
-That is the entire shading model for this chapter. There is no normal, no direction, no
-distance — so every face of the cube comes out identical and the result reads as a flat
-silhouette rather than as a solid.
+One multiply. No normal, no direction, no distance — so every face of the cube comes out
+identical and the result reads as a flat silhouette rather than as a solid.
 
 **Look at the screenshot above and notice how wrong it is.** The cube is rotating, and
 the only thing that changes is its outline. That is worth sitting with for a moment,
 because chapter 2.2 adds one dot product and the whole thing snaps into three
 dimensions.
 
-## Two pipelines
-
-The scene has two objects: the coral cube, and a small white cube standing in for the
-lamp. The lamp is not lit by anything — it *is* the light — so it ignores the shading
-model and draws at the light's own colour.
-
-Two different fragment shaders, then. In OpenGL that would be a second shader program
-and a `glUseProgram` between the draws. In Vulkan it is a second `VkPipeline`, which
-this chapter builds in the cheapest possible way:
+The lamp's fragment stage ignores the model entirely:
 
 ```slang title="code/src/2.lighting/colours/colours.slang"
-[shader("vertex")]   VSOutput vertexMain(VSInput input)         { ... }
-[shader("fragment")] float4 fragmentMain(VSOutput input)        : SV_Target { ... }
-[shader("fragment")] float4 lampFragmentMain(VSOutput input)    : SV_Target { ... }
+[shader("fragment")]
+float4 lampFragmentMain(VSOutput input) : SV_Target {
+    return float4(globals.light_colour.rgb, 1.0);
+}
 ```
 
-Three entry points, one file, one SPIR-V module — and the vertex stage is genuinely
-shared rather than duplicated. Both pipelines come from that one module, differing only
-in which fragment entry point they name:
+A light source is not lit by anything — it *is* the thing doing the lighting — so it
+draws at the light's own colour. It exists to make the light's position visible; without
+it you are guessing where the illumination comes from.
 
-```cpp title="code/src/2.lighting/colours/main.cpp"
-const auto build = [&](const char* fragment_entry) {
-    return vkc::PipelineBuilder(device)
-        .shaders(shader, "vertexMain", fragment_entry)
-        // ... everything else identical
-        .build();
-};
+## Two pipelines from one module
 
-object_pipeline_ = build("fragmentMain");
-lamp_pipeline_ = build("lampFragmentMain");
-```
+Two different fragment shaders means two pipelines. In OpenGL that would be a second
+shader program and a `glUseProgram` between the draws. In Vulkan a **pipeline variant**
+is a whole second `VkPipeline` object — every piece of state baked together — and this
+chapter builds one in the cheapest possible way: same module, same vertex entry point,
+different fragment entry point.
 
-This is `pName` from chapter 1.7 finally doing something. It is also the clearest
+That is `pName` from chapter 1.7 finally doing something. It is also the clearest
 possible statement of what a `VkPipeline` *is*: a compiled combination of state. Change
 one thing in the combination and you have a different object, chosen at draw time with
 one `vkCmdBindPipeline`.
@@ -103,71 +185,588 @@ Binding a pipeline, by contrast, is cheap. Sorting your draws so you bind each p
 once rather than switching back and forth is one of the easiest wins in a renderer.
 :::
 
-## Set 0 means per-frame, from now on
+## The sample, from the top
 
-This is the chapter to fix a convention, because Part 2 is about to need it.
+The C++ side is 1.14's with a lamp added and rather more taken away. Start with what it
+includes:
 
-```slang title="code/src/2.lighting/colours/colours.slang"
-struct Globals {
-    float4x4 view;
-    float4x4 projection;
-    float4 light_colour;
-};
-[[vk::binding(0, 0)]] ConstantBuffer<Globals> globals;
+```cpp title="code/src/2.lighting/colours/main.cpp"
+#include <vkc/app.hpp>
+#include <vkc/buffer.hpp>
+#include <vkc/camera.hpp>
+#include <vkc/check.hpp>
+#include <vkc/image.hpp>
+#include <vkc/pipeline.hpp>
+
+#include <SDL3/SDL.h>
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <spdlog/spdlog.h>
+
+#include <array>
+#include <cstddef>
+#include <cstdlib>
+#include <cstring>
+#include <exception>
+#include <span>
+#include <stdexcept>
 ```
 
-**Set 0 is per-frame data**: the camera, and from 2.5 the lights. It is written once at
-the top of the frame and bound once.
+`<vkc/camera.hpp>` is the new one. Chapter 1.14 wrote the camera out by hand and ended
+by showing the finished `vkc::Camera`; this is the first chapter that simply uses it.
 
-**Push constants are per-object data**: this chapter's model matrix and object colour,
-80 of the 128 guaranteed bytes.
+### The vertex and the cube
 
-**Set 1 will be per-material data**, and that is chapter 2.3's subject.
+```cpp title="code/src/2.lighting/colours/main.cpp"
+namespace {
 
-The reason to split them is lifetime. The camera changes once per frame; a material
-changes once per object; rebinding the cheap one should not mean rewriting the expensive
-one. Vulkan rewards this directly — binding set 1 does not disturb set 0, so you can
-bind the camera once and then walk the scene rebinding only materials.
+struct Vertex {
+    glm::vec3 position;
+};
+```
+
+Position only. The texture coordinate 1.14 carried is gone with the texture.
+
+```cpp title="code/src/2.lighting/colours/main.cpp"
+constexpr float kH = 0.5F;
+constexpr std::array<Vertex, 24> kVertices{{
+    // front (+z)
+    {{-kH, -kH, kH}}, {{kH, -kH, kH}}, {{kH, kH, kH}}, {{-kH, kH, kH}},
+    // back (-z)
+    {{kH, -kH, -kH}}, {{-kH, -kH, -kH}}, {{-kH, kH, -kH}}, {{kH, kH, -kH}},
+    // left (-x)
+    {{-kH, -kH, -kH}}, {{-kH, -kH, kH}}, {{-kH, kH, kH}}, {{-kH, kH, -kH}},
+    // right (+x)
+    {{kH, -kH, kH}}, {{kH, -kH, -kH}}, {{kH, kH, -kH}}, {{kH, kH, kH}},
+    // top (+y)
+    {{-kH, kH, kH}}, {{kH, kH, kH}}, {{kH, kH, -kH}}, {{-kH, kH, -kH}},
+    // bottom (-y)
+    {{-kH, -kH, -kH}}, {{kH, -kH, -kH}}, {{kH, -kH, kH}}, {{-kH, -kH, kH}},
+}};
+
+constexpr std::array<uint16_t, 36> kIndices{
+    0,  1,  2,  2,  3,  0,   // front
+    4,  5,  6,  6,  7,  4,   // back
+    8,  9,  10, 10, 11, 8,   // left
+    12, 13, 14, 14, 15, 12,  // right
+    16, 17, 18, 18, 19, 16,  // top
+    20, 21, 22, 22, 23, 20,  // bottom
+};
+```
+
+`kH` is half the cube's edge, so the cube spans −0.5 to +0.5 and sits centred on the
+origin. Each face lists its four corners counter-clockwise when seen from outside, which
+is what `VK_FRONT_FACE_COUNTER_CLOCKWISE` in the pipeline will expect, and each face's
+six indices make two triangles from those four corners.
+
+The cube is still **24 vertices rather than 8**, even though nothing now needs per-face
+data. With no uv and no normal a cube really could be 8 vertices and 36 indices. It goes
+back to 24 in the very next chapter when each face needs its own normal, and keeping the
+layout stable makes the diff between the two chapters readable.
+
+### The two blocks of data
+
+```cpp title="code/src/2.lighting/colours/main.cpp"
+struct Globals {
+    glm::mat4 view;        // offset 0
+    glm::mat4 projection;  // offset 64
+    glm::vec4 light_colour;  // offset 128
+};
+static_assert(sizeof(Globals) == 144);
+```
+
+This must match `Globals` in the shader exactly, and std140 from chapter 1.10 is what
+decides "exactly". Two matrices at 64 bytes each take offsets 0 and 64; a `vec4` is
+16-byte aligned and 128 already is a multiple of 16, so `light_colour` needs no padding
+in front of it. 144 bytes in total.
+
+Nothing needs padding here, which is what ordering members largest-first buys you. It
+does not last: 2.2 adds a `float3x3` to a push constant block and the padding rules stop
+being free.
+
+```cpp title="code/src/2.lighting/colours/main.cpp"
+struct PushConstants {
+    glm::mat4 model;
+    glm::vec4 object_colour;
+};
+static_assert(sizeof(PushConstants) == 80);
+```
+
+80 of the 128 bytes every Vulkan implementation guarantees for push constants. There is
+room to spare, and 2.2 uses all of it.
+
+The `static_assert`s are the habit chapter 1.10 recommended. They cost one line and turn
+a class of bug that shows up as "the colours look wrong" into a build failure.
+
+### The scene's constants
+
+```cpp title="code/src/2.lighting/colours/main.cpp"
+constexpr glm::vec4 kObjectColour{1.0F, 0.5F, 0.31F, 1.0F};
+constexpr glm::vec4 kLightColour{1.0F, 1.0F, 1.0F, 1.0F};
+
+constexpr float kLightOrbitRadius = 1.8F;
+constexpr float kLightHeight = 1.2F;
+```
+
+Coral for the object, white for the light, and two numbers describing where the lamp
+orbits.
+
+## The application
+
+```cpp title="code/src/2.lighting/colours/main.cpp"
+class ColoursApp : public vkc::App {
+public:
+    using vkc::App::App;
+
+protected:
+    void on_start() override {
+        vertex_buffer_ = vkc::upload_to_device_local(
+            context(), kVertices.data(), sizeof(kVertices),
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+        index_buffer_ = vkc::upload_to_device_local(
+            context(), kIndices.data(), sizeof(kIndices),
+            VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+
+        depth_format_ = vkc::choose_depth_format(context().physical_device());
+        depth_ = vkc::create_depth_buffer(context(), depth_format_,
+                                          swapchain().extent());
+
+        create_uniform_buffers();
+        create_descriptors();
+        create_pipelines();
+
+        camera_.position = {0.0F, 0.5F, 4.0F};
+
+        spdlog::info("Right-click to capture the mouse, WASD to fly, Escape to quit.");
+    }
+```
+
+`vkc::App` and its four virtuals come from chapter 1.8, the buffer helpers from 1.8, the
+depth helpers from 1.13. The camera starts straight back from the origin, looking down
+−z, so the lit cube is centred and the lamp's orbit passes above and around it.
+
+```cpp title="code/src/2.lighting/colours/main.cpp"
+    void on_resize(VkExtent2D extent) override {
+        depth_ = vkc::create_depth_buffer(context(), depth_format_, extent);
+    }
+
+    void on_event(const SDL_Event& event) override {
+        camera_.handle_event(event, window().handle());
+    }
+```
+
+That second function is the visible payoff of 1.14. The whole of that chapter's
+`on_event` and `move_camera` — about sixty lines of key handling, mouse deltas and
+vector arithmetic — is now one call, because `vkc::Camera` owns both.
+
+```cpp title="code/src/2.lighting/colours/main.cpp"
+    void on_shutdown() override {
+        const VkDevice device = context().device();
+
+        vkDestroyPipeline(device, lamp_pipeline_, nullptr);
+        vkDestroyPipeline(device, object_pipeline_, nullptr);
+        vkDestroyPipelineLayout(device, pipeline_layout_, nullptr);
+        vkDestroyDescriptorPool(device, descriptor_pool_, nullptr);
+        vkDestroyDescriptorSetLayout(device, set_layout_, nullptr);
+
+        for (vkc::Buffer& buffer : uniform_buffers_) {
+            buffer.destroy();
+        }
+        depth_.destroy();
+        index_buffer_.destroy();
+        vertex_buffer_.destroy();
+    }
+```
+
+Destruction in reverse order of creation, and both pipelines destroyed separately — they
+are two independent objects even though they came from one module. The module itself is
+already gone; `create_pipelines` destroys it as soon as both pipelines exist.
+
+### The frame
+
+```cpp title="code/src/2.lighting/colours/main.cpp"
+    void on_render(const vkc::FrameInfo& frame) override {
+        camera_.update(delta_time());
+
+        const float time = static_cast<float>(frame.frame_number) / 60.0F;
+        const glm::vec3 light_position = orbit_position(time);
+
+        const size_t slot = frame.frame_number % vkc::kFramesInFlight;
+        update_globals(slot, frame.extent);
+
+        vkc::begin_rendering(frame.cmd, frame.view, depth_.view(), frame.extent,
+                             {{0.02F, 0.02F, 0.04F, 1.0F}});
+
+        set_viewport(frame);
+
+        vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                pipeline_layout_, 0, 1, &descriptor_sets_[slot], 0,
+                                nullptr);
+
+        const VkDeviceSize offset = 0;
+        const VkBuffer vertices = vertex_buffer_.handle();
+        vkCmdBindVertexBuffers(frame.cmd, 0, 1, &vertices, &offset);
+        vkCmdBindIndexBuffer(frame.cmd, index_buffer_.handle(), 0,
+                             VK_INDEX_TYPE_UINT16);
+```
+
+Note what `time` is derived from: `frame.frame_number`, not the wall clock. The lamp's
+position is therefore a pure function of which frame this is, so `tools/capture.py` gets
+the same image on every run and a screenshot comparison means something. Anything
+animated in this series is driven this way.
+
+`slot` picks this frame's uniform buffer out of the `kFramesInFlight` copies, which is
+1.6's rule: never write to memory the GPU might still be reading.
+
+Then the two draws, and they are the point of the chapter:
+
+```cpp title="code/src/2.lighting/colours/main.cpp"
+        vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, object_pipeline_);
+        draw_cube(frame.cmd,
+                  glm::rotate(glm::mat4(1.0F), time * 0.3F,
+                              glm::normalize(glm::vec3(0.3F, 1.0F, 0.15F))),
+                  kObjectColour);
+
+        vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, lamp_pipeline_);
+        draw_cube(frame.cmd,
+                  glm::scale(glm::translate(glm::mat4(1.0F), light_position),
+                             glm::vec3(0.2F)),
+                  kLightColour);
+
+        vkCmdEndRendering(frame.cmd);
+    }
+```
+
+Same geometry, same vertex stage, same descriptor set, same bound buffers. The only
+thing that changes between the two draws is which pipeline is bound and what goes into
+the push constants.
+
+The lit cube sits at the origin and turns slowly about a tilted axis — `glm::normalize`
+matters there, because `glm::rotate` wants a unit axis. The lamp is translated out to
+its orbit position and scaled right down, so it reads as a marker rather than as a
+second object in the scene. Read that second transform right to left, as 1.12
+established: scale first, then translate.
+
+### Drawing, and where the lamp goes
+
+```cpp title="code/src/2.lighting/colours/main.cpp"
+private:
+    [[nodiscard]] static glm::vec3 orbit_position(float time) {
+        return {kLightOrbitRadius * std::sin(time * 0.35F), kLightHeight,
+                kLightOrbitRadius * std::cos(time * 0.35F)};
+    }
+```
+
+A circle in the xz plane, lifted to a constant height: `sin` for x and `cos` for z is
+the unit circle from 1.12 again, scaled by the radius. 2.2 uses this same position to
+work out a light *direction*, which is when it starts to matter.
+
+```cpp title="code/src/2.lighting/colours/main.cpp"
+    void draw_cube(VkCommandBuffer cmd, const glm::mat4& model,
+                   const glm::vec4& colour) {
+        const PushConstants push{.model = model, .object_colour = colour};
+        vkCmdPushConstants(cmd, pipeline_layout_,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                           sizeof(push), &push);
+        vkCmdDrawIndexed(cmd, static_cast<uint32_t>(kIndices.size()), 1, 0, 0, 0);
+    }
+```
+
+The stage flags name both stages because the vertex shader reads `model` and the
+fragment shader reads `object_colour` out of the same block. A push constant range
+covers whole stages rather than individual members, so if any stage reads any part of
+the block, that stage has to be listed.
+
+### Viewport and projection
+
+```cpp title="code/src/2.lighting/colours/main.cpp"
+    static void set_viewport(const vkc::FrameInfo& frame) {
+        const VkViewport viewport{
+            .x = 0.0F,
+            .y = 0.0F,
+            .width = static_cast<float>(frame.extent.width),
+            .height = static_cast<float>(frame.extent.height),
+            .minDepth = 0.0F,
+            .maxDepth = 1.0F,
+        };
+        vkCmdSetViewport(frame.cmd, 0, 1, &viewport);
+
+        const VkRect2D scissor{.offset = {0, 0}, .extent = frame.extent};
+        vkCmdSetScissor(frame.cmd, 0, 1, &scissor);
+    }
+
+    [[nodiscard]] static glm::mat4 build_projection(VkExtent2D extent) {
+        const float aspect =
+            static_cast<float>(extent.width) / static_cast<float>(extent.height);
+        glm::mat4 projection =
+            glm::perspective(glm::radians(45.0F), aspect, 0.1F, 100.0F);
+        projection[1][1] *= -1.0F;  // Vulkan's clip-space y points down.
+        return projection;
+    }
+```
+
+Both are 1.13's, unchanged. `projection[1][1]` is column 1, row 1 — the y scale —
+and negating it flips the handedness glm assumes into the one Vulkan uses.
+
+### The uniform buffers
+
+```cpp title="code/src/2.lighting/colours/main.cpp"
+    void create_uniform_buffers() {
+        for (vkc::Buffer& buffer : uniform_buffers_) {
+            buffer = vkc::Buffer(context().allocator(), sizeof(Globals),
+                                 VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                                 VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                                     VMA_ALLOCATION_CREATE_MAPPED_BIT);
+        }
+    }
+
+    void update_globals(size_t slot, VkExtent2D extent) {
+        const Globals globals{
+            .view = camera_.view(),
+            .projection = build_projection(extent),
+            .light_colour = kLightColour,
+        };
+        std::memcpy(uniform_buffers_[slot].mapped(), &globals, sizeof(globals));
+    }
+```
+
+One buffer per frame in flight, persistently mapped, written with a `memcpy` each frame.
+`SEQUENTIAL_WRITE` tells VMA this memory is written front to back and never read, which
+is what lets it choose write-combined memory — 1.8's subject.
+
+### Descriptors
+
+One binding, because there is one block. The texture 1.14 had at binding 1 is gone.
+
+```cpp title="code/src/2.lighting/colours/main.cpp"
+    void create_descriptors() {
+        const VkDevice device = context().device();
+
+        const VkDescriptorSetLayoutBinding binding{
+            .binding = 0,
+            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+            .pImmutableSamplers = nullptr,
+        };
+
+        const VkDescriptorSetLayoutCreateInfo layout_info{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .bindingCount = 1,
+            .pBindings = &binding,
+        };
+        VK_CHECK(
+            vkCreateDescriptorSetLayout(device, &layout_info, nullptr, &set_layout_));
+```
 
 :::caution[`stageFlags` now names both stages]
 The fragment shader reads `light_colour` from the same block the vertex shader reads the
-matrices from, so the binding has to say so:
+matrices from, so the binding has to say so. Forget it and the validation layers tell you
+plainly, which is a mercy — the same mistake in the `std140` layout would have been
+silent.
+:::
 
 ```cpp title="code/src/2.lighting/colours/main.cpp"
-.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+        const VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                                             vkc::kFramesInFlight};
+
+        const VkDescriptorPoolCreateInfo pool_info{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .maxSets = vkc::kFramesInFlight,
+            .poolSizeCount = 1,
+            .pPoolSizes = &pool_size,
+        };
+        VK_CHECK(vkCreateDescriptorPool(device, &pool_info, nullptr, &descriptor_pool_));
+
+        const std::array<VkDescriptorSetLayout, vkc::kFramesInFlight> layouts{
+            set_layout_, set_layout_};
+
+        const VkDescriptorSetAllocateInfo alloc_info{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .pNext = nullptr,
+            .descriptorPool = descriptor_pool_,
+            .descriptorSetCount = vkc::kFramesInFlight,
+            .pSetLayouts = layouts.data(),
+        };
+        VK_CHECK(vkAllocateDescriptorSets(device, &alloc_info, descriptor_sets_.data()));
 ```
 
-Forget it and the validation layers tell you plainly, which is a mercy — the same
-mistake in the `std140` layout would have been silent.
-:::
+The pool is sized for one uniform buffer descriptor per frame in flight, and `maxSets`
+counts the sets rather than the descriptors. Allocating wants one layout per set, which
+is why `layouts` repeats the same handle twice.
+
+```cpp title="code/src/2.lighting/colours/main.cpp"
+        for (size_t i = 0; i < vkc::kFramesInFlight; ++i) {
+            const VkDescriptorBufferInfo buffer_info{
+                .buffer = uniform_buffers_[i].handle(),
+                .offset = 0,
+                .range = sizeof(Globals),
+            };
+
+            const VkWriteDescriptorSet write{
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .pNext = nullptr,
+                .dstSet = descriptor_sets_[i],
+                .dstBinding = 0,
+                .dstArrayElement = 0,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                .pImageInfo = nullptr,
+                .pBufferInfo = &buffer_info,
+                .pTexelBufferView = nullptr,
+            };
+            vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+        }
+    }
+```
+
+Each set is pointed at its own buffer, once, at start-up. Nothing rewrites a descriptor
+per frame — the *contents* of the buffer change every frame, but which buffer the set
+points at does not.
+
+### The two pipelines
+
+```cpp title="code/src/2.lighting/colours/main.cpp"
+    void create_pipelines() {
+        const VkDevice device = context().device();
+
+        const VkVertexInputBindingDescription binding{
+            .binding = 0,
+            .stride = sizeof(Vertex),
+            .inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
+        };
+
+        const VkVertexInputAttributeDescription attribute{
+            .location = 0,
+            .binding = 0,
+            .format = VK_FORMAT_R32G32B32_SFLOAT,
+            .offset = offsetof(Vertex, position),
+        };
+
+        const VkPushConstantRange push_range{
+            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+            .offset = 0,
+            .size = sizeof(PushConstants),
+        };
+
+        const VkPipelineLayoutCreateInfo layout_info{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .setLayoutCount = 1,
+            .pSetLayouts = &set_layout_,
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &push_range,
+        };
+        VK_CHECK(
+            vkCreatePipelineLayout(device, &layout_info, nullptr, &pipeline_layout_));
+```
+
+One attribute now — just the position — where 1.14 had two. One pipeline layout, shared
+by both pipelines, because both use the same set layout and the same push constant
+range.
+
+```cpp title="code/src/2.lighting/colours/main.cpp"
+        const VkShaderModule shader =
+            vkc::load_shader(device, LVK_CHAPTER_ID, "colours.slang");
+
+        const auto build = [&](const char* fragment_entry) {
+            return vkc::PipelineBuilder(device)
+                .shaders(shader, "vertexMain", fragment_entry)
+                .vertex_input(std::span(&binding, 1), std::span(&attribute, 1))
+                .cull(VK_CULL_MODE_BACK_BIT, VK_FRONT_FACE_COUNTER_CLOCKWISE)
+                .depth(depth_format_, /*test=*/true, /*write=*/true, VK_COMPARE_OP_LESS)
+                .colour_attachment(swapchain().format())
+                .layout(pipeline_layout_)
+                .build();
+        };
+
+        object_pipeline_ = build("fragmentMain");
+        lamp_pipeline_ = build("lampFragmentMain");
+
+        vkDestroyShaderModule(device, shader, nullptr);
+
+        context().name(object_pipeline_, VK_OBJECT_TYPE_PIPELINE, "object pipeline");
+        context().name(lamp_pipeline_, VK_OBJECT_TYPE_PIPELINE, "lamp pipeline");
+    }
+```
+
+The lambda is the whole idea in four lines: everything about the two pipelines is
+identical except the string naming the fragment entry point. `vkc::load_shader` and
+`vkc::PipelineBuilder` are 1.7's, and `LVK_CHAPTER_ID` is the compile definition the
+build system sets so a sample can find its own shader directory.
+
+The module is destroyed immediately after both pipelines are built. A `VkShaderModule`
+is only needed while a pipeline is being created; once the driver has compiled it, the
+module has no further job.
+
+Naming the two pipelines costs nothing in a release build and means a validation message
+or a RenderDoc capture says "lamp pipeline" instead of a hexadecimal handle.
+
+### Members, and `main`
+
+```cpp title="code/src/2.lighting/colours/main.cpp"
+    vkc::Camera camera_;
+
+    vkc::Buffer vertex_buffer_;
+    vkc::Buffer index_buffer_;
+
+    VkFormat depth_format_ = VK_FORMAT_UNDEFINED;
+    vkc::Image depth_;
+
+    std::array<vkc::Buffer, vkc::kFramesInFlight> uniform_buffers_;
+    std::array<VkDescriptorSet, vkc::kFramesInFlight> descriptor_sets_{};
+
+    VkDescriptorSetLayout set_layout_ = VK_NULL_HANDLE;
+    VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
+
+    VkPipelineLayout pipeline_layout_ = VK_NULL_HANDLE;
+    VkPipeline object_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline lamp_pipeline_ = VK_NULL_HANDLE;
+};
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    try {
+        vkc::App::Options options{};
+        options.title = "LearnVulkan 2.1 - Colours";
+        ColoursApp app(vkc::App::parse_args(argc, argv, options));
+        return app.run();
+    } catch (const std::exception& error) {
+        spdlog::error("{}", error.what());
+        return EXIT_FAILURE;
+    }
+}
+```
+
+`main` is 1.8's, with a different title and a different app class.
+
+### The build file
+
+```cmake title="code/src/2.lighting/colours/CMakeLists.txt"
+add_chapter(2.1.colours
+    SOURCES main.cpp
+    SHADERS colours.slang
+)
+```
+
+No `SCAFFOLD` clause. That was Part 1's mechanism for handing a chapter only the pieces
+it had earned; from 1.8 onward a chapter links the whole of `vkcommon`, because by then
+there is nothing in it the reader has not built.
 
 ## What changed since 1.14
 
 The sample got **shorter**, which is the first time that has happened in a while.
 
 :::note[Now from `vkcommon`]
-`vkc::Camera` — chapter 1.14's camera with its SDL handling folded in. The whole of
-1.14's `on_event` and `move_camera`, about sixty lines, is now:
-
-```cpp title="code/src/2.lighting/colours/main.cpp"
-void on_event(const SDL_Event& event) override {
-    camera_.handle_event(event, window().handle());
-}
-// and, once per frame:
-camera_.update(delta_time());
-```
-
-The depth buffer and the start of the render pass come from there too, for the same
-reason — chapter 1.13 wrote all three out and explained them:
-
-```cpp title="code/src/2.lighting/colours/main.cpp"
-depth_format_ = vkc::choose_depth_format(context().physical_device());
-depth_ = vkc::create_depth_buffer(context(), depth_format_, swapchain().extent());
-
-// and, once per frame:
-vkc::begin_rendering(frame.cmd, frame.view, depth_.view(), frame.extent,
-                     {{0.02F, 0.02F, 0.04F, 1.0F}});
-```
+`vkc::Camera` — chapter 1.14's camera with its SDL handling folded in. The depth buffer
+and the start of the render pass come from there too, for the same reason: chapter 1.13
+wrote all three out and explained them.
 
 `begin_rendering` fills in the two `VkRenderingAttachmentInfo` structures and the
 `VkRenderingInfo` around them. Both attachments clear on load; the depth buffer's
@@ -180,11 +779,6 @@ back in 2.4, when a material is more than four floats.
 Added: a second pipeline, `light_colour` in the per-frame block, and `object_colour` in
 the push constants.
 
-The cube is still 24 vertices rather than 8, even though nothing now needs per-face
-data. That is deliberate — 2.2 gives every face its own normal and it would be 24 again
-immediately, and keeping the layout stable makes the diff between the two chapters
-readable.
-
 ## Running it
 
 ```bash
@@ -193,6 +787,17 @@ readable.
 
 A coral cube turning slowly, and a white cube orbiting it. Right-click to capture the
 mouse, `WASD` to fly, `shift` to sprint, `Escape` to quit.
+
+## Words introduced in this chapter
+
+| | |
+|---|---|
+| **reflectance** | the fraction of each wavelength a surface sends back — what an object's "colour" physically is |
+| **component-wise multiply** | multiplying two colours channel by channel, red with red and so on, rather than collapsing them |
+| **shading model** | the rule that turns a surface, a light and a viewpoint into a colour; this chapter's is a single multiply |
+| **pipeline variant** | a second `VkPipeline` differing from the first in one piece of state — here, the fragment entry point |
+| **per-frame data** | data identical for every draw in a frame, written once and bound once; set 0 from here on |
+| **entry point by name** | choosing which function in a module a stage runs, via `pName`, so one module serves several pipelines |
 
 ## Exercises
 
@@ -213,3 +818,6 @@ mouse, `WASD` to fly, `shift` to sprint, `Escape` to quit.
    `.polygon_mode(VK_POLYGON_MODE_LINE)` and draw the lit cube twice, solid then
    wireframe. You will need the `fillModeNonSolid` device feature. Three pipelines, one
    shader module, one pipeline layout.
+6. Add a second light colour and a key that switches between them. Notice that nothing
+   in the pipeline changes — the colour lives in the per-frame block, so switching it is
+   a `memcpy` and not a rebuild. That is the lifetime argument made concrete.

@@ -1,6 +1,6 @@
 ---
 title: Light Casters
-description: Directional lights, point lights with attenuation, and spotlights with soft edges - and specialisation constants choosing between them at no per-fragment cost.
+description: Directional, point and spot lights - the inverse-square law derived, attenuation, soft cone edges - and specialisation constants choosing between them at no per-fragment cost.
 sidebar:
   order: 5
 ---
@@ -19,13 +19,82 @@ from** at a given point, and **how much of it arrives**. This chapter handles th
 standard answers — directional, point and spot — and none of them touches the Phong terms
 from 2.2. They only change the two inputs those terms take.
 
+## One struct for every kind
+
+All three kinds share one `Light` struct, so that the shader can be written once and 2.6
+can put lights of different kinds in a single array:
+
+```slang title="code/src/2.lighting/light_casters/light_casters.slang"
+struct Light {
+    float4 position;   // xyz: point and spot
+    float4 direction;  // xyz, the way the light *travels*: directional and spot
+    float4 ambient;
+    float4 diffuse;
+    float4 specular;
+
+    // Attenuation, for point and spot: intensity = 1 / (c + l*d + q*d^2).
+    float constant_term;
+    float linear_term;
+    float quadratic_term;
+
+    // The spotlight's cone, stored as cosines so the shader can compare them directly
+    // against a dot product without calling acos() per fragment.
+    float inner_cutoff;
+    float outer_cutoff;
+};
+```
+
+A directional light ignores `position` and the falloff; a point light ignores `direction`
+and the cone. Carrying unused fields costs a few bytes and buys one layout.
+
+The C++ side has to match it byte for byte, and this is the sharpest layout case in the
+part so far:
+
+```cpp title="code/src/2.lighting/light_casters/main.cpp"
+struct Light {
+    glm::vec4 position;   // 0
+    glm::vec4 direction;  // 16
+    glm::vec4 ambient;    // 32
+    glm::vec4 diffuse;    // 48
+    glm::vec4 specular;   // 64
+    float constant_term;  // 80
+    float linear_term;    // 84
+    float quadratic_term; // 88
+    float inner_cutoff;   // 92, a cosine
+    float outer_cutoff;   // 96, a cosine
+    float padding[3];
+};
+static_assert(offsetof(Light, constant_term) == 80);
+static_assert(offsetof(Light, outer_cutoff) == 96);
+static_assert(sizeof(Light) == 112);
+```
+
+Five `vec4`s fill offsets 0 to 79. Then five bare floats, and **scalars align to 4, not to
+16** — so they pack tightly from 80 in steps of 4, ending at 100. That is the rule worth
+carrying: std140 pads vectors, not scalars. The block is 100 bytes of content, and the
+`padding[3]` rounds it to 112, because std140 rounds a nested struct up to a multiple of
+16 and `Light` is nested inside `Globals`.
+
+```cpp title="code/src/2.lighting/light_casters/main.cpp"
+struct Globals {
+    glm::mat4 view;           // 0
+    glm::mat4 projection;     // 64
+    glm::vec4 view_position;  // 128
+    Light light;              // 144
+};
+static_assert(offsetof(Globals, light) == 144);
+static_assert(sizeof(Globals) == 256);
+```
+
+144 + 112 = 256. The `static_assert`s are what make all of that a fact rather than a hope.
+
 ## Directional lights
 
 The sun is 150 million kilometres away. By the time its light reaches a scene, every ray is
 effectively parallel: the light arrives from the same direction at every point, and it is
 equally strong everywhere.
 
-So a directional light has a **direction** and no position:
+So a **directional light** has a direction and no position:
 
 ```slang title="code/src/2.lighting/light_casters/light_casters.slang"
 case kDirectional:
@@ -51,15 +120,44 @@ directional light, and it is why outdoor scenes use one for the sun.
 
 A bulb is somewhere. Light leaves it in every direction, so the direction toward it differs
 at every point in the scene — which 2.2 already handled — and it **weakens with distance**,
-which nothing so far has.
+which nothing so far has. That weakening is **attenuation**.
 
-Physically, the same light spreads over the surface of an ever-larger sphere, so intensity
-falls with the square of the distance. Pure inverse-square looks wrong in practice, though:
-it blows up close to the light and dies off too abruptly for scenes without the rest of the
-real-world light transport. The traditional compromise has three terms:
+### Where the inverse square comes from
+
+A bulb emits some fixed amount of energy per second. That energy spreads outward, and at
+distance `d` all of it is crossing the surface of a sphere of radius `d`. A sphere's
+surface area is:
 
 ```
-intensity = 1 / (constant + linear·d + quadratic·d²)
+   area = 4 π d²
+```
+
+The same total energy, divided by an area that grows with `d²`, gives energy per unit area
+falling as `1/d²`:
+
+```
+                    d = 1              d = 2              d = 3
+
+   source  •      ┌──────┐         ┌──────┬──────┐   ┌──────┬──────┬──────┐
+                  │ 1/1  │         ├──────┼──────┤   ├──────┼──────┼──────┤
+                  └──────┘         │      │      │   │      │      │      │
+                                   └──────┴──────┘   ├──────┼──────┼──────┤
+                area × 1           area × 4          └──────┴──────┴──────┘
+                intensity 1        intensity 1/4     area × 9, intensity 1/9
+```
+
+That is the **inverse-square law**, and it is not a graphics convention — it is what
+happens to anything radiating from a point into three dimensions.
+
+### Why the sample does not use it
+
+Pure inverse-square looks wrong in a renderer like this one. At `d < 1` it exceeds the
+light's own output and blows out to white; at large `d` it dies off far faster than the eye
+expects, because a real room is full of bounced light this renderer does not simulate. The
+traditional compromise adds two more terms:
+
+```
+   intensity = 1 / (constant + linear·d + quadratic·d²)
 ```
 
 ```slang title="code/src/2.lighting/light_casters/light_casters.slang"
@@ -69,6 +167,9 @@ to_light = offset / distance;
 intensity = 1.0 / (light.constant_term + light.linear_term * distance +
                    light.quadratic_term * distance * distance);
 ```
+
+Note that `to_light` is `offset / distance` rather than a second `normalize` call: the
+length was needed anyway, so dividing by it normalises for free.
 
 Each term earns its place:
 
@@ -82,9 +183,12 @@ The sample uses `1.0`, `0.09` and `0.032`:
 | Distance | 1 | 5 | 10 | 16 | 20 |
 |---|---|---|---|---|---|
 | Intensity | 0.89 | 0.44 | 0.20 | 0.09 | 0.06 |
+| Pure `1/d²` | 1.00 | 0.04 | 0.01 | 0.004 | 0.003 |
 
-Values like these are usually taken from a table of distances rather than derived. The
-thing to understand is the shape: a plateau near the light, then a long tail.
+The second row is why the compromise exists. At 5 units, true inverse-square leaves 4% of
+the light and the scene goes black; the three-term version leaves 44%. Values like these
+are usually taken from a table of distances rather than derived. The thing to understand is
+the shape: a plateau near the light, then a long tail.
 
 <figure>
   <img src="/img/2.5/point.png" alt="The ten crates lit by a point light hidden behind the central crate: the central crate's front is dark, and the crates around it are lit on the faces turned toward the middle" />
@@ -103,12 +207,14 @@ spotlight's axis and the ray from the light to this fragment is:
 float theta = dot(-to_light, normalize(light.direction.xyz));
 ```
 
-It is 1.0 on the axis and shrinks as the fragment moves off-axis. Comparing it against the
-cosine of the cone's half-angle tells you whether the fragment is inside.
+Both arguments are unit vectors, so by the appendix's `a · b = |a||b| cos θ` this *is* the
+cosine of the angle off the axis — 1.0 dead centre, shrinking as the fragment moves
+outward. `-to_light` is used because `to_light` points from the fragment back at the torch,
+and we want the ray going the same way the torch points.
 
 A single cutoff gives a pool of light with a razor-sharp edge, which looks like a stage
-effect rather than a torch. Two cutoffs give a soft one: full strength inside the **inner**
-cone, nothing outside the **outer** cone, and a ramp between:
+effect rather than a torch. Two cutoffs give a soft one: full strength inside the **inner
+cone**, nothing outside the **outer cone**, and a ramp between:
 
 ```slang title="code/src/2.lighting/light_casters/light_casters.slang"
 float edge = light.inner_cutoff - light.outer_cutoff;
@@ -116,11 +222,24 @@ float cone = saturate((theta - light.outer_cutoff) / edge);
 intensity = attenuation * cone;
 ```
 
+That expression is an inverse lerp: it measures how far `theta` has travelled from the
+outer cutoff toward the inner one, as a fraction, and `saturate` clamps it to `[0, 1]`.
+With the sample's 12.5° and 17.5° **cone cutoff** angles:
+
+| Angle off axis | 0° | 12.5° | 15° | 17.5° | 20° |
+|---|---|---|---|---|---|
+| `theta` (cosine) | 1.0000 | 0.9763 | 0.9659 | 0.9537 | 0.9397 |
+| `cone` | 1.000 | 1.000 | 0.541 | 0.000 | 0.000 |
+
+The whole soft edge lives in the 0.0226 of cosine between the two cutoffs. That is how
+narrow the band is, and why `edge` must never be zero.
+
 :::caution[Cosines run backwards]
 The cutoffs are stored as cosines — computed once on the CPU, so the shader never calls
 `acos` per fragment. Cosines *decrease* as angles grow, so the **inner** cutoff, the smaller
-angle, is the **larger** number. The subtraction `inner - outer` is positive for exactly
-that reason. Swap them and `edge` goes negative and the cone turns inside out.
+angle, is the **larger** number: `cos(12.5°) = 0.9763` against `cos(17.5°) = 0.9537`. The
+subtraction `inner - outer` is positive for exactly that reason. Swap them and `edge` goes
+negative and the cone turns inside out.
 :::
 
 The sample's torch is held by the camera: its position and direction are rebuilt from the
@@ -132,7 +251,7 @@ the soft edge is visible sweeping across the plank face of the crate to the left
 One line deserves a comment:
 
 ```slang title="code/src/2.lighting/light_casters/light_casters.slang"
-return float4(ambient + intensity * (diffuse + specular), 1.0);
+    return float4(ambient + intensity * (diffuse + specular), 1.0);
 ```
 
 The intensity multiplies diffuse and specular, **not ambient**. The ambient term stands for
@@ -140,37 +259,55 @@ light that has bounced around the whole scene, and that light does not come from
 direction or care how far away the torch is. It is why the crates outside the cone are dim
 rather than invisible.
 
-## One struct for every kind
+## The shader, assembled
 
-All three kinds share one `Light` struct:
+The three cases live in one `switch`, and everything after it is 2.4's Phong code with a
+single `intensity` threaded in:
 
 ```slang title="code/src/2.lighting/light_casters/light_casters.slang"
-struct Light {
-    float4 position;   // xyz: point and spot
-    float4 direction;  // xyz: directional and spot
-    float4 ambient;
-    float4 diffuse;
-    float4 specular;
-    float constant_term;
-    float linear_term;
-    float quadratic_term;
-    float inner_cutoff;
-    float outer_cutoff;
-};
+static const int kDirectional = 0;
+static const int kPoint = 1;
 ```
 
-A directional light ignores `position` and the falloff; a point light ignores `direction` and
-the cone. Carrying unused fields costs a few bytes, and buys one layout — which is what lets
-chapter 2.6 put lights of different kinds in a single array.
+```slang title="code/src/2.lighting/light_casters/light_casters.slang"
+    Light light = globals.light;
 
-The layout is worth one look. The five floats after the vectors pack tightly, from offset 80
-in steps of 4 — scalars align to 4, not to 16 — so the block is 100 bytes. The C++ side pads
-it to 112 and pins every offset that matters:
+    float3 to_light;
+    float intensity = 1.0;
+```
 
-```cpp title="code/src/2.lighting/light_casters/main.cpp"
-static_assert(offsetof(Light, constant_term) == 80);
-static_assert(offsetof(Light, outer_cutoff) == 96);
-static_assert(sizeof(Light) == 112);
+Copying `globals.light` into a local is readability, not necessity — it saves writing
+`globals.light.` nine times below.
+
+```slang title="code/src/2.lighting/light_casters/light_casters.slang"
+    case kPoint: {
+```
+
+```slang title="code/src/2.lighting/light_casters/light_casters.slang"
+    default: {
+```
+
+The spotlight is the `default` case rather than a named one, which keeps the compiler from
+warning about an unhandled value: with a specialisation constant the switch has exactly one
+reachable arm anyway.
+
+```slang title="code/src/2.lighting/light_casters/light_casters.slang"
+        float attenuation = 1.0 / (light.constant_term + light.linear_term * distance +
+                                   light.quadratic_term * distance * distance);
+```
+
+And the three Phong terms, now reading the light's own components rather than 2.4's:
+
+```slang title="code/src/2.lighting/light_casters/light_casters.slang"
+    float3 ambient = light.ambient.rgb * surface;
+```
+
+```slang title="code/src/2.lighting/light_casters/light_casters.slang"
+    float3 diffuse = light.diffuse.rgb * diffuse_amount * surface;
+```
+
+```slang title="code/src/2.lighting/light_casters/light_casters.slang"
+    float3 specular = light.specular.rgb * specular_amount * shine;
 ```
 
 ## Choosing the kind: a specialisation constant
@@ -188,13 +325,55 @@ default: ...
 }
 ```
 
+The C++ side declares the same three values, and which one is in force:
+
 ```cpp title="code/src/2.lighting/light_casters/main.cpp"
-const ShaderConstants constants{};
-const std::array<VkSpecializationMapEntry, 1> entries{{
-    {.constantID = 0, .offset = offsetof(ShaderConstants, light_type),
-     .size = sizeof(ShaderConstants::light_type)},
-}};
+enum class LightType : int32_t {
+    directional = 0,
+    point = 1,
+    spot = 2,
+};
+constexpr LightType kLightType = LightType::spot;
+
+struct ShaderConstants {
+    int32_t light_type = static_cast<int32_t>(kLightType);
+};
 ```
+
+`int32_t` rather than plain `int`, because the size has to match what the shader declares
+exactly — a specialisation constant is fed raw bytes.
+
+```cpp title="code/src/2.lighting/light_casters/main.cpp"
+        const ShaderConstants constants{};
+        const std::array<VkSpecializationMapEntry, 1> entries{{
+            {
+                .constantID = 0,
+                .offset = offsetof(ShaderConstants, light_type),
+                .size = sizeof(ShaderConstants::light_type),
+            },
+        }};
+```
+
+The map entry says: constant id 0 is found at this offset in the blob, and is this many
+bytes long. The blob itself is the `ShaderConstants` struct reinterpreted as bytes:
+
+```cpp title="code/src/2.lighting/light_casters/main.cpp"
+        object_pipeline_ =
+            vkc::PipelineBuilder(device)
+                .shaders(shader, "vertexMain", "fragmentMain")
+                .vertex_input(std::span(&binding, 1), attributes)
+                .fragment_specialisation(
+                    entries, std::span(reinterpret_cast<const std::byte*>(&constants),
+                                       sizeof(constants)))
+                .cull(VK_CULL_MODE_BACK_BIT, VK_FRONT_FACE_COUNTER_CLOCKWISE)
+                .depth(depth_format_, /*test=*/true, /*write=*/true, VK_COMPARE_OP_LESS)
+                .colour_attachment(swapchain().format())
+                .layout(pipeline_layout_)
+                .build();
+```
+
+This is the first time a sample has not used the shared `build` lambda for both pipelines,
+because only the object pipeline is specialised. The lamp pipeline still goes through it.
 
 The value is fixed when the pipeline is created, so the `switch` compiles to a SPIR-V
 `OpSwitch` on a constant — and a driver is free to fold that away and keep only the case
@@ -203,6 +382,162 @@ of every frame for a value that never changes.
 
 The specialisation is attached only to the lit pipeline. The lamp pipeline is built from the
 same module and needs none: its fragment entry point never reads `kLightType`.
+
+## Building the light each frame
+
+```cpp title="code/src/2.lighting/light_casters/main.cpp"
+    [[nodiscard]] Light make_light() const {
+        Light light{
+            .position = {},
+            .direction = {},
+            .ambient = kLightAmbient,
+            .diffuse = kLightDiffuse,
+            .specular = kLightSpecular,
+            .constant_term = kConstant,
+            .linear_term = kLinear,
+            .quadratic_term = kQuadratic,
+            .inner_cutoff = std::cos(glm::radians(kInnerCutoffDegrees)),
+            .outer_cutoff = std::cos(glm::radians(kOuterCutoffDegrees)),
+            .padding = {},
+        };
+```
+
+The two cosines are computed here, once per frame, rather than per fragment in the shader.
+The fields a given kind does not use are left at zero and never read.
+
+```cpp title="code/src/2.lighting/light_casters/main.cpp"
+        case LightType::directional:
+            light.direction = glm::vec4(glm::normalize(kSunDirection), 0.0F);
+            break;
+        case LightType::point:
+            light.position = glm::vec4(kPointLightPosition, 1.0F);
+            break;
+        case LightType::spot:
+            light.position = glm::vec4(camera_.position, 1.0F);
+            light.direction = glm::vec4(camera_.front(), 0.0F);
+            break;
+        }
+        return light;
+    }
+```
+
+Note the `w` components: `1.0F` for a position, `0.0F` for a direction. That is 1.12's
+homogeneous rule showing up in data rather than in a matrix multiply — and for the
+spotlight, `camera_.front()` is the `vkc::Camera` accessor chapter 1.14 built.
+
+```cpp title="code/src/2.lighting/light_casters/main.cpp"
+    void update_globals(size_t slot, VkExtent2D extent) {
+```
+
+```cpp title="code/src/2.lighting/light_casters/main.cpp"
+            .light = make_light(),
+```
+
+`update_globals` no longer takes a light position: the light builds itself. So the call in
+`on_render` loses its third argument, which 2.4 needed:
+
+```cpp title="code/src/2.lighting/light_casters/main.cpp"
+        update_globals(slot, frame.extent);
+```
+
+## The scene
+
+```cpp title="code/src/2.lighting/light_casters/main.cpp"
+constexpr glm::vec4 kLightAmbient{0.08F, 0.08F, 0.08F, 1.0F};
+constexpr glm::vec4 kLightDiffuse{0.9F, 0.9F, 0.9F, 1.0F};
+```
+
+```cpp title="code/src/2.lighting/light_casters/main.cpp"
+constexpr float kConstant = 1.0F;
+constexpr float kLinear = 0.09F;
+constexpr float kQuadratic = 0.032F;
+
+constexpr float kInnerCutoffDegrees = 12.5F;
+constexpr float kOuterCutoffDegrees = 17.5F;
+
+constexpr glm::vec3 kSunDirection{-0.4F, -1.0F, -0.6F};
+```
+
+The ambient is much lower than 2.4's, because a scene lit by a torch should be dark outside
+the beam. `kSunDirection` points down and away — high, from the front right — and is the
+direction the light *travels*.
+
+```cpp title="code/src/2.lighting/light_casters/main.cpp"
+struct CratePlacement {
+    glm::vec3 position;
+    glm::vec3 axis;
+    float angle;
+};
+
+constexpr std::array<CratePlacement, 10> kCrates{{
+    {{0.0F, 0.0F, 0.0F}, {0.35F, 1.0F, 0.2F}, 0.4F},
+    {{2.4F, 0.8F, -3.0F}, {1.0F, 0.3F, 0.0F}, 1.1F},
+    {{-2.0F, -0.6F, -2.2F}, {0.2F, 0.4F, 1.0F}, 2.0F},
+    {{1.2F, -1.4F, -5.5F}, {0.0F, 1.0F, 0.0F}, 0.7F},
+    {{-3.1F, 1.6F, -6.0F}, {1.0F, 1.0F, 0.0F}, 2.6F},
+    {{0.6F, 2.2F, -4.1F}, {0.5F, 0.0F, 1.0F}, 1.5F},
+    {{-1.4F, 0.2F, -8.0F}, {1.0F, 0.0F, 0.3F}, 0.2F},
+    {{3.4F, -1.0F, -7.2F}, {0.3F, 1.0F, 0.6F}, 3.0F},
+    {{-4.0F, -1.8F, -4.6F}, {0.0F, 0.4F, 1.0F}, 1.8F},
+    {{2.0F, 2.6F, -9.5F}, {1.0F, 0.6F, 0.2F}, 0.9F},
+}};
+
+constexpr glm::vec3 kPointLightPosition{0.0F, 0.8F, -3.2F};
+```
+
+Ten crates at ten depths, at 1.14's positions. Depth is the point: attenuation and the cone
+edge both need something spread through the scene to fall across. Each crate carries its own
+rotation axis and angle so that faces point in many directions.
+
+```cpp title="code/src/2.lighting/light_casters/main.cpp"
+class LightCastersApp : public vkc::App {
+```
+
+```cpp title="code/src/2.lighting/light_casters/main.cpp"
+        camera_.position = {0.0F, 0.0F, 4.0F};
+```
+
+```cpp title="code/src/2.lighting/light_casters/main.cpp"
+        for (const CratePlacement& crate : kCrates) {
+            const glm::mat4 model =
+                glm::translate(glm::mat4(1.0F), crate.position) *
+                glm::rotate(glm::mat4(1.0F), crate.angle, glm::normalize(crate.axis));
+            draw_cube(frame.cmd, model);
+        }
+```
+
+The crates stand still rather than spinning: with a torch moving through the scene,
+spinning crates make it hard to tell what is the light and what is the geometry.
+
+```cpp title="code/src/2.lighting/light_casters/main.cpp"
+        if (kLightType == LightType::point) {
+            vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, lamp_pipeline_);
+            draw_cube(frame.cmd,
+                      glm::scale(glm::translate(glm::mat4(1.0F), kPointLightPosition),
+                                 glm::vec3(0.15F)));
+        }
+```
+
+Only a point light has a place to put a lamp. A directional light has no position at all,
+and the spotlight sits at the camera, so its marker would be inside your own eye.
+
+```cpp title="code/src/2.lighting/light_casters/main.cpp"
+            vkc::load_shader(device, LVK_CHAPTER_ID, "light_casters.slang");
+```
+
+```cpp title="code/src/2.lighting/light_casters/main.cpp"
+        options.title = "LearnVulkan 2.5 - Light Casters";
+        LightCastersApp app(vkc::App::parse_args(argc, argv, options));
+```
+
+### The build file
+
+```cmake title="code/src/2.lighting/light_casters/CMakeLists.txt"
+add_chapter(2.5.light_casters
+    SOURCES main.cpp
+    SHADERS light_casters.slang
+)
+```
 
 ## What changed since 2.4
 
@@ -221,6 +556,18 @@ Sweep the torch across the scene and watch the soft edge move over the crates; w
 crate and see it brighten as the attenuation falls away. To see the other two kinds, change
 `kLightType` in `main.cpp` to `LightType::point` or `LightType::directional` and rebuild.
 
+## Words introduced in this chapter
+
+| | |
+|---|---|
+| **directional light** | a light infinitely far away: one direction everywhere, no position, no falloff |
+| **point light** | a light at a position, radiating in every direction and weakening with distance |
+| **spotlight** | a point light restricted to a cone, with an axis, an angle and a soft edge |
+| **attenuation** | the fall in intensity with distance; here `1/(c + l·d + q·d²)` |
+| **inverse-square law** | energy from a point spread over a sphere of area `4πd²`, so intensity falls as `1/d²` |
+| **cone cutoff** | the spotlight's half-angle, stored as a cosine so a dot product can be compared against it directly |
+| **inner / outer cone** | the two cutoffs between which intensity ramps from full to nothing, giving a soft edge |
+
 ## Exercises
 
 1. Make the cone's edge hard. Replace the `saturate(...)` line with
@@ -238,3 +585,6 @@ crate and see it brighten as the attenuation falls away. To see the other two ki
 5. Replace the specialisation constant with a field in `Globals` and switch the light type at
    run time with a key press. It works. Now think about what the shader is doing on every
    fragment that it was not doing before.
+6. Use true inverse-square: constant `0`, linear `0`, quadratic `1`. Stand a unit from a crate
+   and then back away. The near face blows out to white and the far crates vanish — both
+   halves of why the three-term compromise exists, in one change.

@@ -88,6 +88,96 @@
       "sample": "1.getting_started/camera",
       "previous": "1.getting_started/coordinate_systems",
       "article": "getting-started/camera.mdx"
+    },
+    {
+      "id": "2.1.colours",
+      "sample": "2.lighting/colours",
+      "previous": "1.getting_started/camera",
+      "article": "lighting/colours.mdx"
+    },
+    {
+      "id": "2.2.basic_lighting",
+      "sample": "2.lighting/basic_lighting",
+      "previous": "2.lighting/colours",
+      "article": "lighting/basic-lighting.mdx"
+    },
+    {
+      "id": "2.3.materials",
+      "sample": "2.lighting/materials",
+      "previous": "2.lighting/basic_lighting",
+      "article": "lighting/materials.mdx"
+    },
+    {
+      "id": "2.4.lighting_maps",
+      "sample": "2.lighting/lighting_maps",
+      "previous": "2.lighting/materials",
+      "article": "lighting/lighting-maps.mdx"
+    },
+    {
+      "id": "2.5.light_casters",
+      "sample": "2.lighting/light_casters",
+      "previous": "2.lighting/lighting_maps",
+      "article": "lighting/light-casters.mdx"
+    },
+    {
+      "id": "2.6.multiple_lights",
+      "sample": "2.lighting/multiple_lights",
+      "previous": "2.lighting/light_casters",
+      "article": "lighting/multiple-lights.mdx"
+    },
+    {
+      "id": "3.1.assimp",
+      "sample": "3.model_loading/assimp",
+      "previous": "2.lighting/multiple_lights",
+      "article": "model-loading/assimp.mdx"
+    },
+    {
+      "id": "3.2.mesh",
+      "sample": "3.model_loading/mesh",
+      "previous": "3.model_loading/assimp",
+      "article": "model-loading/mesh.mdx"
+    },
+    {
+      "id": "3.3.model",
+      "sample": "3.model_loading/model",
+      "previous": "3.model_loading/mesh",
+      "article": "model-loading/model.mdx"
+    },
+    {
+      "id": "3.4.bindless_materials",
+      "sample": "3.model_loading/bindless_materials",
+      "previous": "3.model_loading/model",
+      "article": "model-loading/bindless-materials.mdx"
+    },
+    {
+      "id": "4.1.depth_and_stencil",
+      "sample": "4.advanced_vulkan/depth_and_stencil",
+      "previous": "3.model_loading/bindless_materials",
+      "article": "advanced-vulkan/depth-and-stencil.mdx"
+    },
+    {
+      "id": "4.2.blending_and_culling",
+      "sample": "4.advanced_vulkan/blending_and_culling",
+      "previous": "4.advanced_vulkan/depth_and_stencil",
+      "article": "advanced-vulkan/blending-and-culling.mdx"
+    },
+    {
+      "id": "4.3.offscreen_rendering",
+      "sample": "4.advanced_vulkan/offscreen_rendering",
+      "previous": "4.advanced_vulkan/blending_and_culling",
+      "article": "advanced-vulkan/offscreen-rendering.mdx"
+    },
+    {
+      "id": "4.4.cubemaps",
+      "sample": "4.advanced_vulkan/cubemaps",
+      "previous": "4.advanced_vulkan/offscreen_rendering",
+      "article": "advanced-vulkan/cubemaps.mdx"
+    },
+    {
+      "id": "4.5.buffer_device_address",
+      "sample": "4.advanced_vulkan/buffer_device_address",
+      "previous": "4.advanced_vulkan/cubemaps",
+      "article": "advanced-vulkan/buffer-device-address.mdx"
     }
   ]
 }
