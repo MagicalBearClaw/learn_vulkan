@@ -1,0 +1,398 @@
+---
+title: "Buffer Device Address"
+description: A buffer can have a plain 64-bit address, and a shader can dereference it. Descriptors stop being how data is found, vertex fetch becomes four lines of shader, and a frame's data becomes one bump allocation.
+sidebar:
+  order: 5
+---
+
+<figure>
+  <img src="/img/reference/4.5.buffer_device_address.png" alt="A mirrored sphere standing on a tiled floor between two wooden crates, reflecting the sky above, the crates and ferns around it, and the floor below" />
+  <figcaption>Chapter 4.5. This is 4.4's frame, and that is the point: of 921,600
+  pixels, one differs, by one level in one channel. Nothing about what is drawn has
+  changed. Everything about how the shaders are told where to find it has.</figcaption>
+</figure>
+
+Every buffer in this series so far has reached a shader the same way. The buffer went
+into a descriptor, the descriptor went into a set, the set was allocated from a pool,
+the set was bound to a slot, the slot was described by a layout, and the layout was
+named by the pipeline. Six objects standing between a shader and some bytes.
+
+Chapter 4.4 paid that price seven times a frame. It drew the scene once for the screen
+and once into each of six cube faces, and those seven passes differ only in two
+matrices — so it needed seven uniform buffers, doubled for frames in flight, and
+fourteen descriptor sets to point at them. Fourteen sets to say fourteen numbers'
+worth of difference.
+
+There is another way, and it has been sitting in the device features since chapter 1.3.
+A buffer can be asked for its **address**: an ordinary 64-bit number naming where it
+starts in the GPU's address space. Put that number in a push constant, and the shader
+dereferences it. No descriptor, no set, no pool, no layout, nothing to keep in step.
+
+- <kbd>1</kbd> sway the ferns, to show the per-frame data is genuinely per-frame
+- <kbd>2</kbd> report what this frame put in the arena, and at which addresses
+
+## A buffer can have an address
+
+Two things have to be true first. The device must have been created with
+`VkPhysicalDeviceVulkan12Features::bufferDeviceAddress`, which `vkcommon` has asked for
+since Part 1, and the buffer must have been created with
+`VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT`. Then:
+
+```cpp title="code/src/4.advanced_vulkan/buffer_device_address/main.cpp"
+[[nodiscard]] VkDeviceAddress buffer_address(VkDevice device, VkBuffer buffer) {
+    const VkBufferDeviceAddressInfo info{
+        .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+        .pNext = nullptr,
+        .buffer = buffer,
+    };
+    return vkGetBufferDeviceAddress(device, &info);
+}
+```
+
+That is the whole API. `VkDeviceAddress` is a `uint64_t`, the value is a real address in
+the GPU's virtual address space, and it does not change for as long as the buffer lives
+— so this is worth calling once when the buffer is created rather than once per frame.
+
+Press <kbd>2</kbd> and the sample prints the addresses it is working with:
+
+```text
+arena base 0x9800000, globals[0] 0x9800000, draws 0x9800700
+cube vertices 0xdefa1e0000, quad 0xdefa1e0350, sphere 0xdefa1e0470
+```
+
+Two things are visible there that reading the code would not have told you. The arena and
+the meshes live in completely different regions of the address space, because they are in
+different kinds of memory — the arena is host-visible memory the CPU writes into, the
+meshes are device-local.
+
+And the meshes are packed nose to tail. The cube's 24 vertices are 768 bytes and its 36
+indices are 72 more; 840 bytes, rounded up to the 848 (`0x350`) that separates the cube's
+vertices from the quad's. Six buffers created one after another landed in one VMA block,
+each one starting where the last left off. Addresses show you your allocator, which is
+occasionally more than you wanted to know.
+
+## The shader dereferences it
+
+Slang spells a pointer the way C++ does.
+
+```slang title="code/src/4.advanced_vulkan/buffer_device_address/scene.slang"
+struct PushConstants {
+    Globals* globals;
+    DrawData* draws;
+    Vertex* vertices;
+    uint draw_index;
+};
+[[vk::push_constant]] PushConstants push;
+```
+
+and dereferences it the way C++ does, with `*p`, `p->field`, `p.field` and `p[i]` all
+meaning what you expect:
+
+```slang
+Vertex vertex = push.vertices[vertex_id];
+DrawData draw = push.draws[push.draw_index];
+...
+output.position = mul(push.globals.projection, mul(push.globals.view, world));
+```
+
+Those four lines are why the module comes out of Slang declaring a different memory
+model from every other shader in this series:
+
+```text
+OpCapability PhysicalStorageBufferAddresses
+OpCapability Int64
+OpExtension "SPV_KHR_physical_storage_buffer"
+OpMemoryModel PhysicalStorageBuffer64 GLSL450
+```
+
+A pointer is not a Vulkan concept that SPIR-V borrows. It is a SPIR-V storage class —
+`PhysicalStorageBuffer` — and `vkGetBufferDeviceAddress` is the one function that
+connects it to an object you created.
+
+Note what is now *absent* from the pipeline layout. There is no descriptor set for
+per-frame data and no binding number for it, so there is nothing to keep in step
+between the shader and the C++. The only thing the two sides must agree on is the shape
+of the structs — which is the next section, and it is where this chapter's one real
+trap lives.
+
+## Natural layout is scalar layout, and scalar layout is a feature
+
+The first run of this sample did not draw anything. It printed this, twice:
+
+```text
+vkCreateShaderModule(): pCreateInfo->pCode (spirv-val produced an error):
+Structure id 128 decorated as Block for variable in PhysicalStorageBuffer storage
+class must follow relaxed storage buffer layout rules: member 1 is an improperly
+straddling vector at offset 12
+  %Vertex_natural = OpTypeStruct %v3float %v3float %v2float
+```
+
+The struct it is complaining about is the vertex, and it is the most ordinary struct in
+the entire project:
+
+```slang
+struct Vertex {
+    float3 position;
+    float3 normal;
+    float2 uv;
+};
+```
+
+`position` occupies bytes 0 to 12. `normal` therefore starts at byte 12 and ends at byte
+24 — and in doing so it crosses the 16-byte boundary in the middle. The default layout
+rules for a block forbid that. They are the rules a uniform or storage block has always
+followed, and they exist because the hardware that fetches a `vec3` would rather not
+fetch it in two pieces.
+
+The fix is a device feature, and it is one line:
+
+```cpp title="code/common/scaffold/src/context.cpp"
+features12.scalarBlockLayout = VK_TRUE;
+```
+
+With `scalarBlockLayout`, a member is aligned to its own size and nothing more — which
+is exactly what a C++ compiler does. That single fact is what makes this chapter's data
+sharing work at all, and it is worth stating plainly:
+
+:::note[A struct behind a pointer is laid out like a C++ struct]
+This is the difference that makes addresses pleasant rather than merely possible. A
+uniform block obeys std140, where a three-float column is rounded up to sixteen bytes,
+so chapter 4.4's C++ had to pad its normal matrix by hand into three `glm::vec4`. Here
+it does not:
+
+```cpp
+struct DrawData {
+    glm::mat4 model;           // 0
+    glm::mat3 normal_matrix;   // 64
+    glm::vec4 colour;          // 100
+};
+static_assert(offsetof(DrawData, normal_matrix) == 64);
+static_assert(offsetof(DrawData, colour) == 100);
+static_assert(sizeof(DrawData) == 116);
+```
+
+A `glm::mat3` is 36 bytes. A Slang `float3x3` behind a pointer is 36 bytes. The padding
+stops existing, and 116 is not a number you would ever see in a uniform buffer.
+
+The `static_assert`s are the check, and they are not decoration. Nothing at run time
+compares the C++ struct against the Slang one — there is no descriptor to describe it
+and no validation layer that can see both sides. If the two ever disagree, the shader
+reads the wrong bytes and draws something plausible. Assert the offsets you rely on, so
+that a disagreement stops the build instead of shipping.
+:::
+
+## The frame arena
+
+With the layout settled, the per-frame buffers can collapse into one allocation.
+
+`FrameArena` is a mapped buffer and a cursor. Each frame resets it and writes into it
+from the top, and each write returns the address the bytes landed at:
+
+```cpp title="code/src/4.advanced_vulkan/buffer_device_address/main.cpp"
+[[nodiscard]] VkDeviceAddress write(const void* data, VkDeviceSize bytes) {
+    constexpr VkDeviceSize kAlignment = 16;
+    const VkDeviceSize offset = (used_ + kAlignment - 1) & ~(kAlignment - 1);
+    if (offset + bytes > capacity_) {
+        throw std::runtime_error(...);
+    }
+    std::memcpy(static_cast<std::byte*>(buffer_.mapped()) + offset, data,
+                static_cast<size_t>(bytes));
+    used_ = offset + bytes;
+    return base_ + offset;
+}
+```
+
+The last line is the entire suballocator. There is no Vulkan object for "a range within
+a buffer" and there does not need to be one: a range within a buffer is an address, and
+addresses can be added to.
+
+Resetting the arena at the top of the frame needs no synchronisation, for the same
+reason the command buffer can be reused there. There is one arena per frame in flight,
+and the frame that owns this slot was waited on before the command buffer was handed
+over, so nothing on the GPU is still reading it.
+
+The arena is host-visible rather than device-local with a staging copy, which is the
+right trade for data like this and the wrong trade for the meshes. This data is written
+once by the CPU and read a handful of times by the GPU in the same frame; staging it
+would add a transfer, a barrier and a second allocation to optimise reads that are not
+the bottleneck. Vertices, read thousands of times per frame and written once ever, go
+the other way.
+
+Press <kbd>2</kbd> and the sample reports what the frame actually cost:
+
+```text
+arena: 2952 of 65536 bytes used -- 7 globals x 256 B, 10 draws x 116 B
+       71 push constants x 32 B recorded into the command buffer
+```
+
+Seven sets of per-pass constants and ten objects, in 2,952 bytes, in one allocation, with
+zero descriptors. Chapter 4.4 spent fourteen `VkBuffer`s and fourteen `VkDescriptorSet`s
+on the same seven sets of constants, and pushed the same 71 draws' worth of push
+constants at 128 bytes each rather than 32 — 9,088 bytes of matrices copied into the
+command buffer per frame, against 2,272 bytes of addresses.
+
+The 128 bytes became 32 because the model matrix stopped travelling in the push
+constant. It is written into the arena once per frame and read by however many passes
+want it; 4.4 re-pushed it for every object in every one of the seven passes.
+
+Press <kbd>1</kbd> to see why this is called dynamic data. The ferns start swaying,
+because their model matrices are rebuilt from nothing every frame — and no buffer is
+created, no descriptor is written, and no code changes shape to allow it. Rebuilding a
+static scene's transforms every frame looks wasteful and is not: it is one `memcpy` into
+mapped memory, which is cheaper than the bookkeeping needed to work out which objects
+moved.
+
+## The vertex buffer stops being a vertex buffer
+
+If a shader can read a struct out of memory, it can read a vertex out of memory. This
+sample does, for everything it draws:
+
+```slang title="code/src/4.advanced_vulkan/buffer_device_address/scene.slang"
+[shader("vertex")]
+VSOutput vertexMain(uint vertex_id : SV_VulkanVertexID) {
+    Vertex vertex = push.vertices[vertex_id];
+    DrawData draw = push.draws[push.draw_index];
+    ...
+}
+```
+
+There is no `VSInput` struct, no `[[vk::location(0)]]` anywhere, and correspondingly no
+`vertex_input()` call on any pipeline builder in `create_pipelines()` and no
+`vkCmdBindVertexBuffers` call anywhere in `main.cpp`. Every pipeline is created with zero
+vertex bindings and zero attributes, because vertex fetch is no longer a fixed-function
+stage being configured. It is a load.
+
+Three details are worth pausing on.
+
+**The index buffer is still bound**, with `vkCmdBindIndexBuffer`. That is not an
+inconsistency. Index fetch really is fixed-function hardware, running before any shader
+to decide which vertices to run it on, so it has to be told through the command buffer.
+`SV_VulkanVertexID` is the index that hardware produced.
+
+**The vertex buffers no longer ask for `VK_BUFFER_USAGE_VERTEX_BUFFER_BIT`.** They ask
+for `VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT` instead, because usage flags are what
+the driver chooses memory type and alignment from, and they should say what is true.
+
+**A validation problem disappeared.** Chapter 4.4 had to give each pipeline a hand-cut
+subspan of its attribute array, because the skybox reads only the position and the
+layers report every declared attribute a shader does not consume. Here the question
+cannot arise: the pipeline describes no vertex layout, and each shader reads the fields
+it wants. The skybox reads exactly one:
+
+```slang title="code/src/4.advanced_vulkan/buffer_device_address/environment.slang"
+float3 position = push.vertices[vertex_id].position;
+```
+
+## What addresses cannot replace
+
+The sample still has five descriptor sets, and they are all textures. An image cannot be
+reached by address, and the reason is not an oversight in the API.
+
+A buffer is bytes. An image is bytes plus a format, a tiling arrangement the driver
+chose, a swizzle, a mip chain and a filtering mode — and the hardware that reads one
+needs all of that, in a form it can consume, before it can turn a coordinate into a
+colour. That bundle is what a descriptor is. There is no 64-bit number that can stand in
+for it, because the information genuinely is not one number.
+
+So the count went from nineteen descriptor sets and two layouts to five sets and one
+layout, and the five that remain are exactly the ones that were never about finding
+bytes. Chapter 3.4 already showed the other half of the answer for images: when there
+are too many textures to bind one at a time, you do not get an address, you get an
+*index* into an unbounded array. Addresses for buffers, indices for images.
+
+## What it costs
+
+This is a real trade, and the article would be dishonest to skip it.
+
+**There is no type safety.** `VkDeviceAddress` is a `uint64_t`. Nothing distinguishes the
+address of the globals from the address of the vertices, and the three fields of
+`PushConstants` are named as carefully as they are for exactly that reason. Swap two of
+them and the compiler is content.
+
+**There is no bounds checking, and no validation message.** A descriptor that points at
+a buffer too small for what the shader reads is something the validation layers can
+catch, because they know both the buffer and the layout. An address is a number: read
+past the end of the arena and you get whatever is there, and read a stale address and
+you get a page fault, which surfaces as `VK_ERROR_DEVICE_LOST` with nothing to say about
+where it came from. This is the one place in the series where the usual advice — turn on
+the validation layers and read what they say — does not help by itself. GPU-assisted
+validation can instrument address accesses, and it is worth knowing that before you need
+it.
+
+**Addresses are not stable across runs.** They are assigned when the buffer is created,
+so nothing that contains one can be serialised and reloaded, and a capture tool replaying
+a frame has to reconstruct them — which is what
+`VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT` exists for. If RenderDoc cannot
+replay a capture of your renderer, this is usually why.
+
+What you get in exchange is that data stops being plumbed. There is no per-frame
+descriptor allocation, no set layout to keep in step with a shader, no binding numbers,
+and — the part that matters most later — a shader can be handed a structure it walks
+through by itself. A pointer inside a struct behind a pointer is just another pointer.
+That is what makes GPU-driven rendering possible, and it starts here.
+
+## Checking it against the previous chapter
+
+The claim this chapter makes is that nothing changed except the plumbing. That is
+checkable: 4.4's reference image and 4.5's are the same camera looking at the same scene
+lit the same way, so they should be the same image.
+
+Comparing the two captures at frame 90: **1 of 921,600 pixels differs, by 1 in one
+channel.** One pixel, one level. Floating-point arithmetic reassociated somewhere between
+a uniform load and a pointer load, and that is the entire visible consequence of
+replacing every buffer binding in the sample.
+
+That check is worth more than it looks. A layout disagreement between the C++ and the
+Slang would not crash — it would shade with a transposed matrix or a shifted normal, and
+look almost right. "Almost right" is exactly what a pixel comparison against a known-good
+image catches and what reading the code does not.
+
+:::note[What moved into vkcommon]
+Only one line: `features12.scalarBlockLayout = VK_TRUE` in `Context::create_device()`,
+because it is a property of the device every later chapter will want, and because a
+chapter that forgot it would fail in a way that is hard to read.
+
+`buffer_address()` and `FrameArena` stay in this chapter's `main.cpp`. They are what the
+chapter teaches, and by the rule this series follows they are not shared until the next
+chapter that needs them can say so.
+:::
+
+## What changed since 4.4
+
+- `vkGetBufferDeviceAddress`, and `VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT` on every
+  buffer a shader reads
+- pointers in Slang, and the `PhysicalStorageBuffer64` memory model that comes with them
+- `scalarBlockLayout`, without which the very first pointer is rejected
+- fourteen uniform buffers and fourteen descriptor sets replaced by one 64 KiB arena per
+  frame in flight, bump-allocated
+- push constants down from 128 bytes to 32, because they now carry addresses rather than
+  matrices
+- no vertex input state anywhere: no attributes, no bindings, no
+  `vkCmdBindVertexBuffers`. Vertices are pulled with `SV_VulkanVertexID`
+- the index buffer still bound, because index fetch is still fixed-function
+- 30 chapters in the build now
+
+## Exercises
+
+1. Delete `features12.scalarBlockLayout = VK_TRUE` and run. Predict, before you do, which
+   of the two shaders is rejected first and which member it names. Then put a `float pad;`
+   after `position` in both `Vertex` structs and watch the error move.
+2. Swap the `globals` and `draws` fields in the C++ `PushConstants` without touching the
+   Slang. Describe what you see, then work out how long it would have taken you to find
+   this if it had been a one-field shift rather than a total scramble.
+3. Drop `kArenaBytes` to 1024 and read the exception. Then raise the arena to exactly
+   2,952 bytes and explain why it still throws.
+4. The skybox is handed a `draws` pointer and a `draw_index` it never dereferences. Give
+   it `0` as the address instead and confirm nothing happens. Then make its fragment
+   shader read `push.draws[0].colour` and explain the result.
+5. Put a pointer *inside* `DrawData` — a `float4*` of per-object data, allocated in the
+   same arena — and have the fragment shader follow it. This is the shape everything from
+   here to GPU-driven rendering is built on.
+6. Measure it. Time 4.4 and 4.5 over a thousand frames and compare. The honest expected
+   answer for a scene this size is "no difference you can measure", and understanding why
+   the technique is still worth it is the point of the exercise.
+
+Next: 4.6 turns to Slang itself — modules, generics and interfaces — because the scene
+shader and the environment shader in this chapter contain the same four struct
+declarations copied word for word, and that is exactly the kind of thing that stops being
+acceptable once the structs are the only contract left holding the two sides together.

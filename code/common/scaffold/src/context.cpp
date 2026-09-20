@@ -326,6 +326,15 @@ void Context::create_device() {
     // without it enabled is rejected by vkCreateShaderModule. Chapter 3.4 needs exactly
     // this one, for its unbounded `Sampler2D base_colour_maps[]`.
     features12.runtimeDescriptorArray = VK_TRUE;
+    // How a struct reached through a 64-bit address is laid out in memory. Without this,
+    // a buffer's contents must follow the "relaxed" rules a uniform or storage block
+    // follows, the sharpest of which is that no vector may straddle a 16-byte boundary:
+    // two float3 in a row put the second one at offset 12, spanning 12 to 24, and
+    // vkCreateShaderModule rejects the module outright. With it, the rule becomes the one
+    // a C++ compiler already uses -- every member aligned to its own size and nothing
+    // else -- so a struct in Slang and the same struct in C++ are the same bytes.
+    // Chapter 4.5 hits this on its very first pointer and explains it in full.
+    features12.scalarBlockLayout = VK_TRUE;
 
     VkPhysicalDeviceFeatures2 features2{};
     features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
