@@ -1,205 +1,1122 @@
 ---
 title: The Instance
-description: Creating a VkInstance, turning on the validation layers, and wiring up the debug messenger.
+description: Creating a VkInstance, turning on the validation layers, and wiring up the debug messenger - every line of it.
 sidebar:
   order: 2
 ---
 
-The `VkInstance` is Vulkan's root object. It holds the API version you intend to use,
-the layers you want wrapped around your calls, and the instance-level extensions you
-need. Everything else — devices, queues, buffers, pipelines — descends from it.
+The `VkInstance` is Vulkan's root object. It holds the API version you intend to use, the
+layers you want wrapped around your calls, and the instance-level extensions you need.
+Everything else — devices, queues, buffers, pipelines — descends from it.
+
+It is **not** a connection to a GPU. That comes in 1.3. An instance is a connection to
+*the Vulkan implementation on this machine*: the loader, the layers, and whatever drivers
+it can find.
 
 This chapter also turns on the validation layers, which is the most valuable thing you
 will do in the entire series.
 
-## Loading the entry points
+## What is actually between you and the driver
 
-```cpp title="code/src/1.getting_started/the_instance/main.cpp"
-VK_CHECK(volkInitialize());
+A Vulkan call does not go straight to your graphics card. Understanding the chain it does
+go through explains most of this chapter.
+
+```
+   your program
+        │  vkCreateInstance(...)
+        ▼
+   ┌──────────────────┐
+   │  the loader      │   finds drivers, dispatches calls, inserts layers
+   └──────────────────┘
+        │
+        ▼
+   ┌──────────────────┐
+   │  validation layer│   checks every argument, then calls through
+   └──────────────────┘
+        │
+        ▼
+   ┌──────────────────┐   ┌──────────────────┐
+   │  NVIDIA driver   │   │  Intel driver    │   one per installed GPU vendor
+   └──────────────────┘   └──────────────────┘
 ```
 
-Vulkan is not a normal library you link against. The Vulkan *loader* is a thin shim
-that finds the driver at run time, and every `vk*` function has to be fetched from it
-by name. Doing that by hand for several hundred functions is not a good use of anyone's
-time, so we use [volk](https://github.com/zeux/volk).
+**The loader** is a small system library — `libvulkan.so.1`, `vulkan-1.dll` — that ships
+with the OS or the driver. Its job is to find every Vulkan driver installed on the
+machine (each one is called an **ICD**, an Installable Client Driver), present them as one
+API, and route each call to the right one.
 
-`volkInitialize` finds the loader and fetches the handful of functions that exist
-before an instance does — `vkCreateInstance`,
-`vkEnumerateInstanceLayerProperties` and a few others. Every other `vk*` symbol is a
-null pointer until later.
+**A layer** is an optional library the loader splices into that chain. It receives your
+call, does something with it, and passes it along. Layers can validate, trace, capture
+frames for RenderDoc, or overlay a frame-rate counter. They are not part of the driver and
+they can be switched on and off without changing your program.
 
-This is why the project defines `VK_NO_PROTOTYPES` globally: it stops the headers
-declaring the functions as ordinary linker symbols, so volk's function pointers are the
-only way to reach them. Calling one before it has been loaded is a segfault with an
-empty stack trace, and it is the single most confusing failure mode of this setup.
+This is why Vulkan has no `glGetError`. The driver does essentially no checking — that is
+a large part of why it is fast — and the checking lives in a layer you enable during
+development and ship without.
 
-:::note[Three loads, in order]
-`volkInitialize()` → `volkLoadInstanceOnly(instance)` → `volkLoadDevice(device)`.
-Each one unlocks the next tier of functions. We hit the second in this chapter and the
-third in 1.3.
+## Handles
+
+This chapter creates the first Vulkan object, so this is the moment to say what one is.
+
+Everything in Vulkan is reached through a **handle**: `VkInstance`, `VkDevice`,
+`VkBuffer`. A handle is an **opaque** value — usually a 64-bit integer — that identifies an
+object living inside the driver. "Opaque" means you cannot look inside it. There is no
+`VkInstance` struct with fields to read; there is a token the driver knows how to
+interpret, and a set of functions that take it.
+
+That is why every Vulkan function takes the object it acts on as its **first argument**,
+and why there is no `instance.createDevice(...)`. It is a C API, and the handle is the
+`this` pointer written out by hand. Chapter 1.3 adds the other half of the story — which
+handles you must destroy and which you must not.
+
+## What chapter 1.1 left behind
+
+The window is no longer built here. Chapter 1.1 wrote `SDL_Init`, `SDL_CreateWindow` and
+the destruction that pairs with them, and explained every line; that code now lives in the
+scaffold as `vkc::Window`, and this chapter uses it.
+
+This is the first time that happens, so it is worth looking at what moved rather than
+taking it on trust.
+
+```cpp title="code/common/scaffold/include/vkc/window.hpp"
+class Window {
+public:
+    Window(std::string_view title, uint32_t width, uint32_t height,
+           bool resizable = true);
+    ~Window();
+
+    Window(const Window&) = delete;
+    Window& operator=(const Window&) = delete;
+    Window(Window&&) = delete;
+    Window& operator=(Window&&) = delete;
+```
+
+The constructor takes what 1.1 passed to `SDL_CreateWindow`, and the four deleted special
+members are 1.1's, for 1.1's reason: the object owns a handle that must be destroyed
+exactly once.
+
+```cpp title="code/common/scaffold/src/window.cpp"
+Window::Window(std::string_view title, uint32_t width, uint32_t height,
+               bool resizable) {
+    ensure_sdl_initialised();
+
+    const std::string owned_title(title);
+    window_ = SDL_CreateWindow(owned_title.c_str(), static_cast<int>(width),
+                               static_cast<int>(height),
+                               SDL_WINDOW_VULKAN | (resizable ? SDL_WINDOW_RESIZABLE : 0));
+    if (window_ == nullptr) {
+        throw std::runtime_error(
+            std::format("SDL_CreateWindow failed: {}", SDL_GetError()));
+    }
+}
+```
+
+That is chapter 1.1's constructor, with the title copied into a `std::string` because
+`std::string_view` is not guaranteed to be null-terminated and `SDL_CreateWindow` wants a
+C string.
+
+One thing genuinely changed. Chapter 1.1 called `SDL_Init` in the constructor and
+`SDL_Quit` in the destructor. A library cannot do that, because two windows would
+initialise SDL twice and the first one destroyed would shut it down under the second. So
+the subsystem became a function-local static:
+
+```cpp title="code/common/scaffold/src/window.cpp"
+struct SdlVideoSubsystem {
+    SdlVideoSubsystem() {
+        if (!SDL_Init(SDL_INIT_VIDEO)) {
+            throw std::runtime_error(
+                std::format("SDL_Init(SDL_INIT_VIDEO) failed: {}", SDL_GetError()));
+        }
+    }
+    ~SdlVideoSubsystem() { SDL_Quit(); }
+};
+
+void ensure_sdl_initialised() {
+    static SdlVideoSubsystem subsystem;
+    (void)subsystem;
+}
+```
+
+A function-local `static` is constructed the first time control passes through it, and
+destroyed at program exit — and C++11 onward guarantees that construction is thread-safe.
+So SDL is initialised exactly once no matter how many windows are made, and shut down
+exactly once at the end.
+
+:::note[The rule, and how it is enforced]
+A chapter may only use scaffold pieces that earlier chapters taught, and this is checked by
+the build rather than by good intentions. This chapter's `CMakeLists.txt` says:
+
+```cmake title="code/src/1.getting_started/the_instance/CMakeLists.txt"
+# This chapter teaches the instance, so it writes the instance by hand. It stands on
+# chapter 1.1's window, which is now vkc_window -- and on nothing else: a call into
+# vkc::Device or vkc::Swapchain from here would fail to link.
+add_chapter(1.2.the_instance
+    SOURCES main.cpp
+    SCAFFOLD vkc_window
+)
+```
+
+`vkc_window` and nothing else. Calling into `vkc::Device` — chapter 1.3's subject — from
+here is a link error:
+
+```
+undefined reference to `vkc::Device::wait_idle() const'
+```
+
+You will see that `SCAFFOLD` line grow by one piece per chapter for the rest of Part 1.
 :::
+
+## New includes
+
+```cpp title="code/src/1.getting_started/the_instance/main.cpp"
+#include <vkc/capture.hpp>
+#include <vkc/check.hpp>
+#include <vkc/window.hpp>
+
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_vulkan.h>
+#include <spdlog/spdlog.h>
+
+#include <algorithm>
+#include <cstdlib>
+#include <exception>
+#include <format>
+#include <stdexcept>
+#include <string_view>
+#include <vector>
+```
+
+`vkc/window.hpp` is new for the reason above. `SDL3/SDL_vulkan.h` brings
+`SDL_Vulkan_GetInstanceExtensions`, `<algorithm>` brings `std::ranges::any_of`, and
+`<string_view>` and `<vector>` are for the two availability helpers.
+
+There is no `#include <vulkan/vulkan.h>` anywhere in this file, which surprises most
+people. `vkc/check.hpp` includes `volk.h`, and volk includes the Vulkan headers itself with
+`VK_NO_PROTOTYPES` already set. Including the Vulkan header directly *before* volk is a
+real mistake with a confusing symptom, and not including it at all is how you avoid making
+it.
+
+## Loading the entry points
+
+Vulkan is not a normal library you link against. Every `vk*` function has to be fetched
+from the loader by name at run time, and doing that by hand for several hundred functions
+is not a good use of anyone's time, so we use [volk](https://github.com/zeux/volk).
+
+```cpp title="code/src/1.getting_started/the_instance/main.cpp"
+    void init_instance() {
+        VK_CHECK(volkInitialize());
+```
+
+What that actually does is fill in a table of function pointers. `VK_NO_PROTOTYPES` — set
+project-wide in `vkbase` — stops the Vulkan headers declaring the functions as ordinary
+linker symbols, so every name like `vkCreateInstance` is a **variable holding a pointer**,
+not a function you link against.
+
+They arrive in three tiers, because a function that operates on a device cannot be found
+until a device exists:
+
+```
+  volkInitialize()              ~5 functions    vkCreateInstance, vkEnumerate*Properties
+        │
+        ▼
+  volkLoadInstanceOnly(inst)    ~200 functions  vkCreateDevice, vkEnumeratePhysicalDevices,
+        │                                       vkCreateDebugUtilsMessengerEXT
+        ▼
+  volkLoadDevice(device)        ~400 functions  vkCmdDraw, vkQueueSubmit2, everything else
+```
+
+Calling a function before its tier has loaded is a **jump through a null pointer**: a
+segfault with an empty stack trace, on a line that looks perfectly correct. It is the single
+most confusing failure mode of this setup, and this chapter hits the first two tiers while
+1.3 hits the third.
 
 ## Checking the result of everything
 
-Almost every Vulkan function returns a `VkResult`, and almost every one of those is a
-code you are expected to check. Ignoring them is how a first Vulkan program becomes a
-black window with no explanation.
+Almost every Vulkan function returns a `VkResult`, and almost every one of those is a code
+you are expected to check. Ignoring them is how a first Vulkan program becomes a black
+window with no explanation.
 
 ```cpp title="code/common/base/include/vkc/check.hpp"
-#define VK_CHECK(expression)                                       \
-    do {                                                           \
-        const VkResult vkc_result_ = (expression);                 \
-        if (vkc_result_ != VK_SUCCESS) {                           \
-            ::vkc::throw_vulkan_error(vkc_result_, #expression,    \
-                                      __FILE__, __LINE__);         \
-        }                                                          \
+// VK_CHECK(vkCreateInstance(...)) — evaluates once, throws on anything but VK_SUCCESS.
+#define VK_CHECK(expression)                                                        \
+    do {                                                                            \
+        const VkResult vkc_result_ = (expression);                                  \
+        if (vkc_result_ != VK_SUCCESS) {                                            \
+            ::vkc::throw_vulkan_error(vkc_result_, #expression, __FILE__, __LINE__); \
+        }                                                                           \
     } while (false)
 ```
 
-It evaluates its argument exactly once and throws on anything that is not
-`VK_SUCCESS`, with the failing expression, the result name and the source location in
-the message. Every sample in this series wraps every call in it.
+It evaluates its argument exactly once — hence the temporary, rather than `if ((expr) !=
+VK_SUCCESS)` which would run the call twice if written carelessly — and throws on anything
+that is not `VK_SUCCESS`, with the failing expression, the result name and the source
+location in the message. The `do { } while (false)` is the standard trick that lets a
+multi-statement macro be used like a single statement, semicolon and all.
 
-`VK_CHECK` lives in `vkbase` rather than being written out in each chapter, because
-error handling is not a Vulkan lesson.
+`VK_CHECK` lives in `vkbase` rather than being retyped in each chapter — but it is not
+something you are handed and expected to trust. The header it comes from, and the source
+file behind it, are written out in full at the end of this chapter.
 
-## Describing the application
+## Asking what is available
 
-```cpp title="code/src/1.getting_started/the_instance/main.cpp"
-const VkApplicationInfo app_info{
-    .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
-    .pNext = nullptr,
-    .pApplicationName = "LearnVulkan",
-    .applicationVersion = VK_MAKE_VERSION(0, 1, 0),
-    .pEngineName = "LearnVulkan",
-    .engineVersion = VK_MAKE_VERSION(0, 1, 0),
-    .apiVersion = VK_API_VERSION_1_3,
-};
-```
-
-Two Vulkan conventions appear here and then recur in every struct for the rest of the
-series.
-
-**`sType`** identifies the struct's type at run time. It looks redundant — the compiler
-knows the type — but it is what makes `pNext` work.
-
-**`pNext`** is a linked list of extension structs. Rather than adding parameters to
-functions, Vulkan extends behaviour by letting you chain additional structs onto the
-one you pass in. We use it in a moment, and heavily in 1.3.
-
-`apiVersion` is the version you promise to obey. Asking for 1.3 is precisely what
-makes dynamic rendering and `synchronization2` available as core features later; ask
-for 1.0 and those functions do not exist.
-
-## Which extensions
-
-Vulkan knows nothing about windows. Presenting to one requires `VK_KHR_surface` plus a
-platform-specific partner — `VK_KHR_wayland_surface`, `VK_KHR_win32_surface`,
-`VK_KHR_xcb_surface`. Rather than guess, we ask SDL, which created the window and
-therefore knows:
+Two small functions, both following a pattern you will see perhaps thirty times before the
+series is out.
 
 ```cpp title="code/src/1.getting_started/the_instance/main.cpp"
-uint32_t sdl_extension_count = 0;
-const char* const* sdl_extensions =
-    SDL_Vulkan_GetInstanceExtensions(&sdl_extension_count);
+namespace {
 
-std::vector<const char*> extensions(sdl_extensions,
-                                    sdl_extensions + sdl_extension_count);
+constexpr const char* kValidationLayer = "VK_LAYER_KHRONOS_validation";
+
+bool layer_available(std::string_view name) {
+    uint32_t count = 0;
+    VK_CHECK(vkEnumerateInstanceLayerProperties(&count, nullptr));
+    std::vector<VkLayerProperties> layers(count);
+    VK_CHECK(vkEnumerateInstanceLayerProperties(&count, layers.data()));
+
+    return std::ranges::any_of(layers, [name](const VkLayerProperties& layer) {
+        return name == layer.layerName;
+    });
+}
 ```
 
-This is what keeps the file platform-independent. On this machine it yields
-`VK_KHR_surface` and `VK_KHR_wayland_surface`; on Windows it would be
-`VK_KHR_surface` and `VK_KHR_win32_surface`, with no change to the code.
+**`vkEnumerateInstanceLayerProperties` is called twice**, and that is not a typo. This is
+Vulkan's universal idiom for "give me a list whose length I do not know":
 
-We add one more, `VK_EXT_debug_utils`, which provides the messenger below and the
-object-naming used from 1.4 onward.
+```
+  first call   (&count, nullptr)       → count = 7        "there are seven"
+  make room    vector<...> layers(7)
+  second call  (&count, layers.data()) → fills the array
+```
 
-## The validation layers
+There is no version that allocates for you, because a C API has no way to hand back memory
+that you know how to free. Get comfortable with it now: you will write this shape for
+physical devices, queue families, surface formats and present modes in the next two
+chapters.
 
-A **layer** is a library that inserts itself between your calls and the driver. The
-one that matters is `VK_LAYER_KHRONOS_validation`, and what it does is check every
-argument of every call against the specification and tell you exactly what you got
-wrong, with a link to the relevant rule.
-
-Vulkan itself does essentially no checking — that is a large part of why it is fast.
-Without the layers, a mistake produces a blank screen, a driver crash, or a result
-that happens to look right on your GPU and wrong on someone else's.
+`layer.layerName` is a `char[256]`, and comparing it to a `std::string_view` does the right
+thing — the view is constructed from the array as a null-terminated string.
 
 ```cpp title="code/src/1.getting_started/the_instance/main.cpp"
-validation_enabled_ = args_.validation && layer_available(kValidationLayer);
+bool instance_extension_available(std::string_view name) {
+    uint32_t count = 0;
+    VK_CHECK(vkEnumerateInstanceExtensionProperties(nullptr, &count, nullptr));
+    std::vector<VkExtensionProperties> extensions(count);
+    VK_CHECK(vkEnumerateInstanceExtensionProperties(nullptr, &count, extensions.data()));
+
+    return std::ranges::any_of(extensions, [name](const VkExtensionProperties& ext) {
+        return name == ext.extensionName;
+    });
+}
 ```
 
-We check availability first rather than requesting blindly, because asking for a layer
-that is not installed makes `vkCreateInstance` fail outright with
-`VK_ERROR_LAYER_NOT_PRESENT`. A warning telling you to install them is more useful
-than a crash.
+The same shape. That leading `nullptr` is a layer name: pass one and you get the extensions
+*that layer* provides rather than the implementation's own. We want the implementation's, so
+it stays null.
 
-:::caution
-Layers are a development tool. They cost real performance and ship disabled. But
-develop with them on — always.
-:::
+An **extension** is a piece of API beyond the core specification — a vendor's new feature, a
+platform integration, something that arrived after the spec was frozen. You ask for it by
+name, and it may not be there.
 
 ## Where the messages go
 
-The layers do not print anything by themselves; they hand messages to a callback you
-provide.
+The validation layers do not print anything by themselves. They hand each message to a
+callback you provide, and this is it.
 
 ```cpp title="code/src/1.getting_started/the_instance/main.cpp"
 VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(
     VkDebugUtilsMessageSeverityFlagBitsEXT severity,
-    VkDebugUtilsMessageTypeFlagsEXT types,
-    const VkDebugUtilsMessengerCallbackDataEXT* data, void* user_data) {
-    // ... log data->pMessage at the right level ...
+    VkDebugUtilsMessageTypeFlagsEXT /*types*/,
+    const VkDebugUtilsMessengerCallbackDataEXT* data, void* /*user_data*/) {
+    if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
+        spdlog::error("[vulkan] {}", data->pMessage);
+    } else if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
+        spdlog::warn("[vulkan] {}", data->pMessage);
+    } else {
+        spdlog::info("[vulkan] {}", data->pMessage);
+    }
     return VK_FALSE;
 }
 ```
 
-Returning `VK_FALSE` means "carry on with the call". `VK_TRUE` aborts the offending
-call and is only meaningful to people developing the layers themselves.
+The signature is fixed by the extension; you do not get to choose it. **`VkBool32`** is
+Vulkan's boolean: a 32-bit unsigned integer rather than C++'s `bool`, because a C API
+cannot assume every compiler linking against it agrees on how large a `bool` is or how it
+is passed. Its only legal values are `VK_TRUE` and `VK_FALSE`.
+**`VkDebugUtilsMessengerCallbackDataEXT`** is the message itself — `pMessage` holds the
+text, and the struct also carries the handles and names of the objects involved, which is
+what lets a named object appear in an error message instead of a bare hex handle.
 
-Vulkan may call this from whichever thread provoked the message, so anything it touches
-must be safe to touch from anywhere. Logging is.
+`VKAPI_ATTR` and `VKAPI_CALL` set the **calling convention** — the agreed rules for how
+arguments are passed and who cleans up the stack. They expand to nothing on 64-bit Linux
+and to `__stdcall` on 32-bit Windows. Omitting them builds fine on the machine you are on
+and corrupts the stack on someone else's, which is the worst kind of portability bug.
 
-We subscribe to warnings and errors only. The info and verbose levels are extremely
-chatty and will bury the messages that mean you have made a mistake.
+The severity arrives as a **bit**, not a number, so the tests are `&` rather than `==`: a
+message can in principle carry more than one.
+
+Returning **`VK_FALSE` means "carry on with the call"**. `VK_TRUE` aborts the offending
+call and is only meaningful to people developing the layers themselves. Return `VK_TRUE` by
+accident and your program starts failing calls the driver would have been perfectly happy
+with.
+
+Vulkan calls this from whichever thread provoked the message, so anything it touches must be
+safe to touch from anywhere. Logging is.
+
+The `[vulkan]` prefix is not decoration. Every sample in this book is required to produce
+zero validation messages, and that prefix is what `tools/capture.py` greps for when
+checking.
+
+## Describing the messenger
+
+```cpp title="code/src/1.getting_started/the_instance/main.cpp"
+VkDebugUtilsMessengerCreateInfoEXT debug_messenger_info() {
+    return VkDebugUtilsMessengerCreateInfoEXT{
+        .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+        .pNext = nullptr,
+        .flags = 0,
+        .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+                           VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
+        .messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+                       VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                       VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
+        .pfnUserCallback = debug_callback,
+        .pUserData = nullptr,
+    };
+}
+```
+
+It is a function rather than a constant because the same description is needed twice, in two
+places that cannot share a variable comfortably — once chained onto instance creation and
+once to create the real messenger.
+
+We subscribe to **warnings and errors only**. The info and verbose levels are extremely
+chatty; turning them on buries the messages that mean you have made a mistake under hundreds
+that mean nothing. All three *types* stay on: general, validation, and performance, the last
+of which is where best-practice advice arrives.
+
+Two conventions appear here and recur in every Vulkan struct for the rest of the series.
+
+**`sType`** identifies the struct's type at run time. It looks redundant — the compiler knows
+the type — but it is what makes the next one work.
+
+**`pNext`** is a pointer to another struct, forming a linked list. Vulkan is a C API and C
+structs cannot grow: adding a field to `VkInstanceCreateInfo` would change its size and
+break every program compiled against the old one. So the API never adds fields. New
+functionality arrives as a *new struct* that you chain on, and the driver walks the list,
+reads each `sType` to learn what it is, and ignores any it does not recognise. We use it for
+real a few lines below.
+
+This project writes **every member of every Vulkan struct**, including the ones being set to
+zero. Designated initialisers make that cheap, and it means a struct with a forgotten
+`pNext` is visible on the page rather than silently defaulted.
+
+## The class
+
+```cpp title="code/src/1.getting_started/the_instance/main.cpp"
+class InstanceApp {
+public:
+    explicit InstanceApp(const vkc::Args& args)
+        : args_(args),
+          window_("LearnVulkan - The Instance", args.width, args.height,
+                  /*resizable=*/args.screenshot.empty()) {
+        init_instance();
+    }
+```
+
+`window_` is constructed in the **member initialiser list**, before the constructor body
+runs. That ordering matters more than it looks: `init_instance()` asks SDL which instance
+extensions this platform needs, and SDL can only answer once its video subsystem is up —
+which happened inside the `Window` constructor.
+
+```cpp title="code/src/1.getting_started/the_instance/main.cpp"
+    ~InstanceApp() {
+        if (debug_messenger_ != VK_NULL_HANDLE) {
+            vkDestroyDebugUtilsMessengerEXT(instance_, debug_messenger_, nullptr);
+        }
+        if (instance_ != VK_NULL_HANDLE) {
+            vkDestroyInstance(instance_, nullptr);
+        }
+    }
+
+    InstanceApp(const InstanceApp&) = delete;
+    InstanceApp& operator=(const InstanceApp&) = delete;
+    InstanceApp(InstanceApp&&) = delete;
+    InstanceApp& operator=(InstanceApp&&) = delete;
+```
+
+Only what this chapter created is undone here — the window destroys itself, because members
+are destroyed automatically in reverse order of declaration once the destructor body has
+run.
+
+The messenger is destroyed **before** the instance it was created from. The other order is
+undefined behaviour, and it is the one mistake the layers cannot warn you about, because you
+have just destroyed the thing that would have done the warning.
+
+`VK_NULL_HANDLE` is Vulkan's null. Every handle member is initialised to it at declaration,
+so these checks are meaningful even when the constructor threw part-way through.
+
+```cpp title="code/src/1.getting_started/the_instance/main.cpp"
+    int run() {
+        report();
+
+        uint64_t frames = 0;
+        bool running = true;
+        while (running) {
+            SDL_Event event;
+            while (SDL_PollEvent(&event)) {
+                if (event.type == SDL_EVENT_QUIT ||
+                    event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED ||
+                    (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_ESCAPE)) {
+                    running = false;
+                }
+            }
+            ++frames;
+            if (args_.frame_limit != 0 && frames >= args_.frame_limit) {
+                running = false;
+            }
+        }
+        return 0;
+    }
+```
+
+Chapter 1.1's loop, compressed into one condition now that the resize case has nothing to do
+until 1.4. Everything interesting has already happened by the time this runs.
+
+## Describing the application
+
+```cpp title="code/src/1.getting_started/the_instance/main.cpp"
+        const VkApplicationInfo app_info{
+            .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+            .pNext = nullptr,
+            .pApplicationName = "LearnVulkan",
+            .applicationVersion = VK_MAKE_VERSION(0, 1, 0),
+            .pEngineName = "LearnVulkan",
+            .engineVersion = VK_MAKE_VERSION(0, 1, 0),
+            .apiVersion = VK_API_VERSION_1_3,
+        };
+```
+
+The names and versions are yours to choose and mostly end up in crash reports and driver
+profiles — some drivers really do check `pEngineName` and switch on game-specific
+workarounds, which is a strange thing to learn but true.
+
+`apiVersion` is not decoration. It is the version you **promise to obey**, and asking for
+**1.3** is precisely what makes dynamic rendering and `synchronization2` available as core
+features later. Ask for 1.0 and those functions do not exist, no matter what your driver
+supports.
+
+## Which extensions
+
+```cpp title="code/src/1.getting_started/the_instance/main.cpp"
+        uint32_t sdl_extension_count = 0;
+        const char* const* sdl_extensions =
+            SDL_Vulkan_GetInstanceExtensions(&sdl_extension_count);
+        if (sdl_extensions == nullptr) {
+            throw std::runtime_error(std::format(
+                "SDL_Vulkan_GetInstanceExtensions failed: {}", SDL_GetError()));
+        }
+
+        std::vector<const char*> extensions(sdl_extensions,
+                                            sdl_extensions + sdl_extension_count);
+```
+
+Vulkan knows nothing about windows. Presenting to one requires `VK_KHR_surface` plus a
+platform-specific partner — `VK_KHR_wayland_surface`, `VK_KHR_win32_surface`,
+`VK_KHR_xcb_surface`. Rather than guess, we ask SDL, which created the window and therefore
+knows.
+
+This one call is what keeps the file platform-independent: on this machine it yields
+`VK_KHR_surface` and `VK_KHR_wayland_surface`, and on Windows it would yield `VK_KHR_surface`
+and `VK_KHR_win32_surface` with no change to the code.
+
+SDL owns that array, so we copy it into a vector we can add to. `vkc::Window` wraps the same
+call as `required_instance_extensions()` for later chapters; it is written out here because
+choosing an instance's extensions is this chapter's subject.
+
+## The validation layers
+
+```cpp title="code/src/1.getting_started/the_instance/main.cpp"
+        validation_enabled_ = args_.validation && layer_available(kValidationLayer);
+        if (args_.validation && !validation_enabled_) {
+            spdlog::warn(
+                "Validation layers requested but {} is not installed. Install your "
+                "distribution's vulkan-validation-layers package (or the Vulkan SDK) "
+                "before going any further: developing without them is developing "
+                "blind.",
+                kValidationLayer);
+        }
+
+        debug_utils_enabled_ =
+            instance_extension_available(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+        if (debug_utils_enabled_) {
+            extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+        }
+
+        std::vector<const char*> layers;
+        if (validation_enabled_) {
+            layers.push_back(kValidationLayer);
+        }
+```
+
+`VK_LAYER_KHRONOS_validation` checks every argument of every call against the specification
+and tells you exactly what you got wrong, with a link to the rule you broke. Without it a
+mistake produces a blank screen, a driver crash, or a result that happens to look right on
+your GPU and wrong on someone else's.
+
+We check availability first rather than requesting blindly, because asking for a layer that
+is not installed makes `vkCreateInstance` fail outright with `VK_ERROR_LAYER_NOT_PRESENT`. A
+warning telling you to install them is more useful than a crash.
+
+**The layer and the extension are two different things and both are needed.**
+`VK_LAYER_KHRONOS_validation` produces the messages; `VK_EXT_debug_utils` is the mechanism
+that delivers them to your callback. The extension also provides the object naming used from
+1.8 onward, which turns `VkImage 0x5d2f1a` in an error message into `VkImage "depth buffer"`.
+
+:::caution
+Layers are a development tool. They cost real performance and ship disabled. But develop
+with them on — always.
+:::
 
 ## Catching errors in instance creation itself
 
-There is a bootstrapping problem. The messenger is created *from* the instance, so it
-cannot exist while `vkCreateInstance` is running — which is exactly when you would
-like to hear about a bad argument.
-
-The solution is `pNext`:
-
 ```cpp title="code/src/1.getting_started/the_instance/main.cpp"
-const VkDebugUtilsMessengerCreateInfoEXT messenger_info = debug_messenger_info();
+        const VkDebugUtilsMessengerCreateInfoEXT messenger_info = debug_messenger_info();
+        const bool debug_at_creation = validation_enabled_ && debug_utils_enabled_;
 
-const VkInstanceCreateInfo create_info{
-    .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-    .pNext = debug_at_creation ? &messenger_info : nullptr,
-    // ...
-};
-VK_CHECK(vkCreateInstance(&create_info, nullptr, &instance_));
+        const VkInstanceCreateInfo create_info{
+            .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+            .pNext = debug_at_creation ? &messenger_info : nullptr,
+            .flags = 0,
+            .pApplicationInfo = &app_info,
+            .enabledLayerCount = static_cast<uint32_t>(layers.size()),
+            .ppEnabledLayerNames = layers.data(),
+            .enabledExtensionCount = static_cast<uint32_t>(extensions.size()),
+            .ppEnabledExtensionNames = extensions.data(),
+        };
+
+        VK_CHECK(vkCreateInstance(&create_info, nullptr, &instance_));
 ```
 
-Chaining the messenger description onto the create info gives validation coverage of
-`vkCreateInstance` and `vkDestroyInstance`, which are otherwise blind spots. The
-temporary messenger it describes exists only for the duration of those two calls,
-which is why we still create a real one afterwards.
+There is a bootstrapping problem hiding in that `pNext`, and it is a neat illustration of
+what the chain is for.
+
+The messenger is created *from* the instance, so it cannot exist while `vkCreateInstance` is
+running — which is exactly when you would like to hear about a bad argument:
+
+```
+  vkCreateInstance(...)   ← errors here have nowhere to go
+        │
+        ▼
+  instance exists
+        │
+        ▼
+  vkCreateDebugUtilsMessengerEXT(instance, ...)   ← only now can messages be delivered
+```
+
+Chaining the messenger *description* onto the create info solves it: the layers construct a
+temporary messenger that lives for the duration of `vkCreateInstance` and `vkDestroyInstance`,
+which would otherwise be the two blind spots in the whole program. That is why we still
+create a real one afterwards; this one does not outlive the call.
+
+Note that `messenger_info` is a **named local, not a temporary**. It has to outlive the
+`vkCreateInstance` call that reads through the pointer. Writing `.pNext =
+&debug_messenger_info()` would not compile — which is fortunate, because the equivalent
+mistake with a `std::vector` that goes out of scope does compile and is a recurring source
+of misery.
+
+The second argument to `vkCreateInstance`, here `nullptr`, is a `VkAllocationCallbacks*`: a
+hook for supplying your own host-memory allocator. Every creation function in Vulkan takes
+one. We pass null everywhere in this series.
 
 ## Then load the rest
 
 ```cpp title="code/src/1.getting_started/the_instance/main.cpp"
-volkLoadInstanceOnly(instance_);
+        volkLoadInstanceOnly(instance_);
 
-if (debug_at_creation) {
-    VK_CHECK(vkCreateDebugUtilsMessengerEXT(instance_, &messenger_info, nullptr,
-                                            &debug_messenger_));
+        if (debug_at_creation) {
+            VK_CHECK(vkCreateDebugUtilsMessengerEXT(instance_, &messenger_info, nullptr,
+                                                    &debug_messenger_));
+        }
+
+        enabled_extensions_ = std::move(extensions);
+    }
+```
+
+Order matters and the compiler will not help you. `vkCreateDebugUtilsMessengerEXT` is an
+instance-level function and is still a null pointer until `volkLoadInstanceOnly` has run.
+Swap these two statements and the program segfaults on a line that looks perfectly correct.
+
+`volkLoadInstanceOnly` fetches roughly two hundred entry points. Its sibling
+`volkLoadInstance` also fetches the device-level ones, routing them through the loader's
+dispatch table — which works, and costs an indirection on every call for the rest of the
+program. We take the device-level pointers from the device itself in 1.3 instead.
+
+## Reporting
+
+```cpp title="code/src/1.getting_started/the_instance/main.cpp"
+    void report() const {
+        uint32_t version = 0;
+        VK_CHECK(vkEnumerateInstanceVersion(&version));
+        spdlog::info("Loader supports Vulkan {}.{}.{}", VK_API_VERSION_MAJOR(version),
+                     VK_API_VERSION_MINOR(version), VK_API_VERSION_PATCH(version));
+        spdlog::info("Validation layers: {}", validation_enabled_ ? "on" : "off");
+        spdlog::info("Instance extensions enabled ({}):", enabled_extensions_.size());
+        for (const char* extension : enabled_extensions_) {
+            spdlog::info("  {}", extension);
+        }
+        spdlog::info("Instance created. Nothing is drawn yet - a GPU comes next.");
+    }
+```
+
+`vkEnumerateInstanceVersion` reports what the **loader** supports, which is usually higher
+than what we asked for in `app_info` and tells you nothing about the GPU. Chapter 1.3 asks a
+device what it supports, and that is the number that can actually stop you.
+
+```cpp title="code/src/1.getting_started/the_instance/main.cpp"
+    vkc::Args args_;
+    vkc::Window window_;
+    VkInstance instance_ = VK_NULL_HANDLE;
+    VkDebugUtilsMessengerEXT debug_messenger_ = VK_NULL_HANDLE;
+    std::vector<const char*> enabled_extensions_;
+    bool validation_enabled_ = false;
+    bool debug_utils_enabled_ = false;
+};
+
+}  // namespace
+```
+
+`main` is chapter 1.1's, unchanged except for the type name:
+
+```cpp title="code/src/1.getting_started/the_instance/main.cpp"
+int main(int argc, char** argv) {
+    try {
+        InstanceApp app(vkc::parse_args(argc, argv));
+        return app.run();
+    } catch (const std::exception& error) {
+        spdlog::error("{}", error.what());
+        return EXIT_FAILURE;
+    }
 }
 ```
 
-Order matters: `vkCreateDebugUtilsMessengerEXT` is an instance-level function and is
-still a null pointer until `volkLoadInstanceOnly` has run.
+## What moves into `vkcommon`
+
+Two things leave this chapter. Chapter 1.3 declares a `vkc::Instance` member instead of
+calling `vkCreateInstance` itself, and every chapter from here on writes `VK_CHECK`
+without thinking about it. Neither is a black box, so both are below in full.
+
+### The error checking
+
+```cpp title="code/common/base/include/vkc/check.hpp"
+#include <volk.h>
+
+#include <stdexcept>
+#include <string>
+
+namespace vkc {
+
+class VulkanError : public std::runtime_error {
+public:
+    VulkanError(VkResult result, std::string message)
+        : std::runtime_error(std::move(message)), result_(result) {}
+
+    [[nodiscard]] VkResult result() const noexcept { return result_; }
+
+private:
+    VkResult result_;
+};
+```
+
+`VulkanError` **derives from** `std::runtime_error`, which is what lets `main`'s single
+`catch (const std::exception&)` from chapter 1.1 catch it without knowing it exists.
+Deriving rather than inventing a new exception hierarchy is the whole reason that
+`catch` has never had to change.
+
+It carries the `VkResult` as well as the message, so a caller that wants to *handle* a
+specific failure can. Chapter 1.4 does exactly that: `VK_ERROR_OUT_OF_DATE_KHR` means
+"the swapchain no longer matches the window", which is a normal event to recover from
+rather than an error to report.
+
+`std::move(message)` hands the string to the base class rather than copying it. The
+parameter is taken **by value** so that a caller passing a temporary — which is what
+`std::format` produces — gets one construction and one move, and no copy at all.
+
+```cpp title="code/common/base/include/vkc/check.hpp"
+// Human-readable name for a VkResult, e.g. VK_ERROR_OUT_OF_DEVICE_MEMORY.
+[[nodiscard]] const char* to_string(VkResult result) noexcept;
+
+[[noreturn]] void throw_vulkan_error(VkResult result, const char* expression,
+                                     const char* file, int line);
+
+}  // namespace vkc
+```
+
+**`[[noreturn]]`** promises that this function never comes back — it always throws. The
+compiler uses that: code after a call to it is unreachable, no "not all paths return a
+value" warning fires, and the optimiser need not preserve anything for a return that
+cannot happen.
+
+The macro from earlier in the chapter sits directly below these declarations in the same
+header. Its job is to capture three things that only exist **at the call site**:
+`#expression` stringifies the exact text you wrote, and `__FILE__` and `__LINE__` are
+where you wrote it. A function cannot do that — by the time a function runs, the call
+site is gone — which is the entire reason this is a macro in a codebase that otherwise
+avoids them.
+
+```cpp title="code/common/base/src/check.cpp"
+#include "vkc/check.hpp"
+
+#include <format>
+
+namespace vkc {
+
+const char* to_string(VkResult result) noexcept {
+    switch (result) {
+        case VK_SUCCESS: return "VK_SUCCESS";
+        case VK_NOT_READY: return "VK_NOT_READY";
+        case VK_TIMEOUT: return "VK_TIMEOUT";
+        case VK_EVENT_SET: return "VK_EVENT_SET";
+        case VK_EVENT_RESET: return "VK_EVENT_RESET";
+        case VK_INCOMPLETE: return "VK_INCOMPLETE";
+        case VK_SUBOPTIMAL_KHR: return "VK_SUBOPTIMAL_KHR";
+        case VK_ERROR_OUT_OF_HOST_MEMORY: return "VK_ERROR_OUT_OF_HOST_MEMORY";
+        case VK_ERROR_OUT_OF_DEVICE_MEMORY: return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
+        case VK_ERROR_INITIALIZATION_FAILED: return "VK_ERROR_INITIALIZATION_FAILED";
+        case VK_ERROR_DEVICE_LOST: return "VK_ERROR_DEVICE_LOST";
+        case VK_ERROR_MEMORY_MAP_FAILED: return "VK_ERROR_MEMORY_MAP_FAILED";
+        case VK_ERROR_LAYER_NOT_PRESENT: return "VK_ERROR_LAYER_NOT_PRESENT";
+        case VK_ERROR_EXTENSION_NOT_PRESENT: return "VK_ERROR_EXTENSION_NOT_PRESENT";
+        case VK_ERROR_FEATURE_NOT_PRESENT: return "VK_ERROR_FEATURE_NOT_PRESENT";
+        case VK_ERROR_INCOMPATIBLE_DRIVER: return "VK_ERROR_INCOMPATIBLE_DRIVER";
+        case VK_ERROR_TOO_MANY_OBJECTS: return "VK_ERROR_TOO_MANY_OBJECTS";
+        case VK_ERROR_FORMAT_NOT_SUPPORTED: return "VK_ERROR_FORMAT_NOT_SUPPORTED";
+        case VK_ERROR_FRAGMENTED_POOL: return "VK_ERROR_FRAGMENTED_POOL";
+        case VK_ERROR_UNKNOWN: return "VK_ERROR_UNKNOWN";
+        case VK_ERROR_OUT_OF_POOL_MEMORY: return "VK_ERROR_OUT_OF_POOL_MEMORY";
+        case VK_ERROR_INVALID_EXTERNAL_HANDLE: return "VK_ERROR_INVALID_EXTERNAL_HANDLE";
+        case VK_ERROR_FRAGMENTATION: return "VK_ERROR_FRAGMENTATION";
+        case VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS:
+            return "VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS";
+        case VK_ERROR_SURFACE_LOST_KHR: return "VK_ERROR_SURFACE_LOST_KHR";
+        case VK_ERROR_NATIVE_WINDOW_IN_USE_KHR: return "VK_ERROR_NATIVE_WINDOW_IN_USE_KHR";
+        case VK_ERROR_OUT_OF_DATE_KHR: return "VK_ERROR_OUT_OF_DATE_KHR";
+        case VK_ERROR_INCOMPATIBLE_DISPLAY_KHR: return "VK_ERROR_INCOMPATIBLE_DISPLAY_KHR";
+        case VK_ERROR_VALIDATION_FAILED_EXT: return "VK_ERROR_VALIDATION_FAILED_EXT";
+        default: return "VK_ERROR_<unrecognised>";
+    }
+}
+```
+
+Tedious and worth having. C++ has no reflection, so there is no way to ask an enum for
+the spelling of one of its values; somebody has to write the table, and this is it.
+
+Two of these are worth knowing now because they are **not errors**. `VK_SUCCESS` is
+obviously fine. `VK_SUBOPTIMAL_KHR` means the swapchain still works but no longer
+ideally matches the window — you get a presented frame *and* a hint to rebuild. And
+`VK_INCOMPLETE` means an array you supplied was too small to hold the whole answer,
+which is what the two-call idiom exists to avoid.
+
+Note that positive result codes are successes and negative ones are errors. `VK_CHECK`
+treats everything except `VK_SUCCESS` as fatal, which is right for the samples and would
+be too blunt for a real renderer.
+
+The `default` case matters because this list is not exhaustive — the specification keeps
+adding results, and an extension you enable can return one this table has never heard of.
+Returning a placeholder rather than falling off the end keeps the function `noexcept` and
+total.
+
+```cpp title="code/common/base/src/check.cpp"
+void throw_vulkan_error(VkResult result, const char* expression, const char* file,
+                        int line) {
+    throw VulkanError(result,
+                      std::format("{} failed with {} ({}:{})", expression,
+                                  to_string(result), file, line));
+}
+
+}  // namespace vkc
+```
+
+Which is what produces a message like:
+
+```
+vkCreateInstance(&create_info, nullptr, &instance_) failed with
+VK_ERROR_LAYER_NOT_PRESENT (main.cpp:151)
+```
+
+The failing call, the reason, and where to look — from a macro that costs one line at
+each use.
+
+### `vkc::Instance`
+
+```cpp title="code/common/scaffold/include/vkc/instance.hpp"
+#include <volk.h>
+
+#include <string_view>
+
+namespace vkc {
+
+class Instance {
+public:
+    struct Config {
+        std::string_view app_name = "LearnVulkan";
+        bool enable_validation = true;
+    };
+
+    explicit Instance(const Config& config);
+    ~Instance();
+
+    Instance(const Instance&) = delete;
+    Instance& operator=(const Instance&) = delete;
+    Instance(Instance&&) = delete;
+    Instance& operator=(Instance&&) = delete;
+```
+
+A nested **`Config` struct** rather than a list of constructor parameters. With two
+settings it is a close call; by chapter 1.3's `Device` it is not, and a call reading
+`Instance(name, true)` tells you nothing about what `true` meant. A designated
+initialiser — `.enable_validation = false` — says it at the call site, and new settings
+can be added later without changing a single existing caller.
+
+`explicit` stops the compiler silently converting a `Config` into an `Instance` wherever
+one is expected. For a type that creates a Vulkan instance as a side effect, an accidental
+conversion is not a small mistake.
+
+```cpp title="code/common/scaffold/include/vkc/instance.hpp"
+    [[nodiscard]] VkInstance handle() const noexcept { return instance_; }
+
+    // Whether VK_LAYER_KHRONOS_validation was actually enabled. It is requested by
+    // default and quietly unavailable on a machine without the layers installed, so
+    // this is the honest answer rather than what was asked for.
+    [[nodiscard]] bool validation_enabled() const noexcept { return validation_enabled_; }
+
+    // Whether VK_EXT_debug_utils is present. It provides both the messenger and the
+    // object-naming that turns handle soup into readable validation messages.
+    [[nodiscard]] bool debug_utils_enabled() const noexcept {
+        return debug_utils_enabled_;
+    }
+
+private:
+    void create_instance(const Config& config);
+    void create_debug_messenger();
+
+    VkInstance instance_ = VK_NULL_HANDLE;
+    VkDebugUtilsMessengerEXT debug_messenger_ = VK_NULL_HANDLE;
+    bool validation_enabled_ = false;
+    bool debug_utils_enabled_ = false;
+};
+
+}  // namespace vkc
+```
+
+`handle()` returning the raw `VkInstance` is deliberate. The class owns the lifetime and
+nothing else: it does not try to wrap all two hundred instance-level functions, so any
+Vulkan call in any later chapter can be written normally. That is the shape every
+`vkcommon` type takes.
+
+The two query methods report **what happened, not what was asked for**. Validation is
+requested by default and is simply absent on a machine without the layers installed, and
+a class that answered "yes, enabled" because you asked for it would be lying in exactly
+the situation where you most need the truth.
+
+The constructor's work is split into two `private` methods rather than one long body,
+because the second is conditional — there is no messenger to create when the extension is
+missing.
+
+```cpp title="code/common/scaffold/src/instance.cpp"
+#include "vkc/instance.hpp"
+
+#include "vkc/check.hpp"
+#include "vkc/window.hpp"
+
+#include <spdlog/spdlog.h>
+
+#include <algorithm>
+#include <string>
+#include <vector>
+
+namespace vkc {
+namespace {
+
+constexpr const char* kValidationLayer = "VK_LAYER_KHRONOS_validation";
+
+bool layer_available(std::string_view name) {
+    uint32_t count = 0;
+    VK_CHECK(vkEnumerateInstanceLayerProperties(&count, nullptr));
+    std::vector<VkLayerProperties> layers(count);
+    VK_CHECK(vkEnumerateInstanceLayerProperties(&count, layers.data()));
+
+    return std::ranges::any_of(layers, [name](const VkLayerProperties& layer) {
+        return name == layer.layerName;
+    });
+}
+
+bool instance_extension_available(std::string_view name) {
+    uint32_t count = 0;
+    VK_CHECK(vkEnumerateInstanceExtensionProperties(nullptr, &count, nullptr));
+    std::vector<VkExtensionProperties> extensions(count);
+    VK_CHECK(vkEnumerateInstanceExtensionProperties(nullptr, &count, extensions.data()));
+
+    return std::ranges::any_of(extensions, [name](const VkExtensionProperties& ext) {
+        return name == ext.extensionName;
+    });
+}
+```
+
+Identical to the two helpers you wrote above, moved into an anonymous namespace so they
+stay local to this file.
+
+`#include "vkc/window.hpp"` is the interesting line: this is where chapter 1.1's work is
+used. `Window::required_instance_extensions()` is the static function whose ordering
+problem the previous chapter explained, and it is called a few lines further down.
+
+```cpp title="code/common/scaffold/src/instance.cpp"
+VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(
+    VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+    VkDebugUtilsMessageTypeFlagsEXT /*types*/,
+    const VkDebugUtilsMessengerCallbackDataEXT* data, void* /*user_data*/) {
+    if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
+        spdlog::error("[vulkan] {}", data->pMessage);
+    } else if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
+        spdlog::warn("[vulkan] {}", data->pMessage);
+    } else {
+        spdlog::info("[vulkan] {}", data->pMessage);
+    }
+    // Returning VK_FALSE means "carry on"; VK_TRUE would abort the offending call
+    // and is only meaningful to layer developers.
+    return VK_FALSE;
+}
+
+VkDebugUtilsMessengerCreateInfoEXT debug_messenger_info() {
+    return VkDebugUtilsMessengerCreateInfoEXT{
+        .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+        .pNext = nullptr,
+        .flags = 0,
+        .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+                           VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
+        .messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+                       VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                       VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
+        .pfnUserCallback = debug_callback,
+        .pUserData = nullptr,
+    };
+}
+
+}  // namespace
+```
+
+Both unchanged from the versions above.
+
+```cpp title="code/common/scaffold/src/instance.cpp"
+Instance::Instance(const Config& config) {
+    // volk loads vkGetInstanceProcAddr and the handful of entry points that exist
+    // before an instance does. Nothing Vulkan works before this call.
+    VK_CHECK(volkInitialize());
+
+    create_instance(config);
+    volkLoadInstanceOnly(instance_);
+
+    if (validation_enabled_ && debug_utils_enabled_) {
+        create_debug_messenger();
+    }
+}
+
+Instance::~Instance() {
+    if (debug_messenger_ != VK_NULL_HANDLE) {
+        vkDestroyDebugUtilsMessengerEXT(instance_, debug_messenger_, nullptr);
+    }
+    if (instance_ != VK_NULL_HANDLE) {
+        vkDestroyInstance(instance_, nullptr);
+    }
+}
+```
+
+The constructor is the three-step sequence this chapter spent its length on, now in one
+place: load the bootstrap entry points, create the instance, load the rest, then create
+the messenger. The destructor is the reverse, messenger before instance.
+
+```cpp title="code/common/scaffold/src/instance.cpp"
+void Instance::create_instance(const Config& config) {
+    const std::string app_name(config.app_name);
+
+    const VkApplicationInfo app_info{
+        .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+        .pNext = nullptr,
+        .pApplicationName = app_name.c_str(),
+        .applicationVersion = VK_MAKE_VERSION(0, 1, 0),
+        .pEngineName = "vkcommon",
+        .engineVersion = VK_MAKE_VERSION(0, 1, 0),
+        // Vulkan 1.3 is the floor for this series: dynamic rendering and
+        // synchronization2 are core there, and that is what removes most of the
+        // boilerplate older tutorials have to spend five chapters on.
+        .apiVersion = VK_API_VERSION_1_3,
+    };
+
+    std::vector<const char*> extensions;
+    for (const char* ext : Window::required_instance_extensions()) {
+        extensions.push_back(ext);
+    }
+```
+
+`app_name` is the null-termination copy again, and it must be a **named local**: the
+struct stores `app_name.c_str()`, a pointer into it, and `vkCreateInstance` reads through
+that pointer at the bottom of this function. A temporary would have been destroyed long
+before.
+
+The extension list now comes from `vkc::Window` rather than from a bare
+`SDL_Vulkan_GetInstanceExtensions` call, which is the one real difference between this
+file and the sample above.
+
+```cpp title="code/common/scaffold/src/instance.cpp"
+    validation_enabled_ = config.enable_validation && layer_available(kValidationLayer);
+    if (config.enable_validation && !validation_enabled_) {
+        spdlog::warn(
+            "Validation layers were requested but {} is not installed. Install the "
+            "Vulkan SDK or your distribution's validation-layers package: running "
+            "these samples without validation hides real bugs.",
+            kValidationLayer);
+    }
+
+    debug_utils_enabled_ = instance_extension_available(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    if (debug_utils_enabled_) {
+        extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    }
+
+    std::vector<const char*> layers;
+    if (validation_enabled_) {
+        layers.push_back(kValidationLayer);
+    }
+
+    // Chaining the messenger info onto the create info catches errors raised by
+    // vkCreateInstance itself, before a real messenger object can exist.
+    const VkDebugUtilsMessengerCreateInfoEXT messenger_info = debug_messenger_info();
+
+    const VkInstanceCreateInfo create_info{
+        .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+        .pNext = (validation_enabled_ && debug_utils_enabled_) ? &messenger_info : nullptr,
+        .flags = 0,
+        .pApplicationInfo = &app_info,
+        .enabledLayerCount = static_cast<uint32_t>(layers.size()),
+        .ppEnabledLayerNames = layers.data(),
+        .enabledExtensionCount = static_cast<uint32_t>(extensions.size()),
+        .ppEnabledExtensionNames = extensions.data(),
+    };
+
+    VK_CHECK(vkCreateInstance(&create_info, nullptr, &instance_));
+}
+
+void Instance::create_debug_messenger() {
+    const VkDebugUtilsMessengerCreateInfoEXT info = debug_messenger_info();
+    VK_CHECK(vkCreateDebugUtilsMessengerEXT(instance_, &info, nullptr, &debug_messenger_));
+}
+
+}  // namespace vkc
+```
+
+Line for line what the sample did, including the `pNext` chain that covers
+`vkCreateInstance` itself.
+
+That is the whole of both files. From chapter 1.3, `vkc::Instance instance_` is one member
+declaration — and now you know precisely what it does when it is constructed.
 
 ## Running it
 
@@ -217,18 +1134,45 @@ still a null pointer until `volkLoadInstanceOnly` has run.
 [info] Instance created. Nothing is drawn yet - a GPU comes next.
 ```
 
-Still nothing on screen. An instance is a connection to the Vulkan *implementation*,
-not to a GPU — that comes next.
+Still nothing on screen. An instance is a connection to the Vulkan *implementation*, not to a
+GPU — that comes next. What you should see is **no `[vulkan]` lines at all**, which means the
+layers are watching and have nothing to complain about.
+
+## Words introduced in this chapter
+
+| | |
+|---|---|
+| **loader** | the system library that finds drivers, inserts layers, and routes every call |
+| **ICD** | an Installable Client Driver — one vendor's Vulkan implementation |
+| **layer** | an optional library spliced into the call chain; validation is one |
+| **extension** | API beyond the core specification, requested by name |
+| **handle** | an opaque token identifying an object that lives inside the driver |
+| **`sType`** | the field that tells the driver what struct it is looking at |
+| **`pNext`** | the chain that lets a frozen C API gain new fields without breaking |
+| **calling convention** | the agreed rules for passing arguments, which `VKAPI_CALL` sets |
+| **`VkResult`** | the status code almost every Vulkan call returns; positive values are successes, negative ones errors |
+| **`VK_CHECK`** | the macro that turns any non-`VK_SUCCESS` result into an exception naming the call, the reason and the line |
+| **two-call idiom** | ask for the count, make room, ask again for the data — how every Vulkan list is read |
+| **designated initialiser** | naming each struct field where you set it, which this project does for every member of every Vulkan struct |
+| **`[[noreturn]]`** | a promise that a function always throws and never comes back |
 
 ## Exercises
 
-1. Print every available layer and instance extension, not just the ones enabled.
+1. Print every available layer and instance extension, not just the ones enabled. You have
+   both enumeration helpers already; they just need to return the vector instead of a `bool`.
    The list is longer than you expect.
-2. Request a layer that does not exist, such as `"VK_LAYER_does_not_exist"`, and
-   confirm `vkCreateInstance` fails with `VK_ERROR_LAYER_NOT_PRESENT`. This is what
-   the availability check is protecting you from.
-3. Lower the messenger's `messageSeverity` to include
-   `VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT` and run again. This is why we
-   subscribe to warnings and errors only.
+2. Request a layer that does not exist, such as `"VK_LAYER_does_not_exist"`, by pushing it
+   onto `layers` directly and skipping the availability check. Confirm `vkCreateInstance`
+   fails with `VK_ERROR_LAYER_NOT_PRESENT`, and note that `VK_CHECK` names the failing
+   expression for you.
+3. Add `VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT` to `messageSeverity` and run again.
+   This is why we subscribe to warnings and errors only.
+4. Move `volkLoadInstanceOnly(instance_)` to *after* the messenger creation. The crash tells
+   you nothing about which pointer was null — worth provoking once so you recognise the
+   shape of it later.
+5. Open `code/common/scaffold/src/window.cpp` and check it against chapter 1.1's `main.cpp`.
+   Everything except the SDL initialisation guard should be familiar line for line. If it is
+   not, 1.1 is the place to go back to — nothing in the scaffold is ever code you have not
+   been shown.
 
 Next: [devices and queues](/getting-started/devices-and-queues/) — finding a GPU.

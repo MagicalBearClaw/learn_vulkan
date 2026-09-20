@@ -1,6 +1,6 @@
 ---
 title: Command Buffers
-description: Recording commands, image layout transitions, dynamic rendering, and the first pixels on screen.
+description: Recording commands, image layout transitions, dynamic rendering, and the first pixels on screen - every line of it.
 sidebar:
   order: 5
 ---
@@ -15,132 +15,590 @@ Something finally appears on screen in this chapter.
 ## Vulkan has no draw call
 
 There is no function that draws something now. You record commands into a
-`VkCommandBuffer`, then submit the whole buffer to a queue, and the GPU gets to it when
-it gets to it.
+`VkCommandBuffer`, then submit the whole buffer to a queue, and the GPU gets to it when it
+gets to it.
 
-Recording is ordinary CPU work: `vkCmdBeginRendering` and friends write bytes into a
-buffer and return. Nothing touches the GPU. **Submission** is the moment work crosses
-over, and from then on your program and the GPU are running independently.
+```
+   CPU                                       GPU
+   ───                                       ───
+   vkBeginCommandBuffer()   ─┐
+   vkCmdPipelineBarrier2()   │ writing bytes into
+   vkCmdBeginRendering()     │ a buffer. The GPU
+   vkCmdEndRendering()       │ is not involved.
+   vkEndCommandBuffer()     ─┘
+
+   vkQueueSubmit2()         ─────────────────▶ starts executing, whenever
+                                               ──────────────────────────▶
+   (returns immediately)
+```
+
+Recording is ordinary CPU work: `vkCmdBeginRendering` and friends write bytes into a buffer
+and return. **Submission** is the moment work crosses over, and from then on your program
+and the GPU are running independently.
 
 This gap is the biggest adjustment coming from OpenGL, where `glDrawArrays` at least
-pretends to draw. It is also the entire reason Vulkan scales across threads: recording
-has no shared state, so sixteen threads can record sixteen command buffers at once and
-one thread submits them.
+pretends to draw. It is also the entire reason Vulkan scales across threads: recording has
+no shared state, so sixteen threads can record sixteen command buffers at once and one
+thread submits them.
 
-## Pools own the memory
+One frame, in full:
 
-```cpp title="code/src/1.getting_started/command_buffers/main.cpp"
-const VkCommandPoolCreateInfo pool_info{
-    .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
-    .queueFamilyIndex = queue_family_,
-};
+1. ask the swapchain for an image — `vkAcquireNextImageKHR`
+2. record: transition, clear, transition
+3. submit it to the queue — `vkQueueSubmit2`
+4. hand the image back to be displayed — `vkQueuePresentKHR`
+
+## What chapters 1.1 to 1.4 left behind
+
+Four things now come from the scaffold, and two of them are new arrivals.
+
+**`vkc::Swapchain`** is chapter 1.4's file, moved. If you open
+`code/common/scaffold/src/swapchain.cpp` you will find the same `choose_surface_format`
+preferring an sRGB format, the same `choose_present_mode` taking `MAILBOX` when offered, the
+same "one more than the minimum" image count, and the same comment about the images belonging
+to the swapchain:
+
+```cpp title="code/common/scaffold/src/swapchain.cpp"
+void Swapchain::destroy() noexcept {
+    for (VkImageView view : views_) {
+        vkDestroyImageView(context_.device(), view, nullptr);
+    }
+    views_.clear();
+    // The images themselves belong to the swapchain; destroying it frees them.
+    images_.clear();
 ```
 
-A command buffer does not own its storage; a `VkCommandPool` does. Pools are tied to a
-queue family — a buffer recorded from a graphics pool cannot be submitted to a
-transfer-only queue.
+Its interface is the four questions a renderer asks of it:
 
-**Pools are not thread-safe.** Recording into two buffers from the same pool on two
-threads is a data race that Vulkan will not protect you from. The rule in a threaded
-renderer is one pool per thread; we have one thread and therefore one pool.
+```cpp title="code/common/scaffold/include/vkc/swapchain.hpp"
+    void recreate();
 
-`RESET_COMMAND_BUFFER_BIT` lets an individual buffer be reset and re-recorded rather
-than requiring the whole pool to be reset at once. We re-record the same buffer every
-frame, so that is what we want.
+    [[nodiscard]] VkSwapchainKHR handle() const noexcept { return swapchain_; }
+    [[nodiscard]] VkFormat format() const noexcept { return format_; }
+    [[nodiscard]] VkExtent2D extent() const noexcept { return extent_; }
+    [[nodiscard]] uint32_t image_count() const noexcept {
+        return static_cast<uint32_t>(images_.size());
+    }
 
-```cpp title="code/src/1.getting_started/command_buffers/main.cpp"
-.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+    [[nodiscard]] VkImage image(uint32_t index) const { return images_.at(index); }
+    [[nodiscard]] VkImageView view(uint32_t index) const { return views_.at(index); }
 ```
 
-`PRIMARY` buffers can be submitted to a queue. `SECONDARY` ones cannot — they are
-called from a primary buffer, and exist so that several threads can record pieces of
-one render pass in parallel.
+**`vkc::Context`** is new, and it is not a new *idea* — it is the three objects chapters 1.2
+and 1.3 built, held together:
+
+```cpp title="code/common/scaffold/src/context.cpp"
+Context::Context(const Config& config, Window& window) : window_(&window) {
+    instance_ = std::make_unique<Instance>(Instance::Config{
+        .app_name = config.app_name,
+        .enable_validation = config.enable_validation,
+    });
+
+    surface_ = window.create_surface(instance_->handle());
+
+    device_ = std::make_unique<Device>(*instance_, surface_);
+}
+```
+
+Chapter 1.4 juggled a `Window`, an `Instance`, a `VkSurfaceKHR` and a `unique_ptr<Device>` as
+four separate members, and had to get their destruction order right by hand. From here on
+every chapter wants all three at once, so they travel together and `Context` owns the
+ordering:
+
+```cpp title="code/common/scaffold/src/context.cpp"
+// Strict reverse order. The device owns the allocator and dies first; the surface was
+// created from the instance and has to go before it; the instance goes last.
+Context::~Context() {
+    device_.reset();
+
+    if (window_ != nullptr && instance_) {
+        window_->destroy_surface(instance_->handle());
+    }
+
+    instance_.reset();
+}
+```
+
+The build grant becomes two pieces, because `vkc_swapchain` already depends on `vkc_context`:
+
+```cmake title="code/src/1.getting_started/command_buffers/CMakeLists.txt"
+# This chapter teaches command pools, command buffers, layout transitions and the
+# frame, so it writes all of them by hand. It stands on 1.1 to 1.4: the window, the
+# instance and the device arrive together as vkc::Context, and the swapchain is 1.4's.
+# vkc_frame -- which is what this chapter and 1.6 become -- is deliberately not named.
+add_chapter(1.5.command_buffers
+    SOURCES main.cpp
+    SCAFFOLD vkc_context vkc_swapchain
+)
+```
+
+`vkc_frame` — which is what this chapter and 1.6 become — is deliberately absent.
+
+## New includes
+
+```cpp title="code/src/1.getting_started/command_buffers/main.cpp"
+#include <vkc/capture.hpp>
+#include <vkc/check.hpp>
+#include <vkc/context.hpp>
+#include <vkc/swapchain.hpp>
+#include <vkc/window.hpp>
+
+#include <SDL3/SDL.h>
+#include <spdlog/spdlog.h>
+
+#include <cmath>
+#include <cstdlib>
+#include <exception>
+```
+
+`<cmath>` is the only genuinely new one, for the `std::sin` that drives the colour cycle. The
+list is shorter than 1.4's because `<algorithm>`, `<memory>` and `<vector>` went with the
+swapchain code.
 
 ## Image layouts
 
 This is the concept that produces more beginner validation errors than anything else in
 Vulkan.
 
-The arrangement of pixels in memory that is fast to *render into* is not the one that
-is fast to *sample from*, nor the one the display hardware wants to scan out. GPUs
-swizzle and compress image data, and the optimal scheme differs per use.
+The arrangement of pixels in memory that is fast to *render into* is not the one that is fast
+to *sample from*, nor the one the display hardware wants to scan out. GPUs swizzle and
+compress image data, and the optimal scheme differs per use:
 
-Vulkan exposes this as **image layout**, and images never change layout on their own.
-You insert a barrier that says so.
-
-```cpp title="code/src/1.getting_started/command_buffers/main.cpp"
-const VkImageMemoryBarrier2 barrier{
-    .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-    .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
-    .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-    .dstAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT,
-    .oldLayout = from,
-    .newLayout = to,
-    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-    .image = image,
-    // ...
-};
+```
+   VK_IMAGE_LAYOUT_UNDEFINED              contents are not worth keeping
+   VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL   arranged for the raster units to write
+   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL   arranged for the texture units to read
+   VK_IMAGE_LAYOUT_PRESENT_SRC_KHR            arranged for the display to scan out
 ```
 
-A barrier says two things at once:
-
-- **A layout transition** — rearrange the memory from `oldLayout` to `newLayout`.
-- **An execution and memory dependency** — the work described by `srcStageMask` and
-  `srcAccessMask` must finish, and be visible, before the work in `dstStageMask` and
-  `dstAccessMask` begins.
-
-`ALL_COMMANDS` on both sides is the sledgehammer: it means "everything before, then
-everything after", which is always correct and slower than necessary. A later chapter
-narrows these masks and measures the difference. Starting broad and tightening later is
-the right order — starting tight means debugging subtle race conditions while also
-learning the API.
-
-The two frames of a swapchain image look like this:
+Vulkan exposes this as **image layout**, and images never change layout on their own. You
+insert a **barrier** that says so.
 
 ```cpp title="code/src/1.getting_started/command_buffers/main.cpp"
-transition_image(command_buffer_, images_[image_index],
-                 VK_IMAGE_LAYOUT_UNDEFINED,
-                 VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-// ... render ...
-transition_image(command_buffer_, images_[image_index],
-                 VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                 VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+namespace {
+
+void transition_image(VkCommandBuffer cmd, VkImage image, VkImageLayout from,
+                      VkImageLayout to) {
+    const VkImageMemoryBarrier2 barrier{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+        .pNext = nullptr,
+        .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        .dstAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT,
+        .oldLayout = from,
+        .newLayout = to,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = image,
+        .subresourceRange =
+            {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0,
+                .levelCount = VK_REMAINING_MIP_LEVELS,
+                .baseArrayLayer = 0,
+                .layerCount = VK_REMAINING_ARRAY_LAYERS,
+            },
+    };
+```
+
+`VkImageMemoryBarrier2` describes one barrier on one image, and `vkCmdPipelineBarrier2`
+is the command that records it. The `2` on both names is the `synchronization2` form; the
+originals are still in the API and take a different shape.
+
+**A barrier does two jobs at once**, and the second is the one people forget.
+
+*One:* a **layout transition** — rearrange the memory from `oldLayout` to `newLayout`.
+
+*Two:* an **execution and memory dependency** — the work described by `srcStageMask` and
+`srcAccessMask` must finish, and its writes must be made visible, before the work in
+`dstStageMask` and `dstAccessMask` begins:
+
+```
+   ──── src: these stages, doing these accesses ────┐
+                                                    │  barrier
+                                   ┌────────────────┘
+                                   └──── dst: before these stages may do these accesses ────
+```
+
+A barrier is not only about layout; it is the general mechanism for ordering *anything*
+against anything else on the GPU, and Part 4 uses it that way with no layout change at all.
+
+`ALL_COMMANDS` on both sides is the sledgehammer: "everything before, then everything
+after". Always correct, and slower than necessary, because it forbids overlap that was never
+a problem. A later chapter narrows these masks and measures the difference. Starting broad
+and tightening later is the right order — starting tight means debugging race conditions
+while also learning the API.
+
+`VK_QUEUE_FAMILY_IGNORED` on both sides says this is not a queue family ownership transfer,
+which is the other thing a barrier can do and which chapter 1.3 avoided by choosing one
+universal queue.
+
+`VK_REMAINING_MIP_LEVELS` and `VK_REMAINING_ARRAY_LAYERS` mean "all of them from the base
+onward". A swapchain image has exactly one of each, but writing the constants keeps the
+helper usable for the mipmapped images of chapter 1.11.
+
+```cpp title="code/src/1.getting_started/command_buffers/main.cpp"
+    const VkDependencyInfo dependency{
+        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .pNext = nullptr,
+        .dependencyFlags = 0,
+        .memoryBarrierCount = 0,
+        .pMemoryBarriers = nullptr,
+        .bufferMemoryBarrierCount = 0,
+        .pBufferMemoryBarriers = nullptr,
+        .imageMemoryBarrierCount = 1,
+        .pImageMemoryBarriers = &barrier,
+    };
+
+    vkCmdPipelineBarrier2(cmd, &dependency);
+}
+```
+
+`synchronization2` — the feature switched on in chapter 1.3 — is why this is one struct
+holding arrays of three barrier kinds rather than the six loose parameters that the original
+`vkCmdPipelineBarrier` took. The practical benefit is that the stage and access masks are
+64-bit here and were 32-bit before, and the old ones had run out of bits.
+
+## Pools own the memory
+
+```cpp title="code/src/1.getting_started/command_buffers/main.cpp"
+    void create_commands() {
+        const VkCommandPoolCreateInfo pool_info{
+            .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+            .queueFamilyIndex = context_.queue_family(),
+        };
+        VK_CHECK(vkCreateCommandPool(context_.device(), &pool_info, nullptr,
+                                     &command_pool_));
+```
+
+A command buffer does not own its storage; a `VkCommandPool` does:
+
+```
+   VkCommandPool ──── owns a block of memory
+        │
+        ├── VkCommandBuffer   recorded into a slice of it
+        ├── VkCommandBuffer
+        └── VkCommandBuffer   destroying the pool frees all three
+```
+
+Pools are tied to a queue family — a buffer recorded from a graphics pool cannot be submitted
+to a transfer-only queue.
+
+**Pools are not thread-safe.** Recording into two buffers from the same pool on two threads is
+a data race that Vulkan will not protect you from. The rule in a threaded renderer is one pool
+per thread; we have one thread and therefore one pool.
+
+`RESET_COMMAND_BUFFER_BIT` lets an individual buffer be reset and re-recorded rather than
+requiring the whole pool to be reset at once. We re-record the same buffer every frame, so
+that is what we want. Without the flag, `vkResetCommandBuffer` is illegal and the only legal
+reset is `vkResetCommandPool`.
+
+```cpp title="code/src/1.getting_started/command_buffers/main.cpp"
+        const VkCommandBufferAllocateInfo alloc_info{
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .pNext = nullptr,
+            .commandPool = command_pool_,
+            .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            .commandBufferCount = 1,
+        };
+        VK_CHECK(vkAllocateCommandBuffers(context_.device(), &alloc_info,
+                                          &command_buffer_));
+```
+
+`PRIMARY` buffers can be submitted to a queue. `SECONDARY` ones cannot — they are called from
+a primary buffer, and exist so that several threads can record pieces of one rendering scope
+in parallel.
+
+Note `vkAllocateCommandBuffers` rather than `vkCreate...`. The distinction is the
+created-versus-retrieved rule from 1.3 in a third form: **allocated** objects come out of a
+pool and are freed by destroying it, which is why the destructor below frees no command
+buffers individually.
+
+## Fences
+
+```cpp title="code/src/1.getting_started/command_buffers/main.cpp"
+        const VkFenceCreateInfo fence_info{
+            .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+        };
+        VK_CHECK(vkCreateFence(context_.device(), &fence_info, nullptr, &acquire_fence_));
+        VK_CHECK(vkCreateFence(context_.device(), &fence_info, nullptr, &submit_fence_));
+    }
+```
+
+A **fence** is how the CPU finds out that the GPU has finished something. It has two states,
+signalled and unsignalled: the GPU signals it, the CPU waits on it and resets it.
+
+Two of them here: one for "the acquired image is ready", one for "the submitted frame is
+done". `flags = 0` creates them unsignalled, which is right because nothing has happened yet.
+Chapter 1.6 creates one *signalled* instead, for a reason that will be obvious when you see
+the loop it sits in.
+
+## The class
+
+```cpp title="code/src/1.getting_started/command_buffers/main.cpp"
+class ClearApp {
+public:
+    explicit ClearApp(const vkc::Args& args)
+        : args_(args),
+          window_("LearnVulkan - Command Buffers", args.width, args.height,
+                  /*resizable=*/args.screenshot.empty()),
+          context_(vkc::Context::Config{
+                       .app_name = "LearnVulkan",
+                       .enable_validation = args.validation,
+                   },
+                   window_),
+          swapchain_(context_, window_) {
+        create_commands();
+        capture_.init(context_.device(), context_.allocator());
+    }
+```
+
+Three members in the initialiser list, in dependency order: the window, the context built from
+it, the swapchain built from both. Chapter 1.4's `unique_ptr` is gone, because `Context` now
+does that sequencing internally.
+
+`vkc::Capture` is book infrastructure — the thing that implements `--screenshot` — and it is
+worth one paragraph because its calls are scattered through `draw_frame` below. It owns a
+host-visible buffer, records a copy from a swapchain image into it, and writes the result out
+as a PNG once the GPU has finished. The one genuinely instructive thing about it is *where*
+its calls have to go, which the frame walkthrough points out as it passes.
+
+```cpp title="code/src/1.getting_started/command_buffers/main.cpp"
+    ~ClearApp() {
+        // Wait for the GPU before tearing anything down: it may still be reading
+        // the command buffer we are about to free.
+        context_.wait_idle();
+
+        capture_.destroy();
+        vkDestroyFence(context_.device(), acquire_fence_, nullptr);
+        vkDestroyFence(context_.device(), submit_fence_, nullptr);
+        // Destroying a pool frees every command buffer allocated from it.
+        vkDestroyCommandPool(context_.device(), command_pool_, nullptr);
+        // swapchain_, context_ and window_ destroy themselves, in that order.
+    }
+
+    ClearApp(const ClearApp&) = delete;
+    ClearApp& operator=(const ClearApp&) = delete;
+    ClearApp(ClearApp&&) = delete;
+    ClearApp& operator=(ClearApp&&) = delete;
+```
+
+`wait_idle()` first, and this one is not optional. The GPU may still be reading the command
+buffer we are about to free; there is no way to destroy a resource safely while work
+referencing it is in flight, and waiting for the whole device is the simplest guarantee that
+none is.
+
+Note that the fences and the pool are destroyed **without null checks**, unlike every handle
+in 1.3's destructor. `vkDestroyFence` and `vkDestroyCommandPool` accept `VK_NULL_HANDLE` and
+do nothing — most `vkDestroy*` functions do. The checks in the earlier destructors guard
+`device_` and `instance_`, which are the *first* argument rather than the object, and those
+may not be null.
+
+## The loop gains a frame
+
+```cpp title="code/src/1.getting_started/command_buffers/main.cpp"
+    int run() {
+        spdlog::info("Clearing to a cycling colour. Escape or close to quit.");
+
+        uint64_t frames = 0;
+        bool running = true;
+        while (running) {
+            SDL_Event event;
+            while (SDL_PollEvent(&event)) {
+                if (event.type == SDL_EVENT_QUIT ||
+                    event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED ||
+                    (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_ESCAPE)) {
+                    running = false;
+                } else if (event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) {
+                    swapchain_.recreate();
+                }
+            }
+
+            // Minimised windows have a zero-sized drawable, so there is nothing
+            // to render into and no swapchain to build.
+            if (window_.is_minimised()) {
+                SDL_WaitEvent(nullptr);
+                continue;
+            }
+
+            const bool last_frame =
+                args_.frame_limit != 0 && frames + 1 >= args_.frame_limit;
+            draw_frame(last_frame && !args_.screenshot.empty());
+
+            ++frames;
+            if (args_.frame_limit != 0 && frames >= args_.frame_limit) {
+                running = false;
+            }
+        }
+        return 0;
+    }
+```
+
+A minimised window has a zero-sized drawable. There is nothing to render into and no swapchain
+to build, so the only sensible thing is to stop spinning: `SDL_WaitEvent` blocks until
+something happens, which also stops the process burning a core while minimised.
+
+The `last_frame` calculation exists so the screenshot is taken on the final frame rather than
+the first — `frames + 1` because `frames` is incremented after the draw.
+
+## Acquiring an image
+
+```cpp title="code/src/1.getting_started/command_buffers/main.cpp"
+    void draw_frame(bool capture_this_frame) {
+        const VkDevice device = context_.device();
+
+        // 1. Ask for an image. This returns immediately with an index, but the image
+        //    is not necessarily ready to use yet -- the fence tells us when it is.
+        uint32_t image_index = 0;
+        const VkResult acquired =
+            vkAcquireNextImageKHR(device, swapchain_.handle(), UINT64_MAX,
+                                  VK_NULL_HANDLE, acquire_fence_, &image_index);
+        if (acquired == VK_ERROR_OUT_OF_DATE_KHR) {
+            swapchain_.recreate();
+            return;
+        }
+        if (acquired != VK_SUCCESS && acquired != VK_SUBOPTIMAL_KHR) {
+            vkc::throw_vulkan_error(acquired, "vkAcquireNextImageKHR", __FILE__,
+                                    __LINE__);
+        }
+```
+
+`vkAcquireNextImageKHR` returns an index immediately, but the image is **not necessarily ready
+to use** — the presentation engine may still be displaying it. That is why the function insists
+on a semaphore or a fence: it will not let you ignore the question. We pass `VK_NULL_HANDLE`
+for the semaphore and a fence instead, because a fence is the thing the CPU can wait on
+directly.
+
+This is the first call in the series **not** wrapped in `VK_CHECK`, and the reason is that two
+of its non-`VK_SUCCESS` results are not errors:
+
+```
+  VK_SUCCESS            fine
+  VK_SUBOPTIMAL_KHR     fine — the frame is usable, the swapchain just no longer
+                        matches the surface perfectly
+  VK_ERROR_OUT_OF_DATE  not an error either — the swapchain expired, which chapter 1.4
+                        said is a normal part of running. Rebuild and skip the frame.
+  anything else         a real failure
+```
+
+`VK_CHECK` would throw on the first two. So the cases are handled by hand and only genuine
+failures reach `throw_vulkan_error`, which is the function `VK_CHECK` expands to.
+
+`UINT64_MAX` is the timeout in nanoseconds, and means "wait forever".
+
+```cpp title="code/src/1.getting_started/command_buffers/main.cpp"
+        VK_CHECK(vkWaitForFences(device, 1, &acquire_fence_, VK_TRUE, UINT64_MAX));
+        VK_CHECK(vkResetFences(device, 1, &acquire_fence_));
+```
+
+Wait for the image to actually be available, then put the fence back to unsignalled ready for
+next frame. **Forgetting the reset is a classic hang**: the second wait returns instantly on a
+fence still signalled from the first, and the bug shows up as rendering into an image the
+display is still scanning out.
+
+## Recording
+
+```cpp title="code/src/1.getting_started/command_buffers/main.cpp"
+        // 2. Record. Nothing executes here; we are writing a list.
+        VK_CHECK(vkResetCommandBuffer(command_buffer_, 0));
+        const VkCommandBufferBeginInfo begin_info{
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .pNext = nullptr,
+            // This buffer is submitted once and then reset, which lets the driver
+            // optimise for that case.
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+            .pInheritanceInfo = nullptr,
+        };
+        VK_CHECK(vkBeginCommandBuffer(command_buffer_, &begin_info));
+
+        const VkImage image = swapchain_.image(image_index);
+        const VkExtent2D extent = swapchain_.extent();
+```
+
+`VkCommandBufferBeginInfo` is how recording starts: everything between
+`vkBeginCommandBuffer` and `vkEndCommandBuffer` is appended to this buffer, and the flags
+here describe how the buffer will be used rather than what it contains.
+
+`ONE_TIME_SUBMIT` promises the driver that this buffer is submitted once and then reset, which
+lets it skip bookkeeping it would otherwise need. Breaking that promise — submitting the same
+buffer twice — is undefined behaviour the layers will catch. `pInheritanceInfo` is only for
+secondary buffers, hence null.
+
+```cpp title="code/src/1.getting_started/command_buffers/main.cpp"
+        transition_image(command_buffer_, image, VK_IMAGE_LAYOUT_UNDEFINED,
+                         VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 ```
 
 :::tip[`UNDEFINED` means "discard"]
-Using `VK_IMAGE_LAYOUT_UNDEFINED` as the *source* layout tells the driver you do not
-care about the existing contents, which makes the transition free — no data has to be
-rearranged. Whatever was in a returned swapchain image is not ours to keep anyway, and
-we are about to clear it.
+Using `VK_IMAGE_LAYOUT_UNDEFINED` as the *source* layout tells the driver you do not care about
+the existing contents, which makes the transition free — no data has to be rearranged. Whatever
+was in a returned swapchain image is not ours to keep anyway, and we are about to clear it.
 
-Transitioning *from* the real old layout instead would preserve contents you are about
-to overwrite. It is a common and invisible waste.
+Transitioning *from* the real old layout instead would preserve contents you are about to
+overwrite. It is a common and invisible waste.
 :::
+
+```cpp title="code/src/1.getting_started/command_buffers/main.cpp"
+        const float seconds = static_cast<float>(frame_number_) / 50.0F;
+        const VkClearValue clear{
+            .color = {{0.5F + 0.5F * std::sin(seconds),
+                       0.5F + 0.5F * std::sin(seconds + 2.0F),
+                       0.5F + 0.5F * std::sin(seconds + 4.0F), 1.0F}},
+        };
+```
+
+A slow colour cycle, so a frozen frame is obvious at a glance. The three channels are offset by
+about a third of a cycle each — 2.0 and 4.0 radians out of 2π ≈ 6.28 — so the colour sweeps
+through hues rather than just brightening and dimming.
+
+Driven by the **frame counter rather than the clock**, so that frame N always has the same
+colour: `tools/capture.py` depends on that, because a screenshot taken at frame 90 has to be
+identical every run or it cannot detect a real change.
+
+The doubled braces are not a typo. `VkClearValue` is a union, `.color` is a `VkClearColorValue`
+which is itself a union, and the inner braces select its `float32[4]` member.
 
 ## Dynamic rendering
 
 ```cpp title="code/src/1.getting_started/command_buffers/main.cpp"
-const VkRenderingAttachmentInfo colour_attachment{
-    .imageView = views_[image_index],
-    .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-    .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-    .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-    .clearValue = clear,
-};
-
-vkCmdBeginRendering(command_buffer_, &rendering);
-vkCmdEndRendering(command_buffer_);
+        const VkRenderingAttachmentInfo colour_attachment{
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .pNext = nullptr,
+            .imageView = swapchain_.view(image_index),
+            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .resolveMode = VK_RESOLVE_MODE_NONE,
+            .resolveImageView = VK_NULL_HANDLE,
+            .resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            // CLEAR means the clear happens as part of starting the pass rather than
+            // as a separate pass over every pixel. It is effectively free.
+            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .clearValue = clear,
+        };
 ```
 
-This is where Vulkan 1.3 saves an enormous amount of work. You describe what you are
-rendering into at the point of use, and that is all.
+A `VkRenderingAttachmentInfo` describes **one thing being rendered into** — which view, in
+which layout, what to do with its contents at the start and end. One of these per colour
+target, plus optionally one for depth and one for stencil.
 
-In Vulkan 1.0 this required a `VkRenderPass` describing attachments, subpasses and
-their dependencies, created up front; and a `VkFramebuffer` binding actual image views
-to it, recreated every time the swapchain changed. Both objects had to be kept
-consistent with each other and with every pipeline. Older tutorials spend two or three
-chapters here. We spend one struct.
+This is where Vulkan 1.3 saves an enormous amount of work. You describe what you are rendering
+into at the point of use, and that is all.
+
+In Vulkan 1.0 this required a `VkRenderPass` describing attachments, subpasses and their
+dependencies, created up front; and a `VkFramebuffer` binding actual image views to it,
+recreated every time the swapchain changed. Both had to be kept consistent with each other and
+with every pipeline. Older tutorials spend two or three chapters here. We spend one struct.
+
+Note the attachment takes the **view**, not the image, while the barrier above took the image.
+Layouts belong to images; rendering reads through views.
+
+The three `resolve` fields are for multisampling — the attachment a multisampled image is
+resolved down into. `VK_RESOLVE_MODE_NONE` says there is none.
 
 `loadOp` and `storeOp` are worth understanding rather than copying:
 
@@ -150,57 +608,653 @@ chapters here. We spend one struct.
 | `LOAD` | Preserve existing contents — costs bandwidth on tiled GPUs |
 | `DONT_CARE` | Contents become undefined — cheapest when you will overwrite every pixel |
 
-`VK_ATTACHMENT_LOAD_OP_CLEAR` is why there is no `vkCmdClearColorImage` here. Clearing
-as part of beginning the pass costs nothing; clearing as a separate command is a full
-pass over every pixel.
-
-## The frame, end to end
+`VK_ATTACHMENT_LOAD_OP_CLEAR` is why there is no `vkCmdClearColorImage` here. Clearing as part
+of beginning the pass costs nothing; clearing as a separate command is a full pass over every
+pixel.
 
 ```cpp title="code/src/1.getting_started/command_buffers/main.cpp"
-vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, VK_NULL_HANDLE,
-                      acquire_fence_, &image_index);
+        const VkRenderingInfo rendering{
+            .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .renderArea = {{0, 0}, extent},
+            .layerCount = 1,
+            .viewMask = 0,
+            .colorAttachmentCount = 1,
+            .pColorAttachments = &colour_attachment,
+            .pDepthAttachment = nullptr,
+            .pStencilAttachment = nullptr,
+        };
+
+        vkCmdBeginRendering(command_buffer_, &rendering);
+        // No draw calls yet. The triangle arrives in 1.7.
+        vkCmdEndRendering(command_buffer_);
 ```
 
-`vkAcquireNextImageKHR` returns an index immediately, but the image is **not
-necessarily ready to use**. The presentation engine may still be displaying it. That is
-why the function insists on a semaphore or a fence — it will not let you ignore the
-question of when the image becomes usable.
+No draw calls between them yet — the clear still happens, because it is `loadOp`'s job and
+`loadOp` runs when the scope begins.
 
-Here we pass a fence, because a fence is the thing the CPU can wait on directly:
+`viewMask = 0` disables multiview, the feature that renders to several array layers at once for
+VR. `pDepthAttachment` is null until chapter 1.13 needs a depth buffer.
+
+## Presenting, and the capture hook
 
 ```cpp title="code/src/1.getting_started/command_buffers/main.cpp"
-VK_CHECK(vkWaitForFences(device_, 1, &acquire_fence_, VK_TRUE, UINT64_MAX));
-VK_CHECK(vkResetFences(device_, 1, &acquire_fence_));
+        if (capture_this_frame) {
+            capture_.record(command_buffer_, image, extent);
+        } else {
+            transition_image(command_buffer_, image,
+                             VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                             VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+        }
+
+        VK_CHECK(vkEndCommandBuffer(command_buffer_));
 ```
 
-Then record, submit, wait for the GPU to finish, and present:
+The presentation engine only accepts an image in `PRESENT_SRC_KHR`, so every frame ends with
+that transition. The capture path replaces it rather than adding to it, because the copy it
+records needs `TRANSFER_SRC_OPTIMAL` and it performs the final transition itself on the way
+out. The image still gets presented either way.
+
+This is the instructive part of the capture helper: the copy **has to be recorded into the same
+command buffer that drew the frame**. There is no reaching back for a finished image afterwards
+— by then it belongs to the presentation engine.
+
+## Submitting
 
 ```cpp title="code/src/1.getting_started/command_buffers/main.cpp"
-VK_CHECK(vkQueueSubmit2(queue_, 1, &submit, submit_fence_));
-
-VK_CHECK(vkWaitForFences(device_, 1, &submit_fence_, VK_TRUE, UINT64_MAX));
-VK_CHECK(vkResetFences(device_, 1, &submit_fence_));
+        // 3. Submit. This is where the work crosses to the GPU.
+        const VkCommandBufferSubmitInfo cmd_submit{
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+            .pNext = nullptr,
+            .commandBuffer = command_buffer_,
+            .deviceMask = 0,
+        };
+        const VkSubmitInfo2 submit{
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+            .pNext = nullptr,
+            .flags = 0,
+            // No semaphores yet: we are about to block on the fence instead, which is
+            // what makes this version simple and slow.
+            .waitSemaphoreInfoCount = 0,
+            .pWaitSemaphoreInfos = nullptr,
+            .commandBufferInfoCount = 1,
+            .pCommandBufferInfos = &cmd_submit,
+            .signalSemaphoreInfoCount = 0,
+            .pSignalSemaphoreInfos = nullptr,
+        };
+        VK_CHECK(vkQueueSubmit2(context_.queue(), 1, &submit, submit_fence_));
 ```
+
+`VkSubmitInfo2` is one submission, and `VkCommandBufferSubmitInfo` wraps one command buffer
+inside it. `vkQueueSubmit2` is the `synchronization2` form: it wraps each command buffer in
+its own struct so each can carry its own device mask, and does the same for semaphores so
+each wait can name the stage it waits at.
+
+`deviceMask` is for multi-GPU setups, where each bit selects a physical device that should
+run the buffer. With one GPU, `0` means the same as `1` — the default device.
+
+Both semaphore counts are zero, and those four fields are the shape of the next chapter.
+
+```cpp title="code/src/1.getting_started/command_buffers/main.cpp"
+        VK_CHECK(vkWaitForFences(device, 1, &submit_fence_, VK_TRUE, UINT64_MAX));
+        VK_CHECK(vkResetFences(device, 1, &submit_fence_));
+
+        // The GPU has finished, so the copy the capture helper recorded is now
+        // sitting in host-visible memory and can be written out.
+        if (capture_this_frame) {
+            capture_.write(args_.screenshot, swapchain_.format());
+        }
+
+        ++frame_number_;
+```
+
+The capture write is placed after the wait for a reason worth stating: the copy was *recorded*
+into the command buffer, so its result only exists once the GPU has actually run it.
+
+```cpp title="code/src/1.getting_started/command_buffers/main.cpp"
+        // 4. Give the image back. Because the GPU is idle, there is nothing left to
+        //    wait on, so this needs no wait semaphores either.
+        const VkSwapchainKHR swapchain = swapchain_.handle();
+        const VkPresentInfoKHR present{
+            .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+            .pNext = nullptr,
+            .waitSemaphoreCount = 0,
+            .pWaitSemaphores = nullptr,
+            .swapchainCount = 1,
+            .pSwapchains = &swapchain,
+            .pImageIndices = &image_index,
+            .pResults = nullptr,
+        };
+        const VkResult presented = vkQueuePresentKHR(context_.queue(), &present);
+        if (presented == VK_ERROR_OUT_OF_DATE_KHR || presented == VK_SUBOPTIMAL_KHR) {
+            swapchain_.recreate();
+        } else if (presented != VK_SUCCESS) {
+            vkc::throw_vulkan_error(presented, "vkQueuePresentKHR", __FILE__, __LINE__);
+        }
+    }
+```
+
+`swapchain` is a named local because `pSwapchains` is an array and therefore a pointer —
+`&swapchain_.handle()` would be taking the address of a temporary.
+
+`SUBOPTIMAL` is treated as a rebuild here but was tolerated at acquire time. Both are
+defensible; rebuilding on it means the very next frame matches the surface again. `pResults` is
+only useful when presenting to several swapchains at once.
 
 ## This version is deliberately slow
 
-That wait is the problem with this chapter, and it is there on purpose.
-
-The CPU submits a frame and then stops, doing nothing, until the GPU has completely
-finished. Then the GPU stops, doing nothing, while the CPU records the next frame.
-**Half the machine is always idle.**
+That wait on `submit_fence_` is the problem with this chapter, and it is there on purpose.
 
 ```
 CPU  [record][wait............][record][wait............]
 GPU  [......][execute.........][......][execute.........]
+     └─ idle ─┘                └─ idle ─┘
 ```
 
-It is correct — and correctness first is the right order. Deleting the wait would not
-be an optimisation, it would be a bug: the command buffer would be re-recorded while
-the GPU was still reading it.
+The CPU submits a frame and then stops, doing nothing, until the GPU has completely finished.
+Then the GPU stops, doing nothing, while the CPU records the next frame. **Half the machine is
+always idle.**
 
-The actual fix is to stop asking *"has the GPU finished?"* and start saying *"do this
-after that"*, which is what [chapter 1.6](/getting-started/synchronisation/) is about.
+It is correct — and correctness first is the right order. Deleting the wait would not be an
+optimisation, it would be a bug: the command buffer would be re-recorded while the GPU was
+still reading it.
+
+The actual fix is to stop asking *"has the GPU finished?"* and start saying *"do this after
+that"*, which is what [chapter 1.6](/getting-started/synchronisation/) is about.
+
+```cpp title="code/src/1.getting_started/command_buffers/main.cpp"
+    vkc::Args args_;
+    vkc::Window window_;
+    vkc::Context context_;
+    vkc::Swapchain swapchain_;
+
+    VkCommandPool command_pool_ = VK_NULL_HANDLE;
+    VkCommandBuffer command_buffer_ = VK_NULL_HANDLE;
+    VkFence acquire_fence_ = VK_NULL_HANDLE;
+    VkFence submit_fence_ = VK_NULL_HANDLE;
+    uint64_t frame_number_ = 0;
+    vkc::Capture capture_;
+};
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    try {
+        ClearApp app(vkc::parse_args(argc, argv));
+        return app.run();
+    } catch (const std::exception& error) {
+        spdlog::error("{}", error.what());
+        return EXIT_FAILURE;
+    }
+}
+```
+
+## The two scaffold files in full
+
+`vkc::Context` appeared above as a constructor and a destructor, and `vkc::Capture` has
+been treated as scenery. Neither is allowed to stay that way.
+
+### `vkc::Context`
+
+```cpp title="code/common/scaffold/include/vkc/context.hpp"
+#include "vkc/device.hpp"
+#include "vkc/instance.hpp"
+
+#include <volk.h>
+
+#include <vk_mem_alloc.h>
+
+#include <cstdint>
+#include <memory>
+#include <string_view>
+
+namespace vkc {
+
+class Window;
+
+class Context {
+public:
+    struct Config {
+        std::string_view app_name = "LearnVulkan";
+        bool enable_validation = true;
+    };
+
+    Context(const Config& config, Window& window);
+    ~Context();
+
+    Context(const Context&) = delete;
+    Context& operator=(const Context&) = delete;
+    Context(Context&&) = delete;
+    Context& operator=(Context&&) = delete;
+```
+
+This header **includes** `device.hpp` and `instance.hpp` rather than forward-declaring
+them, because the members below are `unique_ptr`s whose destructors need the complete
+type. `Window` is only referred to by pointer, so a forward declaration is enough for it.
+
+`Config` mirrors `Instance::Config` exactly, and is passed straight through.
+
+```cpp title="code/common/scaffold/include/vkc/context.hpp"
+    // The two halves, for a chapter that wants to name them.
+    [[nodiscard]] const Instance& vk_instance() const noexcept { return *instance_; }
+    [[nodiscard]] const Device& vk_device() const noexcept { return *device_; }
+
+    [[nodiscard]] VkInstance instance() const noexcept { return instance_->handle(); }
+    [[nodiscard]] VkPhysicalDevice physical_device() const noexcept {
+        return device_->physical_device();
+    }
+    [[nodiscard]] VkDevice device() const noexcept { return device_->handle(); }
+    [[nodiscard]] VkSurfaceKHR surface() const noexcept { return surface_; }
+    [[nodiscard]] VmaAllocator allocator() const noexcept {
+        return device_->allocator();
+    }
+```
+
+This is what a **facade** is: almost every method here forwards to one of the two objects
+it holds. The point is not to add behaviour but to give the rest of the series a single
+thing to pass around.
+
+Note the deliberate name collision: `instance()` returns the raw `VkInstance`, while
+`vk_instance()` returns the `vkc::Instance` object. The raw handles are what Vulkan calls
+want, so they get the short names.
+
+`surface()` is the one accessor that returns something `Context` owns itself rather than
+forwarding.
+
+```cpp title="code/common/scaffold/include/vkc/context.hpp"
+    // A single queue that supports graphics, compute, transfer and presentation.
+    // Every desktop GPU exposes at least one such queue family, and using one queue
+    // for everything removes an entire class of ownership-transfer barriers from the
+    // early chapters. Multiple queues get their own chapter much later.
+    [[nodiscard]] VkQueue queue() const noexcept { return device_->queue(); }
+    [[nodiscard]] uint32_t queue_family() const noexcept {
+        return device_->queue_family();
+    }
+
+    [[nodiscard]] const VkPhysicalDeviceProperties& gpu_properties() const noexcept {
+        return device_->gpu_properties();
+    }
+
+    // Attaches a readable name to a Vulkan object. Costs nothing in release builds
+    // and turns RenderDoc captures and validation messages from handle soup into
+    // something you can actually read.
+    void set_debug_name(uint64_t handle, VkObjectType type, const char* name) const {
+        device_->set_debug_name(handle, type, name);
+    }
+
+    template <typename Handle>
+    void name(Handle handle, VkObjectType type, const char* label) const {
+        set_debug_name(reinterpret_cast<uint64_t>(handle), type, label);
+    }
+```
+
+`name` is the only piece of real machinery in the class. `set_debug_name` takes a
+`uint64_t`, because one function has to accept every kind of handle, but callers hold
+typed handles like `VkSwapchainKHR`. Without the template, every naming call would carry
+its own cast.
+
+The **template** lets the cast be written once. `Handle` is deduced from the argument, so
+`context.name(swapchain_, VK_OBJECT_TYPE_SWAPCHAIN_KHR, "swapchain")` compiles for any
+handle type, and the `reinterpret_cast` — which reinterprets the bits of one type as
+another without converting them — happens in one place instead of scattered through
+twenty chapters.
+
+It cannot check that the `VkObjectType` matches the handle you passed; that pairing is
+yours to get right, and the validation layers will complain if you do not.
+
+```cpp title="code/common/scaffold/include/vkc/context.hpp"
+    // Blocks until the GPU is completely idle. Only ever correct at teardown or
+    // during a window resize; never in a frame loop.
+    void wait_idle() const { device_->wait_idle(); }
+
+private:
+    std::unique_ptr<Instance> instance_;
+    VkSurfaceKHR surface_ = VK_NULL_HANDLE;
+    std::unique_ptr<Device> device_;
+
+    Window* window_ = nullptr;
+};
+
+}  // namespace vkc
+```
+
+The members are `unique_ptr`s for chapter 1.4's reason, now solved once for everybody:
+`Instance` and `Device` are both non-copyable and non-movable, and `Device` cannot be
+constructed until the surface exists. Holding them by pointer lets the constructor body
+build them in sequence.
+
+They are also declared in **dependency order**, which matters because members are
+destroyed in reverse declaration order — though this destructor does not rely on that, as
+the next file shows.
+
+`window_` is a raw `Window*` rather than a reference. A reference would be more honest
+about never being null, but it would also make `Context` non-assignable and, more
+practically, the destructor wants to check it before using it.
+
+```cpp title="code/common/scaffold/src/context.cpp"
+#include "vkc/context.hpp"
+
+#include "vkc/window.hpp"
+
+namespace vkc {
+
+// The order here is the dependency order, and it is the reason the three objects are
+// built in three steps rather than one: the surface needs an instance to be created
+// from, and the device cannot be chosen without a surface to ask about.
+Context::Context(const Config& config, Window& window) : window_(&window) {
+    instance_ = std::make_unique<Instance>(Instance::Config{
+        .app_name = config.app_name,
+        .enable_validation = config.enable_validation,
+    });
+
+    surface_ = window.create_surface(instance_->handle());
+
+    device_ = std::make_unique<Device>(*instance_, surface_);
+}
+
+// Strict reverse order. The device owns the allocator and dies first; the surface was
+// created from the instance and has to go before it; the instance goes last.
+Context::~Context() {
+    device_.reset();
+
+    if (window_ != nullptr && instance_) {
+        window_->destroy_surface(instance_->handle());
+    }
+
+    instance_.reset();
+}
+
+}  // namespace vkc
+```
+
+The whole file. `window.hpp` is included here rather than in the header because this is
+where `create_surface` and `destroy_surface` are actually called.
+
+The destructor calls `.reset()` explicitly instead of letting the members fall out of
+scope, because the surface has to be destroyed *between* the two — after the device that
+was chosen for it, before the instance that created it. Automatic destruction would run
+both `unique_ptr`s after this body, with the surface teardown stranded in the middle.
+
+### `vkc::Capture`
+
+The screenshot harness. Chapter 1.1 showed the `Args` half of this header; this is the
+rest.
+
+```cpp title="code/common/base/include/vkc/capture.hpp"
+#include <filesystem>
+#include <string>
+```
+
+`<filesystem>` is for `std::filesystem::path`, which is what `Args::screenshot` and
+`write()` below both take — a path rather than a `std::string`, so that separators and
+encodings are the platform's problem rather than ours.
+
+```cpp title="code/common/base/include/vkc/capture.hpp"
+class Capture {
+public:
+    Capture() = default;
+    ~Capture();
+
+    Capture(const Capture&) = delete;
+    Capture& operator=(const Capture&) = delete;
+    Capture(Capture&&) = delete;
+    Capture& operator=(Capture&&) = delete;
+
+    void init(VkDevice device, VmaAllocator allocator);
+
+    // Records: COLOR_ATTACHMENT_OPTIMAL -> TRANSFER_SRC -> copy -> PRESENT_SRC_KHR.
+    // The image still gets presented; the screenshot is taken on the way past.
+    void record(VkCommandBuffer cmd, VkImage image, VkExtent2D extent);
+
+    // Writes what record() copied. Call only once the GPU has finished the frame.
+    void write(const std::filesystem::path& path, VkFormat format) const;
+
+    [[nodiscard]] bool has_pending_capture() const noexcept { return pending_; }
+
+    void destroy() noexcept;
+
+private:
+    void allocate(VkExtent2D extent);
+
+    VkDevice device_ = VK_NULL_HANDLE;
+    VmaAllocator allocator_ = VK_NULL_HANDLE;
+    VkBuffer buffer_ = VK_NULL_HANDLE;
+    VmaAllocation allocation_ = VK_NULL_HANDLE;
+    VmaAllocationInfo allocation_info_{};
+    VkExtent2D extent_{};
+    bool pending_ = false;
+};
+```
+
+`init` rather than a constructor taking the device, because a sample declares its
+`Capture` as a member and the device does not exist until the context has been built. The
+split is the price of not using a `unique_ptr` here.
+
+The two-method shape — **`record` then `write`** — is the whole lesson of this class, and
+the frame walkthrough above already used it: `record` adds commands to your command
+buffer, and `write` can only run once the GPU has executed them.
+
+```cpp title="code/common/base/src/capture.cpp"
+#include "vkc/capture.hpp"
+
+#include <stb_image_write.h>
+
+#include <charconv>
+#include <cstring>
+#include <vector>
+```
+
+`stb_image_write.h` is a single-header library for writing PNG and a handful of other
+formats. It is included here without a companion `#define` for its implementation,
+because of a constraint recorded in this project's `CLAUDE.md`: Assimp, used from Part 3,
+exports all of stb's symbols from its own static library, so defining the implementation
+globally makes every Part 3 chapter fail to link with `multiple definition of stbi_load`.
+The implementation lives in `stb_impl.cpp` and holds only the *write* half.
+
+`<charconv>` is for the `std::from_chars` in `parse_args` that chapter 1.1 walked through.
+
+```cpp title="code/common/base/src/capture.cpp"
+Capture::~Capture() { destroy(); }
+
+void Capture::init(VkDevice device, VmaAllocator allocator) {
+    device_ = device;
+    allocator_ = allocator;
+}
+
+void Capture::allocate(VkExtent2D extent) {
+    destroy();
+    extent_ = extent;
+
+    const VkBufferCreateInfo buffer_info{
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .size = static_cast<VkDeviceSize>(extent.width) * extent.height * 4,
+        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = 0,
+        .pQueueFamilyIndices = nullptr,
+    };
+
+    // HOST_ACCESS_RANDOM plus MAPPED gives a buffer the CPU can read straight out of
+    // once the GPU is done writing it, with no second copy.
+    VmaAllocationCreateInfo alloc_info{};
+    alloc_info.usage = VMA_MEMORY_USAGE_AUTO;
+    alloc_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
+                       VMA_ALLOCATION_CREATE_MAPPED_BIT;
+
+    VK_CHECK(vmaCreateBuffer(allocator_, &buffer_info, &alloc_info, &buffer_,
+                             &allocation_, &allocation_info_));
+}
+```
+
+Buffers are chapter 1.8's subject, so take this on its outline for now: a `VkBuffer` is a
+region of memory with a declared use, and VMA picks which kind of memory to put it in.
+
+Two flags make it readable from the CPU. `HOST_ACCESS_RANDOM` asks VMA for memory the CPU
+can read, and `MAPPED` asks for it to be **mapped** permanently — that is, given an
+ordinary CPU address — so `allocation_info_.pMappedData` is a pointer you can `memcpy`
+from. Without it, every read would need a `vmaMapMemory` / `vmaUnmapMemory` pair.
+
+The size is `width × height × 4`, one byte per channel of RGBA, with the cast to
+`VkDeviceSize` **before** the multiplication so that a large window cannot overflow a
+32-bit intermediate.
+
+`allocate` begins by calling `destroy()`, which is what makes it safe to call again when
+the window is resized.
+
+```cpp title="code/common/base/src/capture.cpp"
+void Capture::record(VkCommandBuffer cmd, VkImage image, VkExtent2D extent) {
+    if (buffer_ == VK_NULL_HANDLE || extent_.width != extent.width ||
+        extent_.height != extent.height) {
+        allocate(extent);
+    }
+
+    const auto barrier = [cmd, image](VkImageLayout from, VkImageLayout to) {
+        const VkImageMemoryBarrier2 image_barrier{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+            .pNext = nullptr,
+            .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+            .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+            .dstAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT,
+            .oldLayout = from,
+            .newLayout = to,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = image,
+            .subresourceRange =
+                {
+                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .baseMipLevel = 0,
+                    .levelCount = VK_REMAINING_MIP_LEVELS,
+                    .baseArrayLayer = 0,
+                    .layerCount = VK_REMAINING_ARRAY_LAYERS,
+                },
+        };
+        const VkDependencyInfo dependency{
+            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .pNext = nullptr,
+            .dependencyFlags = 0,
+            .memoryBarrierCount = 0,
+            .pMemoryBarriers = nullptr,
+            .bufferMemoryBarrierCount = 0,
+            .pBufferMemoryBarriers = nullptr,
+            .imageMemoryBarrierCount = 1,
+            .pImageMemoryBarriers = &image_barrier,
+        };
+        vkCmdPipelineBarrier2(cmd, &dependency);
+    };
+```
+
+That lambda is `transition_image` from the top of this chapter, captured as a local so the
+two calls below read cleanly. Same masks, same sledgehammer, same reasoning.
+
+```cpp title="code/common/base/src/capture.cpp"
+    barrier(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+
+    const VkBufferImageCopy2 region{
+        .sType = VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2,
+        .pNext = nullptr,
+        .bufferOffset = 0,
+        .bufferRowLength = 0,  // 0 means "tightly packed to imageExtent"
+        .bufferImageHeight = 0,
+        .imageSubresource =
+            {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+        .imageOffset = {0, 0, 0},
+        .imageExtent = {extent.width, extent.height, 1},
+    };
+    const VkCopyImageToBufferInfo2 copy{
+        .sType = VK_STRUCTURE_TYPE_COPY_IMAGE_TO_BUFFER_INFO_2,
+        .pNext = nullptr,
+        .srcImage = image,
+        .srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .dstBuffer = buffer_,
+        .regionCount = 1,
+        .pRegions = &region,
+    };
+    vkCmdCopyImageToBuffer2(cmd, &copy);
+
+    barrier(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    pending_ = true;
+}
+```
+
+The three steps the header comment promised: move the image to `TRANSFER_SRC_OPTIMAL`,
+copy it into the buffer, then move it to `PRESENT_SRC_KHR` so it can still be displayed.
+The screenshot is taken **on the way past**, not instead of presenting.
+
+`bufferRowLength = 0` and `bufferImageHeight = 0` mean "tightly packed" — the rows in the
+buffer follow each other with no padding, matching `imageExtent`. Non-zero values describe
+a copy into a larger buffer, which is how you would extract a sub-rectangle.
+
+`imageOffset` and `imageExtent` are three-dimensional because the same struct copies 3D
+images; a 2D image has depth `1`.
+
+`srcImageLayout` has to state the layout the image is *already* in. It does not perform a
+transition — that is what the barrier before it was for — and getting it wrong is a
+validation error rather than a silent fix.
+
+```cpp title="code/common/base/src/capture.cpp"
+void Capture::write(const std::filesystem::path& path, VkFormat format) const {
+    if (!pending_) {
+        return;
+    }
+
+    const size_t byte_count = static_cast<size_t>(extent_.width) * extent_.height * 4;
+    std::vector<uint8_t> pixels(byte_count);
+    std::memcpy(pixels.data(), allocation_info_.pMappedData, byte_count);
+
+    // Swapchains usually hand out BGRA; PNG wants RGBA, so swap red and blue.
+    const bool is_bgra = format == VK_FORMAT_B8G8R8A8_SRGB ||
+                         format == VK_FORMAT_B8G8R8A8_UNORM;
+    if (is_bgra) {
+        for (size_t i = 0; i + 3 < pixels.size(); i += 4) {
+            std::swap(pixels[i], pixels[i + 2]);
+        }
+    }
+
+    const std::string filename = path.string();
+    if (stbi_write_png(filename.c_str(), static_cast<int>(extent_.width),
+                       static_cast<int>(extent_.height), 4, pixels.data(),
+                       static_cast<int>(extent_.width) * 4) == 0) {
+        spdlog::error("Could not write screenshot to {}", filename);
+    } else {
+        spdlog::info("Wrote {} ({}x{})", filename, extent_.width, extent_.height);
+    }
+}
+
+void Capture::destroy() noexcept {
+    if (buffer_ != VK_NULL_HANDLE) {
+        vmaDestroyBuffer(allocator_, buffer_, allocation_);
+        buffer_ = VK_NULL_HANDLE;
+        allocation_ = VK_NULL_HANDLE;
+    }
+    pending_ = false;
+}
+```
+
+The `memcpy` out of `pMappedData` is the moment GPU-written bytes become ordinary CPU
+memory, and it is only valid because the caller waited on the fence first.
+
+The **red-and-blue swap** is the practical consequence of chapter 1.4's format choice. A
+swapchain usually hands out `B8G8R8A8`, and PNG expects RGBA, so channels 0 and 2 of every
+four-byte pixel are exchanged. Skipping this step produces an image that looks
+convincingly correct until you notice the sky is orange.
+
+The last argument to `stbi_write_png` is the **stride**: the number of bytes from the start
+of one row to the start of the next. It equals `width × 4` here precisely because the copy
+was tightly packed.
+
+`vmaDestroyBuffer` destroys the buffer and frees its allocation in one call — the pairing
+VMA exists to keep straight.
 
 ## Running it
 
@@ -208,30 +1262,49 @@ after that"*, which is what [chapter 1.6](/getting-started/synchronisation/) is 
 ./code/out/build/linux-debug/bin/1.5.command_buffers
 ```
 
-A window cycling slowly through colours. The cycle is driven by the frame counter
-rather than the clock, so that frame N always has the same colour — the screenshot
-tooling diffs captures against reference images, and a time-based cycle would differ
-every run.
+A window cycling slowly through colours.
 
 :::note[If the colours look wrong]
-If you changed the swapchain format to `_UNORM` in the last chapter's exercises, the
-colours will be visibly brighter and more washed out than they should be. That is the
-sRGB conversion you switched off.
+If you changed the swapchain format to `_UNORM` in chapter 1.4's exercises, the colours will be
+visibly brighter and more washed out than they should be. That is the sRGB conversion you
+switched off.
 :::
+
+## Words introduced in this chapter
+
+| | |
+|---|---|
+| **command buffer** | a recorded list of GPU commands; recording touches no GPU |
+| **command pool** | the memory command buffers are recorded into; not thread-safe |
+| **submit** | handing a recorded buffer to a queue — the moment work crosses over |
+| **image layout** | how a driver has arranged an image's pixels for a particular use |
+| **barrier** | an instruction that transitions a layout *and* orders work against work |
+| **fence** | a signal from the GPU that the CPU can wait on |
+| **dynamic rendering** | describing attachments at the point of use, with no render pass object |
+| **`loadOp` / `storeOp`** | what happens to an attachment at the start and end of rendering |
+| **allocated** | a third kind of handle: taken from a pool, freed by destroying the pool |
+| **primary / secondary** | a buffer that can be submitted, versus one called from a primary |
+| **facade** | one object presenting several others behind a single interface |
+| **host-visible memory** | memory the CPU can map and read directly, which is how a screenshot gets back |
 
 ## Exercises
 
-1. Comment out the first `transition_image` call and run with validation on. Read the
-   error carefully — this is the error you will see most often in your Vulkan career,
-   so it is worth meeting it deliberately once.
-2. Change `loadOp` to `VK_ATTACHMENT_LOAD_OP_DONT_CARE`. On most desktop drivers the
-   previous contents happen to persist, giving a stale or garbage image. "Undefined"
-   means the driver may do anything, including nothing.
-3. Remove the `vkWaitForFences` on `submit_fence_` and see what validation says. It
-   will object to the command buffer being reset while still in use — which is the
-   precise thing chapter 1.6 solves properly.
-4. Switch the present mode to `IMMEDIATE` from the last chapter's exercise. Now there
-   is animation, you can watch it tear.
+1. Comment out the first `transition_image` call and run with validation on. Read the error
+   carefully — this is the error you will see most often in your Vulkan career, so it is worth
+   meeting it deliberately once.
+2. Change `loadOp` to `VK_ATTACHMENT_LOAD_OP_DONT_CARE`. On most desktop drivers the previous
+   contents happen to persist, giving a stale or garbage image. "Undefined" means the driver may
+   do anything, including nothing.
+3. Remove the `vkWaitForFences` on `submit_fence_` and see what validation says. It will object
+   to the command buffer being reset while still in use — which is the precise thing chapter 1.6
+   solves properly.
+4. Switch the present mode to `IMMEDIATE` from chapter 1.4's exercise. Now there is animation,
+   you can watch it tear.
+5. Delete the `vkResetFences` call after the acquire wait and run it. The hang is immediate and
+   total, and understanding why is worth more than the two seconds it takes to put the line back.
+6. Open `code/common/scaffold/src/swapchain.cpp` and check it against chapter 1.4's `main.cpp`.
+   The choosing functions, the create info and the ownership comments are the same code — which
+   is the claim this series makes about everything in the scaffold.
 
-Next: [synchronisation](/getting-started/synchronisation/) — making both halves of the
-machine work at once.
+Next: [synchronisation](/getting-started/synchronisation/) — making both halves of the machine
+work at once.

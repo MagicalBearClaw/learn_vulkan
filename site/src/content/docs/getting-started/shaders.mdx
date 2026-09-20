@@ -10,61 +10,174 @@ sidebar:
   <figcaption>Chapter 1.9: the same four vertices, with the fragment shader doing some actual work.</figcaption>
 </figure>
 
-There is almost no new Vulkan in this chapter. The C++ shrank instead: everything 1.8
-wrote by hand now lives in `vkcommon`, and the two buffers are two lines.
+There is almost no new Vulkan in this chapter. The C++ shrank instead: everything 1.8 wrote by
+hand now lives in `vkcommon`.
 
-```cpp title="code/src/1.getting_started/shaders/main.cpp"
-vertex_buffer_ = vkc::upload_to_device_local(
-    context(), kVertices.data(), sizeof(kVertices),
-    VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+```cmake title="code/src/1.getting_started/shaders/CMakeLists.txt"
+add_chapter(1.9.shaders
+    SOURCES main.cpp
+    SHADERS quad.slang
+)
 ```
 
-The subject this time is the shading language itself.
+No `SCAFFOLD` line, as of chapter 1.8 — the whole scaffold is linked, because every piece
+of it has now been written out and explained. Every chapter's build file for the rest of
+the series is these four lines with a different name.
+
+## What chapter 1.8 left behind
+
+```cpp title="code/src/1.getting_started/shaders/main.cpp"
+#include <vkc/buffer.hpp>
+```
+
+```cpp title="code/src/1.getting_started/shaders/main.cpp"
+class ShaderApp : public vkc::App {
+```
+
+```cpp title="code/src/1.getting_started/shaders/main.cpp"
+    void on_start() override {
+        vertex_buffer_ = vkc::upload_to_device_local(
+            context(), kVertices.data(), sizeof(kVertices),
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+        index_buffer_ = vkc::upload_to_device_local(
+            context(), kIndices.data(), sizeof(kIndices),
+            VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+
+        create_pipeline();
+    }
+```
+
+Two calls where 1.8 needed a hundred lines. It is the same staging upload, and the scaffold
+version ends with the comment that makes the lifetime rule explicit:
+
+```cpp title="code/common/scaffold/src/buffer.cpp"
+    // `staging` is destroyed as this returns, after immediate_submit has waited on its
+    // fence -- so the GPU has certainly finished reading it.
+    return result;
+```
+
+The one thing genuinely added is **ownership**. Chapter 1.8's `Buffer` was a plain struct with a
+`destroy_buffer` free function; `vkc::Buffer` is a class that frees itself:
+
+```cpp title="code/common/scaffold/src/buffer.cpp"
+Buffer::~Buffer() { destroy(); }
+
+Buffer::Buffer(Buffer&& other) noexcept
+    : allocator_(std::exchange(other.allocator_, VK_NULL_HANDLE)),
+      buffer_(std::exchange(other.buffer_, VK_NULL_HANDLE)),
+      allocation_(std::exchange(other.allocation_, VK_NULL_HANDLE)),
+      info_(std::exchange(other.info_, {})),
+      size_(std::exchange(other.size_, 0)) {}
+```
+
+`std::exchange` is what makes a move safe here: it hands over the handle *and* leaves the
+source holding `VK_NULL_HANDLE`, so when the moved-from object is destroyed it frees nothing.
+Without it, `upload_to_device_local` returning a `Buffer` by value would destroy the buffer it
+just made.
+
+```cpp title="code/src/1.getting_started/shaders/main.cpp"
+    vkc::Buffer vertex_buffer_;
+    vkc::Buffer index_buffer_;
+```
+
+```cpp title="code/src/1.getting_started/shaders/main.cpp"
+    void on_shutdown() override {
+        vkDestroyPipeline(context().device(), pipeline_, nullptr);
+        vkDestroyPipelineLayout(context().device(), pipeline_layout_, nullptr);
+
+        index_buffer_.destroy();
+        vertex_buffer_.destroy();
+    }
+```
+
+`vkc::Buffer` frees itself in its destructor, so why the explicit `destroy()`?
+
+```
+   ~ShaderApp()  →  on_shutdown()          ← allocator still alive
+                 →  ~App() tears down the allocator
+                 →  members destroyed      ← vkc::Buffer's destructor runs HERE, too late
+```
+
+Members are destroyed after the class body finishes, which is after `vkc::App` has already torn
+down the allocator they belong to. Calling `destroy()` here is telling them to let go while the
+allocator is still alive. This is the one place RAII and Vulkan's destruction order disagree,
+and the same pattern appears in every remaining sample in the series.
+
+```cpp title="code/src/1.getting_started/shaders/main.cpp"
+        const VkDeviceSize offset = 0;
+        const VkBuffer vertices = vertex_buffer_.handle();
+        vkCmdBindVertexBuffers(frame.cmd, 0, 1, &vertices, &offset);
+        vkCmdBindIndexBuffer(frame.cmd, index_buffer_.handle(), 0,
+                             VK_INDEX_TYPE_UINT16);
+```
+
+`vertices` is a named local because `vkCmdBindVertexBuffers` takes an *array* of buffers and
+therefore a pointer; `&vertex_buffer_.handle()` would be taking the address of a temporary.
+
+```cpp title="code/src/1.getting_started/shaders/main.cpp"
+constexpr std::array<Vertex, 4> kVertices{{
+    {{-0.6F, -0.6F}, {1.0F, 0.0F, 0.0F}},
+    {{0.6F, -0.6F}, {0.0F, 1.0F, 0.0F}},
+    {{0.6F, 0.6F}, {0.0F, 0.0F, 1.0F}},
+    {{-0.6F, 0.6F}, {1.0F, 1.0F, 0.0F}},
+}};
+```
+
+Slightly larger than 1.8's quad, so there is more room to see the checkerboard.
 
 ## The program compiles them
 
-Vulkan does not take shader source. It takes **SPIR-V**: a binary intermediate
-representation, already parsed, with names stripped and control flow made explicit.
-Somebody has to do the translation, and the interesting question is *when*.
+Vulkan does not take shader source. It takes **SPIR-V**: a binary intermediate representation,
+already parsed, with names stripped and control flow made explicit. Somebody has to do the
+translation, and the interesting question is *when*.
 
-There are two answers and both are legitimate.
-
-**Ahead of time** is what a shipping game does. Compile every shader during the build,
-put the SPIR-V in a pack file, and the program never contains a compiler. Syntax errors
-fail your build rather than a user's launch, startup is fast, and the binary is smaller.
-
-**At startup** is what this project does. The samples link `libslang` and hand it the
-`.slang` file that sits next to the executable. Chapter 1.7 wrote the code out in full;
-from here it is one call:
-
-```cpp title="code/src/1.getting_started/shaders/main.cpp"
-const VkShaderModule shader =
-    vkc::load_shader(device, LVK_CHAPTER_ID, "quad.slang");
+```
+   AHEAD OF TIME              AT STARTUP (this series)
+   build → .spv → pack file   .slang beside the binary
+   no compiler shipped        libslang linked in, ~30 MB
+   syntax errors fail YOUR    syntax errors fail the user's launch
+     build                    edit and re-run is the whole loop
 ```
 
-The reason is that this is a course, and half the exercises end with "change this and
-run it again". The file beside the binary *is* the shader. There is no `.spv` anywhere,
-no build step between editing and seeing, and no stale artefact that can lie to you. It
-is also how a tool with hot reload works, and how an engine that compiles shader
-permutations on demand works, so it is not a toy arrangement.
+Both are legitimate. This series compiles at startup because half the exercises end with
+"change this and run it again", and the file next to the executable *is* the shader — there is
+no `.spv` anywhere and no stale artefact that can lie to you.
 
-What it costs, honestly: `libslang` is about 30 MB beside the binary, and the whole
-program — window, device, buffers and the shader compile together — takes roughly a
-third of a second to reach its first frame. Neither matters for a tutorial. Both would
-matter for something you ship, and the answer there is to cache the SPIR-V the first
-time and skip the compiler afterwards.
+```cpp title="code/src/1.getting_started/shaders/main.cpp"
+        const VkShaderModule shader =
+            vkc::load_shader(device, LVK_CHAPTER_ID, "quad.slang");
+```
 
-Either way, **one compiler, one dialect**. OpenGL's GLSL front end was each vendor's own,
-and they disagreed — about whether an implicit conversion was allowed, about how
-aggressive an optimisation could be, occasionally about what a loop meant. SPIR-V moves
-that stage out of the driver, whichever side of the build you do it on.
+Chapter 1.7 wrote that function out in full. The scaffold version is the same code with one
+change — the expensive object is created once:
+
+```cpp title="code/common/scaffold/src/pipeline.cpp"
+[[nodiscard]] slang::IGlobalSession& global_session() {
+    static Slang::ComPtr<slang::IGlobalSession> session = [] {
+        Slang::ComPtr<slang::IGlobalSession> created;
+        if (SLANG_FAILED(slang::createGlobalSession(created.writeRef()))) {
+            throw std::runtime_error("slang::createGlobalSession failed");
+        }
+        return created;
+    }();
+    return *session;
+}
+```
+
+A function-local static again, as in `vkc::Window`: constructed on first use, thread-safe by
+the standard's guarantee, destroyed at exit.
+
+Either way, **one compiler, one dialect**. OpenGL's GLSL front end was each vendor's own, and
+they disagreed — about whether an implicit conversion was allowed, about how aggressive an
+optimisation could be, occasionally about what a loop meant. SPIR-V moves that stage out of the
+driver.
 
 :::tip[Look at the SPIR-V]
-There is no `.spv` file to inspect, but the Slang your build downloaded includes the
+There is no `.spv` file in this project, but the Slang that vcpkg installed includes the
 command-line compiler, so you can make one:
 
 ```bash
-SLANGC=code/out/build/linux-debug/_deps/slang_bindist-src/bin/slangc
+SLANGC=code/out/build/linux-debug/vcpkg_installed/x64-linux/tools/shader-slang/slangc
 $SLANGC code/src/1.getting_started/shaders/quad.slang \
     -target spirv -profile spirv_1_6 -matrix-layout-column-major \
     -emit-spirv-directly -fvk-use-entrypoint-name -o /tmp/quad.spv
@@ -73,132 +186,80 @@ spirv-dis /tmp/quad.spv | head -40
 spirv-val --target-env vulkan1.3 /tmp/quad.spv
 ```
 
-`spirv-dis` prints a module in readable assembly, and it is the fastest way to answer
-"did the compiler really keep that branch?" or "which location did that end up at?".
-`spirv-val` tells you whether the module is legal before a driver ever sees it.
+`spirv-dis` prints a module in readable assembly, and it is the fastest way to answer "did the
+compiler really keep that branch?". `spirv-val` tells you whether the module is legal before a
+driver ever sees it.
 :::
-
-:::caution[The API's defaults are not the command line's defaults]
-Two of the options `load_shader` sets exist because the two disagree.
-
-`VulkanUseEntryPointName` keeps the SPIR-V entry points named after the Slang functions.
-Without it, a module with a single entry point gets it renamed to `main` and `pName`
-stops matching.
-
-`defaultMatrixLayoutMode` is the one that costs people an afternoon. The API defaults to
-row-major, `glm` is column-major, and the mismatch transposes every transform silently —
-it still draws. `load_shader` sets `SLANG_MATRIX_LAYOUT_COLUMN_MAJOR`, which is what
-`slangc`'s command line does by default. That is why the snippet above passes
-`-matrix-layout-column-major`: so that what you disassemble is what the program runs.
-:::
-
-
-## Why Slang
-
-Vulkan does not care what language you write in — it sees SPIR-V and nothing else. GLSL
-via glslang is the traditional answer and still works. This series uses **Slang**
-instead, for reasons that show up immediately and keep paying off:
-
-- **One file per pipeline.** Every stage lives in one module, and the interface between
-  them is a shared struct rather than two lists of declarations in two files.
-- **A real type system.** Generics, interfaces, modules and overload resolution, so the
-  lighting code you write once in Part 2 can be instantiated for a dozen pipelines
-  instead of copied into each of them with a `#define` on top.
-- **It is the direction the ecosystem moved.** Slang is a Khronos project and ships in
-  the Vulkan SDK; `slangc` sits beside `glslangValidator` in the same `bin` directory,
-  and the modules it produces identify their generator as "Khronos Slang Compiler".
-
-The syntax comes from HLSL. If you know GLSL you will be reading it fluently within a
-chapter: `vec3` is `float3`, `mat4` is `float4x4`, `mix` is `lerp`, `mod` is `fmod`, and
-the `layout(...)` qualifiers become `[[vk::...]]` attributes. Appendix *Slang for GLSL
-programmers* has the full table for when you are porting something.
 
 ## Stages talk through a struct
-
-A Slang file declares entry points, and an attribute says which stage each one is:
-
-```slang title="code/src/1.getting_started/shaders/quad.slang"
-[shader("vertex")]
-VSOutput vertexMain(VSInput input) { ... }
-
-[shader("fragment")]
-float4 fragmentMain(VSOutput input) : SV_Target { ... }
-```
-
-Both compile into one SPIR-V module. `main.cpp` names them in
-`VkPipelineShaderStageCreateInfo::pName`, which is the mechanism chapter 1.7 introduced.
-
-What travels between stages is a struct, and the slots are attributes on its fields:
 
 ```slang title="code/src/1.getting_started/shaders/quad.slang"
 struct VSInput {
     [[vk::location(0)]] float2 position;
     [[vk::location(1)]] float3 colour;
 };
+```
 
+```slang title="code/src/1.getting_started/shaders/quad.slang"
 struct VSOutput {
     float4 position : SV_Position;
+
     [[vk::location(0)]] float3 colour;
+
     [[vk::location(1)]] nointerpolation float3 flat_colour;
 };
 ```
 
 Read those two blocks carefully, because the two numbering spaces are **completely
-independent**. `VSInput`'s locations pair with `VkVertexInputAttributeDescription` on the
-C++ side; `VSOutput`'s pair with whatever the fragment stage declares as its input. That
-`location(0)` appears twice in eight lines and means two unrelated things.
+independent**:
 
-The vertex-to-fragment half of that is where Slang differs from GLSL in a way you feel.
-`fragmentMain` takes **the same `VSOutput`**, so there is one declaration of the
-interface rather than two that must agree. Nothing stops you writing a second struct —
-and exercise 5 asks you to, precisely to see what goes wrong when the two disagree.
+```
+   vertex buffer ──location 0,1──▶ VSInput ──▶ [vertex stage] ──▶ VSOutput ──location 0,1──▶ [fragment stage]
+                  ▲                                                          ▲
+                  paired with VkVertexInputAttributeDescription              paired with the
+                                                                             fragment's input
+```
 
-A `float3` output occupies one location. A `float4` also occupies one. A `float4x4`
-occupies four, and a double-precision type occupies two — so the numbers are not always
-consecutive, and the compiler will tell you when you have overlapped them.
+That `location(0)` appears twice in eight lines and means two unrelated things.
+
+`fragmentMain` takes **the same `VSOutput`**, so there is one declaration of the interface
+rather than two that must agree. Exercise 5 asks you to break that on purpose, to see what the
+layers do and do not catch.
+
+A `float3` output occupies one location. A `float4` also occupies one. A `float4x4` occupies
+four, and a double-precision type occupies two — so the numbers are not always consecutive.
 
 ## System-value semantics
 
-The `: SV_Something` suffixes are **system-value semantics**: they mark a field the
-hardware fills in or reads back, where GLSL would use a `gl_` global. Four matter early.
-
-**`SV_Position`** is the one output every vertex shader must write. It is a clip-space
-position, and the hardware divides it by `w` to get normalised device coordinates:
+The `: SV_Something` suffixes are **system-value semantics**: they mark a field the hardware
+fills in or reads back, where GLSL would use a `gl_` global.
 
 ```slang title="code/src/1.getting_started/shaders/quad.slang"
-output.position = float4(input.position, 0.0, 1.0);
+[shader("vertex")]
+VSOutput vertexMain(VSInput input) {
+    VSOutput output;
+
+    output.position = float4(input.position, 0.0, 1.0);
+
+    output.colour = input.colour;
+    output.flat_colour = input.colour;
+    return output;
+}
 ```
 
-`w = 1.0` makes that division a no-op, which is right for flat 2D work. Once there is a
-perspective projection, `w` carries the distance to the camera and the division is
-precisely what makes far-away things small. That is chapter 1.13.
+`w = 1.0` makes the perspective divide a no-op, which is right for flat 2D work. Once there is
+a perspective projection, `w` carries the distance to the camera and the division is precisely
+what makes far-away things small. That is chapter 1.13.
 
-Read as a *fragment input*, the same field means something different: the fragment's
-position in pixels. GLSL keeps these apart as `gl_Position` and `gl_FragCoord`; Slang
-gives the field one name and lets the stage decide. This chapter's fragment shader uses
-it:
-
-```slang title="code/src/1.getting_started/shaders/quad.slang"
-float2 cell = floor(input.position.xy / kCheckerSize);
-float checker = fmod(cell.x + cell.y, 2.0);
-```
-
-Its origin is the **top-left** of the framebuffer, consistent with Vulkan's downward y.
-OpenGL puts it at the bottom-left, and a shader ported without accounting for that comes
-out vertically mirrored.
-
-Because it is in screen pixels, the checkerboard is nailed to the screen rather than to
-the quad. Resize the window and the quad changes size while the squares do not.
-Attaching a pattern to a *surface* needs texture coordinates, which arrive in 1.11.
-
-**`SV_VulkanVertexID`** counts vertices within a draw — it is what 1.7 used to index its
-constant array. Its companion is `SV_VulkanInstanceID`.
+Read as a *fragment input*, `SV_Position` means something different: the fragment's position in
+**pixels**, origin at the top-left, consistent with Vulkan's downward y. GLSL keeps these apart
+as `gl_Position` and `gl_FragCoord`; Slang gives the field one name and lets the stage decide.
 
 :::caution[Not `SV_VertexID`]
-Slang has both, and they are not the same. `SV_VertexID` is the HLSL semantic, where the
-index is relative to the draw, so Slang compiles it to `VertexIndex - BaseVertex` and the
-module declares SPIR-V's `DrawParameters` capability. Unless you enabled
-`shaderDrawParameters` on the device, validation rejects it at `vkCreateShaderModule`:
+Slang has both, and they are not the same. `SV_VertexID` is the HLSL semantic, where the index
+is relative to the draw, so Slang compiles it to `VertexIndex - BaseVertex` and the module
+declares SPIR-V's `DrawParameters` capability. Unless you enabled `shaderDrawParameters` on the
+device, validation rejects it at `vkCreateShaderModule`:
 
 ```
 SPIR-V Capability DrawParameters was declared, but one of the following requirements is
@@ -206,136 +267,177 @@ required (VkPhysicalDeviceVulkan11Features::shaderDrawParameters OR
 VK_KHR_shader_draw_parameters [when using Vulkan 1.0]).
 ```
 
-`SV_VulkanVertexID` is Vulkan's `VertexIndex` builtin directly, with nothing subtracted
-and nothing to enable. The two agree whenever `firstVertex` is 0, which is why the
-mistake can live in a codebase for a long time.
+`SV_VulkanVertexID` is Vulkan's `VertexIndex` builtin directly. The two agree whenever
+`firstVertex` is 0, which is why the mistake can live in a codebase for a long time.
 :::
 
 **`SV_Target`** marks a fragment shader's colour attachment output; `SV_Target0` through
-`SV_TargetN` address them individually once there is more than one.
-
-**`SV_Depth`** lets a fragment shader override the depth it writes. It is worth knowing
-about mostly so you know to avoid it: writing it disables early depth testing on most
-hardware.
-
-:::caution[Vulkan's clip space differs in two ways]
-y points **down**, and z runs **0 to 1** rather than −1 to 1. Both differ from OpenGL,
-and both are silent: a shader ported straight across renders upside down and with a
-depth buffer that is subtly wrong.
-
-The project sets `GLM_FORCE_DEPTH_ZERO_TO_ONE` so glm's projection matrices produce the
-right z. The y flip is handled explicitly in chapter 1.13.
-:::
+`SV_TargetN` address them individually once there is more than one. **`SV_Depth`** lets a
+fragment shader override the depth it writes, and is worth knowing about mostly so you know to
+avoid it: writing it disables early depth testing on most hardware.
 
 ## Interpolation, and switching it off
 
-A fragment shader input is not the value a vertex wrote. The hardware interpolates the
-three vertex values across the triangle, weighted by the fragment's position. That is
-what produced 1.7's gradient, and it is free.
+A fragment shader input is not the value a vertex wrote. The hardware interpolates the three
+vertex values across the triangle, weighted by the fragment's position. That is what produced
+1.7's gradient, and it is free.
 
-It is also a choice. This chapter's vertex shader sends the same colour twice, and the
-second copy carries a qualifier:
+It is also a choice. `nointerpolation` — GLSL's `flat` — means every fragment in the triangle
+gets the value from one nominated vertex, the **provoking vertex**, which in Vulkan is the
+first vertex of the primitive:
 
-```slang title="code/src/1.getting_started/shaders/quad.slang"
-[[vk::location(0)]] float3 colour;
-[[vk::location(1)]] nointerpolation float3 flat_colour;
+```
+   interpolated              nointerpolation
+      red                        red
+      ● ╲                        ●─────────
+     ╱▒▒▒╲                      │█████████│   every pixel gets the
+    ╱▒▒▒▒▒╲                     │█████████│   provoking vertex's value
+   ●───────●                    ●─────────●
+  blue    green                blue    green
 ```
 
-`nointerpolation` — GLSL's `flat` — means every fragment in the triangle gets the value
-from one nominated vertex, the **provoking vertex**, which in Vulkan is the first vertex
-of the primitive. Each triangle comes out a single flat colour.
+There are two other qualifiers you will meet. `noperspective` interpolates in screen space
+rather than correcting for perspective. `sample` forces the shader to run per sample rather than
+per pixel under multisampling; `centroid` keeps it per pixel but moves the sample point inside
+the covered area, which matters at the edges of triangles.
 
-There are two other qualifiers you will meet. `noperspective` interpolates in screen
-space rather than correcting for perspective, which is occasionally what you want for
-screen-space effects. `sample` forces the shader to run per sample rather than per pixel
-under multisampling; `centroid` keeps it per pixel but moves the sample point inside the
-covered area, which matters at the edges of triangles.
-
-Integers are *always* `nointerpolation`, whether you say so or not — there is no
-meaningful way to interpolate between two integers.
+Integers are *always* `nointerpolation`, whether you say so or not — there is no meaningful way
+to interpolate between two integers.
 
 ## Specialisation constants
 
 Here is the one genuinely Vulkan-shaped idea in the chapter.
 
-A shader often has a value that never changes at run time but that you would like to
-choose from C++: a quality level, a light count, a feature toggle. In OpenGL you would
-either recompile the shader with a `#define` or pay for a uniform read and a branch.
+A shader often has a value that never changes at run time but that you would like to choose
+from C++: a quality level, a light count, a feature toggle. In OpenGL you would either
+recompile the shader with a `#define` or pay for a uniform read and a branch.
 
-Vulkan gives you a third option. Declare a constant with an id:
+Vulkan gives you a third option:
+
+```
+   .slang source ──▶ SPIR-V (with OpSpecConstant placeholders)
+                        │
+                        │  at vkCreateGraphicsPipelines: your values substituted
+                        ▼
+                     driver compiles to machine code, branch already folded away
+```
 
 ```slang title="code/src/1.getting_started/shaders/quad.slang"
 [[vk::constant_id(0)]] const int kShadingMode = 0;      // 0 = smooth, 1 = flat
 [[vk::constant_id(1)]] const float kCheckerSize = 48.0;
 ```
 
-Those look like ordinary constants with defaults, and if the host says nothing that is
-exactly what they are. But the host can replace them **when the pipeline is created** —
-after the SPIR-V is written, before the driver compiles it to machine code.
+Those look like ordinary constants with defaults, and if the host says nothing that is exactly
+what they are.
 
-On the C++ side it is a flat block of bytes plus a table describing it:
+```slang title="code/src/1.getting_started/shaders/quad.slang"
+[shader("fragment")]
+float4 fragmentMain(VSOutput input) : SV_Target {
+    float3 base = (kShadingMode == 1) ? input.flat_colour : input.colour;
+
+    float2 cell = floor(input.position.xy / kCheckerSize);
+    float checker = fmod(cell.x + cell.y, 2.0);
+
+    return float4(lerp(base, base * 0.55, checker), 1.0);
+}
+```
+
+Because the checker is measured in **pixels** and not in the quad's own coordinates, it is fixed
+to the screen — resize the window and the quad changes size while the squares do not. Attaching
+a pattern to a *surface* needs texture coordinates, which arrive in 1.11.
+
+`lerp(a, b, t)` is linear interpolation and it is everywhere in shader code; here it darkens
+every other square to 55% brightness. GLSL spells it `mix`.
 
 ```cpp title="code/src/1.getting_started/shaders/main.cpp"
 struct ShaderConstants {
-    int32_t shading_mode = 0;
+    int32_t shading_mode = 0;  // 0 = smooth, 1 = flat
     float checker_size = 48.0F;
 };
-
-const std::array<VkSpecializationMapEntry, 2> entries{{
-    {
-        .constantID = 0,
-        .offset = offsetof(ShaderConstants, shading_mode),
-        .size = sizeof(ShaderConstants::shading_mode),
-    },
-    {
-        .constantID = 1,
-        .offset = offsetof(ShaderConstants, checker_size),
-        .size = sizeof(ShaderConstants::checker_size),
-    },
-}};
 ```
 
-Each entry says: constant id N is this many bytes at this offset. The ids match
-`vk::constant_id` in the shader; the offsets match the struct. The whole thing goes into
-`VkPipelineShaderStageCreateInfo::pSpecializationInfo`, which is the field 1.7 left as
-`nullptr`.
+```cpp title="code/src/1.getting_started/shaders/main.cpp"
+        const std::array<VkSpecializationMapEntry, 2> entries{{
+            {
+                .constantID = 0,
+                .offset = offsetof(ShaderConstants, shading_mode),
+                .size = sizeof(ShaderConstants::shading_mode),
+            },
+            {
+                .constantID = 1,
+                .offset = offsetof(ShaderConstants, checker_size),
+                .size = sizeof(ShaderConstants::checker_size),
+            },
+        }};
 
-The payoff is that the branch disappears. `kShadingMode` is a true compile-time constant
-by the time the driver optimises, so only one side of `(kShadingMode == 1) ? ... : ...`
-survives, and a loop bounded by a specialisation constant can be fully unrolled.
+        const ShaderConstants constants{};
+```
 
-The cost is that changing a value means **building a new pipeline**. That is the trade:
-free at run time, expensive to change. For a value that changes every frame you want a
-push constant or a uniform buffer instead — which is chapter 1.10, and is the real answer
-to "where did `glUniform` go".
+A `VkSpecializationMapEntry` is the bridge between the shader's numbered constants and the
+bytes you hand over. Each entry says: constant id N is this many bytes at this offset in an
+untyped block. The ids
+match `vk::constant_id` in the shader; the offsets match the struct. `int32_t` rather than `int`
+is deliberate — the size is part of the contract, so a type whose width is written down is the
+one to use.
 
-:::note[Added to `vkcommon` this chapter]
-`vkc::Buffer`, `vkc::upload_to_device_local` and `vkc::immediate_submit` — chapter 1.8's
-code, with a destructor attached. `PipelineBuilder` gained
-`fragment_specialisation()`, which does nothing but carry the two structures above
-through to the shader stage.
+This is the only place in Vulkan where a shader's constants are supplied by the host **without
+a buffer and without a descriptor**, because the values are consumed by the compiler rather than
+read at run time.
 
-`vkc::load_shader` is chapter 1.7's Slang compiler code, unchanged except that the
-global session is now created once and cached rather than per shader. It is in
-`code/common/scaffold/src/pipeline.cpp` if you want to read it again.
-:::
+```cpp title="code/src/1.getting_started/shaders/main.cpp"
+        pipeline_ =
+            vkc::PipelineBuilder(device)
+                .shaders(shader)
+                .vertex_input(std::span(&binding, 1), attributes)
+                .fragment_specialisation(
+                    entries, std::span(reinterpret_cast<const std::byte*>(&constants),
+                                       sizeof(constants)))
+                .colour_attachment(swapchain().format())
+                .layout(pipeline_layout_)
+                .build();
+```
+
+The builder gained one method this chapter, and it does nothing but carry the two structures
+through to `VkPipelineShaderStageCreateInfo::pSpecializationInfo` — the field 1.7 left as
+`nullptr`:
+
+```cpp title="code/common/scaffold/src/pipeline.cpp"
+    const VkSpecializationInfo* fragment_specialisation =
+        specialisation_entries_.empty() ? nullptr : &specialisation;
+```
+
+The `reinterpret_cast` to `std::byte` is how a typed struct becomes the untyped block Vulkan
+wants.
+
+```cpp title="code/src/1.getting_started/shaders/main.cpp"
+        spdlog::info("Pipeline built with shading_mode={} checker_size={}",
+                     constants.shading_mode, constants.checker_size);
+```
+
+```cpp title="code/src/1.getting_started/shaders/main.cpp"
+        options.title = "LearnVulkan 1.9 - Shaders";
+        ShaderApp app(vkc::App::parse_args(argc, argv, options));
+```
+
+The payoff is that **the branch disappears**. `kShadingMode` is a true compile-time constant by
+the time the driver optimises, so only one side of the `?:` survives, and a loop bounded by a
+specialisation constant can be fully unrolled.
+
+The cost is that changing a value means **building a new pipeline**. That is the trade: free at
+run time, expensive to change. For a value that changes every frame you want a push constant or
+a uniform buffer instead — which is chapter 1.10, and is the real answer to "where did
+`glUniform` go".
 
 ## A shader style note
 
-A few habits worth forming now, all of which pay off in the lighting chapters.
+Prefer the built-in functions. `lerp`, `clamp`, `smoothstep`, `dot`, `normalize`, `length` and
+`reflect` usually map to single instructions, and hand-written equivalents usually do not.
 
-Prefer the built-in functions. `lerp`, `clamp`, `smoothstep`, `dot`, `normalize`,
-`length` and `reflect` usually map to single instructions, and hand-written equivalents
-usually do not.
-
-Write `float3(0.0)` rather than `float3(0, 0, 0)` — the splat constructor is there and
-it reads better.
-
-Watch out for `if` on a value that differs between neighbouring pixels. Fragment shaders
-run in groups — 2×2 quads at minimum, typically 32 or 64 invocations in lockstep — and
-when invocations in a group disagree about a branch, the hardware runs **both sides** and
-discards the unwanted half. A branch that is uniform across the screen is nearly free; a
-branch that is different for every pixel costs the sum of both sides.
+Watch out for `if` on a value that differs between neighbouring pixels. Fragment shaders run in
+groups — 2×2 quads at minimum, typically 32 or 64 invocations in lockstep — and when invocations
+in a group disagree about a branch, the hardware runs **both sides** and discards the unwanted
+half. A branch that is uniform across the screen is nearly free; a branch that differs per pixel
+costs the sum of both sides.
 
 ## Running it
 
@@ -345,36 +447,33 @@ branch that is different for every pixel costs the sum of both sides.
 
 The quad from 1.8, with a screen-fixed checkerboard darkening alternate squares.
 
-## What changed
+## Words introduced in this chapter
 
-- `main.cpp` lost the buffer and upload code to `vkcommon`
-- `VSOutput` gained a second, `nointerpolation` field
-- the fragment entry point gained two specialisation constants and some real work
-- the pipeline now supplies specialisation data
+| | |
+|---|---|
+| **SPIR-V** | the binary shader format; source never reaches a driver |
+| **system-value semantic** | a field the hardware fills in or reads back, marked `SV_...` |
+| **provoking vertex** | the one whose value `nointerpolation` propagates; the first, in Vulkan |
+| **specialisation constant** | a value substituted into SPIR-V at pipeline creation and then folded away |
+| **move semantics** | `std::exchange` handing over a handle and leaving the source null |
 
 ## Exercises
 
-1. Set `shading_mode` to `1` in `ShaderConstants` and run it. Two flat triangles. Which
-   corner's colour won for each triangle? That is the provoking vertex, and it is the
-   first index of each triangle in `kIndices`.
-2. Change `checker_size` to `12.0` and to `400.0`. Note that you changed a value the
-   shader treats as a compile-time constant and did not touch the shader.
-3. Make the checkerboard follow the quad instead of the screen: interpolate a `float2`
-   from the vertex positions — mapping −0.6…0.6 to 0…1 — and use that instead of
-   `input.position.xy`. Resize the window and watch the difference. You have just
-   invented texture coordinates.
+1. Set `shading_mode` to `1` in `ShaderConstants` and run it. Two flat triangles. Which corner's
+   colour won for each triangle? That is the provoking vertex, and it is the first index of each
+   triangle in `kIndices`.
+2. Change `checker_size` to `12.0` and to `400.0`. Note that you changed a value the shader
+   treats as a compile-time constant and did not touch the shader.
+3. Make the checkerboard follow the quad instead of the screen: interpolate a `float2` from the
+   vertex positions — mapping −0.6…0.6 to 0…1 — and use that instead of `input.position.xy`. You
+   have just invented texture coordinates.
 4. Produce a `.spv` with the `slangc` command above and run `spirv-dis` on it. Find
-   `OpSpecConstant`: those are the two constants sitting in the module with their
-   default values, waiting to be overridden. While you are there, find the two
-   `OpEntryPoint` lines and the `Flat` decoration.
-
-   Then drop `-matrix-layout-column-major` and diff the two disassemblies. The only
-   difference is `RowMajor` becoming `ColMajor` — and that one word is the entire bug
-   the caution above describes.
-5. Break the stage interface on purpose, which takes a little work now that both stages
-   share `VSOutput`. Copy it to a second struct, `PSInput`, and make `fragmentMain` take
-   that instead. Now delete `flat_colour` from `VSOutput` (and the line that writes it),
-   leaving `PSInput` reading it. The validation layers say so precisely:
+   `OpSpecConstant`: those are the two constants sitting in the module with their defaults,
+   waiting to be overridden. Then drop `-matrix-layout-column-major` and diff the two
+   disassemblies — the only difference is `RowMajor` becoming `ColMajor`.
+5. Break the stage interface on purpose. Copy `VSOutput` to a second struct, `PSInput`, make
+   `fragmentMain` take that, then delete `flat_colour` from `VSOutput` and the line that writes
+   it. The layers say so precisely:
 
    ```
    vkCreateGraphicsPipelines(): pCreateInfos[0] (SPIR-V Interface)
@@ -383,9 +482,8 @@ The quad from 1.8, with a screen-fixed checkerboard darkening alternate squares.
    ([EntryPoint "vertexMain", VK_SHADER_STAGE_VERTEX_BIT]) has no Output declared there.
    ```
 
-   Now put the field back in `VSOutput` but **without** `nointerpolation`, leaving
-   `PSInput`'s copy with it. **Nothing complains**, and it renders. The layers check that
-   locations and types line up; interpolation qualifiers are outside what they verify.
+   Now put the field back but **without** `nointerpolation`, leaving `PSInput`'s copy with it.
+   **Nothing complains**, and it renders. The layers check that locations and types line up;
+   interpolation qualifiers are outside what they verify.
 
-   Then delete `PSInput` and go back to sharing one struct, which is the reason to share
-   it: the mismatch you just spent five minutes constructing is not expressible.
+Next: [descriptors and push constants](/getting-started/descriptors/) — where `glUniform` went.

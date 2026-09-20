@@ -14,8 +14,14 @@ and a destructor that releases it, you can read all of it.
 
 **A terminal.** Enough to run CMake and a compiler.
 
-**No graphics experience.** Where a chapter needs mathematics it derives what it needs,
-and the appendices cover vectors, matrices and coordinate spaces from the beginning.
+**No graphics experience.** Where a chapter needs mathematics it derives what it needs —
+chapter 1.12 builds a rotation matrix from a unit circle rather than quoting one, and 1.13
+derives the perspective projection from similar triangles. The appendix
+[Vectors and Matrices](/appendices/mathematics/) gathers the same material in one place,
+from the beginning: vectors, dot and cross products, what the columns of a matrix mean,
+and homogeneous coordinates. Read it first or use it as a reference, whichever suits.
+
+School trigonometry — sine, cosine, Pythagoras — is assumed. Nothing beyond it is.
 
 ## What you need installed
 
@@ -167,18 +173,46 @@ committed to the repository.
 
 ## A note on how to read the code
 
-Each chapter is a single self-contained `main.cpp`. Chapter 1.5 contains everything
-chapter 1.4 had, plus command buffers. That means duplication between chapters, and it
-is intentional: you can read any chapter top to bottom without jumping between files,
-and you can diff one against the previous to see exactly what changed.
+Each chapter is a single `main.cpp` holding that chapter's subject, written out in full.
+What earlier chapters taught is not retyped: it lives in a shared library, `vkcommon`,
+and the chapter uses it from there.
+
+So chapter 1.5 writes command buffers and the frame by hand, and takes the window, the
+instance, the device and the swapchain — chapters 1.1 to 1.4 — from the scaffold. Its
+`main.cpp` is about a third the length it would otherwise be, and all of it is the thing
+the chapter is actually about.
+
+**Nothing in that library is hidden from you.** When a chapter's subject moves into
+`vkcommon`, that chapter ends by showing the finished file — header and implementation,
+in full — and explaining what changed on the way in. Chapter 1.1 ends with the whole of
+`vkc::Window`, 1.2 with `VK_CHECK` and `vkc::Instance`, and so on to 1.14 and
+`vkc::Camera`. By the end of Part 1 there is no line of `code/common/` that has not
+appeared in an article, which is checked by a tool rather than by good intentions:
+
+```bash
+python3 tools/coverage.py --part 1      # every line each chapter adds is in its article
+python3 tools/attribution.py --strict   # every line of vkcommon is in its owning chapter
+python3 tools/terms.py --part 1         # every Vulkan name is explained where it first appears
+```
+
+**The rule is enforced by the build, not by good intentions.** Each chapter's
+`CMakeLists.txt` names the pieces it may link:
+
+```cmake
+add_chapter(1.5.command_buffers
+    SOURCES main.cpp
+    SCAFFOLD vkc_context vkc_swapchain)
+```
+
+Reaching for something a later chapter teaches — `vkc_frame`, here — is a link error, not
+a matter of discipline. Chapter 1.1 names nothing at all, which is why it begins with
+`SDL_Init`.
+
+You can still diff one chapter against the next to see exactly what it added:
 
 ```bash
 diff code/src/1.getting_started/the_swapchain/main.cpp \
      code/src/1.getting_started/command_buffers/main.cpp
 ```
-
-From chapter 1.8 onward, once everything in these chapters has been explained, the
-samples switch to a shared library called `vkcommon` that contains precisely the code
-you have already read.
 
 Ready. [Chapter 1.1: creating a window](/getting-started/creating-a-window/).

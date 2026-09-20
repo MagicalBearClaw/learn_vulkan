@@ -13,9 +13,9 @@ namespace vkc {
 // Options every sample in the book understands, so that tools/capture.py can drive
 // any chapter the same way.
 //
-// This is book infrastructure rather than a Vulkan lesson: it exists so the article
-// screenshots stay in step with the code that produces them. No chapter depends on it
-// to teach anything, and you can ignore it entirely when reading a sample.
+// This is book infrastructure rather than a Vulkan lesson -- it exists so the article
+// screenshots stay in step with the code that produces them -- but it is not withheld:
+// chapter 1.1 writes this struct and the parser behind it out in full.
 struct Args {
     uint32_t width = 1280;
     uint32_t height = 720;

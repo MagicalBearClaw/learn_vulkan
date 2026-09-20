@@ -1,61 +1,198 @@
 ---
 title: The Swapchain
-description: Negotiating format, present mode and size with the window system, and handling the fact that swapchains expire.
+description: Negotiating format, present mode and size with the window system, creating the swapchain and its views, and handling the fact that swapchains expire.
 sidebar:
   order: 4
 ---
 
-The swapchain is the set of images the window system will actually display, plus the
-rules for passing them back and forth. You do not create the images — the presentation
-engine owns them and lends them to you one at a time.
-
-Three decisions define it, and each is a negotiation with what the surface genuinely
-supports rather than a preference you can simply state.
+The swapchain is the set of images the window system will actually display, plus the rules
+for passing them back and forth. You do not create the images — the **presentation engine**
+owns them and lends them to you one at a time.
 
 ## Why images are borrowed
 
-If the program drew straight into the image being scanned out to the display, you would
-see it being drawn — the top of the screen showing the new frame while the bottom still
-shows the old one. That is tearing.
+If the program drew straight into the image being scanned out to the display, you would see
+it being drawn: the top of the screen showing the new frame while the bottom still shows the
+old one. That is **tearing**.
 
-So there are several images. You draw into one while another is displayed, then swap.
-Two images is double buffering; three is triple buffering. The swapchain is the object
-that owns that set and the swapping policy, and because the display hardware is
-involved, *it* decides when you may have an image back.
+So there are several images, and you take turns:
+
+```
+   ┌────────────┐   acquire    ┌────────────┐
+   │            │ ───────────▶ │  you draw  │
+   │ presentation              │  into it   │
+   │   engine   │              └────────────┘
+   │  owns them │                    │ present
+   │            │ ◀──────────────────┘
+   └────────────┘
+      displays one while you draw another
+```
+
+Two images is double buffering; three is triple buffering. The swapchain owns that set and
+the swapping policy, and because the display hardware is involved, **it** decides when you
+may have an image back — which is why chapter 1.6 needs semaphores.
+
+Three decisions define it, and each is a negotiation with what the surface genuinely
+supports rather than a preference you can simply state:
+
+| | |
+|---|---|
+| **format** | how a pixel is stored, and whether the hardware converts to sRGB on the way out |
+| **present mode** | what happens when you produce frames faster than the display consumes them |
+| **extent** | how big the images are, in pixels |
+
+## What chapter 1.3 left behind
+
+The physical device, the logical device, the queue and the allocator are no longer built
+here. Chapter 1.3 wrote all of it; it is now `vkc::Device`.
+
+```cpp title="code/common/scaffold/include/vkc/device.hpp"
+class Device {
+public:
+    Device(const Instance& instance, VkSurfaceKHR surface);
+    ~Device();
+
+    [[nodiscard]] VkPhysicalDevice physical_device() const noexcept { return gpu_; }
+    [[nodiscard]] VkDevice handle() const noexcept { return device_; }
+    [[nodiscard]] VmaAllocator allocator() const noexcept { return allocator_; }
+
+    [[nodiscard]] VkQueue queue() const noexcept { return queue_; }
+    [[nodiscard]] uint32_t queue_family() const noexcept { return queue_family_; }
+
+    void set_debug_name(uint64_t handle, VkObjectType type, const char* name) const;
+    void wait_idle() const;
+```
+
+The constructor takes an `Instance` and a **surface**, because chapter 1.3 established that
+device selection cannot happen without one — "can this GPU present to that window?" is one of
+the questions it asks.
+
+Its body is 1.3's three steps:
+
+```cpp title="code/common/scaffold/src/device.cpp"
+Device::Device(const Instance& instance, VkSurfaceKHR surface)
+    : debug_utils_enabled_(instance.debug_utils_enabled()) {
+    select_physical_device(instance.handle(), surface);
+    create_device();
+    create_allocator(instance.handle());
+```
+
+`wait_idle()` is new here — 1.3 never needed it, and this chapter does, because rebuilding a
+swapchain means destroying images the GPU might still be reading.
+
+The build grant grows again:
+
+```cmake title="code/src/1.getting_started/the_swapchain/CMakeLists.txt"
+# This chapter teaches the swapchain, so it writes the swapchain by hand. It stands on
+# the window, the instance and the device that 1.1 to 1.3 taught -- and naming
+# vkc_swapchain here would fail to link, which is the point.
+add_chapter(1.4.the_swapchain
+    SOURCES main.cpp
+    SCAFFOLD vkc_window vkc_instance vkc_device
+)
+```
+
+## New includes
+
+```cpp title="code/src/1.getting_started/the_swapchain/main.cpp"
+#include <vkc/capture.hpp>
+#include <vkc/check.hpp>
+#include <vkc/device.hpp>
+#include <vkc/instance.hpp>
+#include <vkc/window.hpp>
+
+#include <SDL3/SDL.h>
+#include <spdlog/spdlog.h>
+
+#include <algorithm>
+#include <cstdlib>
+#include <exception>
+#include <memory>
+#include <vector>
+```
+
+`SDL3/SDL_vulkan.h` is gone: creating the surface was chapter 1.3's material, so it is
+`window_.create_surface()` now. `<memory>` is new, for the one `unique_ptr` below.
 
 ## Choosing a format
 
 ```cpp title="code/src/1.getting_started/the_swapchain/main.cpp"
-for (const VkSurfaceFormatKHR& candidate : available) {
-    const bool wanted = candidate.format == VK_FORMAT_B8G8R8A8_SRGB ||
-                        candidate.format == VK_FORMAT_R8G8B8A8_SRGB;
-    if (wanted && candidate.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
-        return candidate;
+namespace {
+
+const char* format_name(VkFormat format) {
+    switch (format) {
+        case VK_FORMAT_B8G8R8A8_SRGB: return "VK_FORMAT_B8G8R8A8_SRGB";
+        case VK_FORMAT_R8G8B8A8_SRGB: return "VK_FORMAT_R8G8B8A8_SRGB";
+        case VK_FORMAT_B8G8R8A8_UNORM: return "VK_FORMAT_B8G8R8A8_UNORM";
+        case VK_FORMAT_R8G8B8A8_UNORM: return "VK_FORMAT_R8G8B8A8_UNORM";
+        case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+            return "VK_FORMAT_A2B10G10R10_UNORM_PACK32";
+        default: return "some other format";
     }
 }
-return available.front();
 ```
 
-We want eight bits per channel in an **sRGB** format. This matters more than it looks.
+Five of the several hundred `VkFormat` values, chosen because they are the ones a surface is
+likely to offer. `B8G8R8A8` before `R8G8B8A8` is not alphabetising: BGRA is what most desktop
+compositors actually want, and it is usually first in the list a surface returns.
 
-Monitors do not respond linearly to pixel values: 128 is not half as bright as 255, it
-is closer to a fifth. Lighting mathematics, on the other hand, only works in linear
-space — adding two lights together means adding their actual energies. So a correct
-renderer computes in linear space and converts to sRGB on the way out.
+```cpp title="code/src/1.getting_started/the_swapchain/main.cpp"
+VkSurfaceFormatKHR choose_surface_format(const std::vector<VkSurfaceFormatKHR>& available) {
+    for (const VkSurfaceFormatKHR& candidate : available) {
+        const bool wanted = candidate.format == VK_FORMAT_B8G8R8A8_SRGB ||
+                            candidate.format == VK_FORMAT_R8G8B8A8_SRGB;
+        if (wanted && candidate.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+            return candidate;
+        }
+    }
+    // The specification guarantees at least one format, so this is always safe.
+    return available.front();
+}
+```
 
-Choosing an `_SRGB` format makes the hardware do that conversion automatically as it
-writes. Choosing `_UNORM` instead means writing linear values straight to the display,
-and every image in this series would come out noticeably too dark. The gamma chapter
-returns to this properly; for now, it is the right default and it is free.
+A `VkSurfaceFormatKHR` is a **pair**, not a single value: a `format` saying how the bits of
+a pixel are arranged, and a `colorSpace` saying how the display should interpret them. A
+surface advertises the combinations it will accept, and you must pick one of those pairs
+rather than mixing a format from one with a colour space from another.
 
-`colorSpace` is a separate field describing how the *display* should interpret the
-values, and pairing sRGB-nonlinear with an sRGB format is the ordinary case. HDR output
-is where the two start to diverge.
+We want eight bits per channel in an **sRGB** format, and this matters more than it looks.
+
+Monitors do not respond linearly to pixel values. Roughly, displayed brightness goes as the
+value raised to about 2.2, so:
+
+```
+  stored 255  →  100% brightness
+  stored 128  →  (128/255)^2.2 ≈ 22% brightness     not 50%
+  stored 186  →  (186/255)^2.2 ≈ 50% brightness
+```
+
+Lighting mathematics, on the other hand, only works in **linear** space: adding two lights
+means adding their actual energies. So a correct renderer computes in linear space and
+converts on the way out.
+
+Choosing an `_SRGB` format makes the hardware do that conversion automatically as it writes,
+for free. Choosing `_UNORM` instead means writing linear values straight to the display, and
+every image in this series would come out noticeably too dark. Chapter 5.2 returns to this
+properly; for now it is the right default and it costs nothing.
+
+`colorSpace` is a separate field describing how the *display* should interpret the values, and
+pairing sRGB-nonlinear with an sRGB format is the ordinary case. HDR output is where the two
+start to diverge.
+
+Falling back to `available.front()` is safe rather than lazy: the specification guarantees a
+surface reports at least one format, so the vector is never empty.
 
 ## Choosing a present mode
 
-This decides what happens when frames are produced faster than the display consumes
-them.
+```cpp title="code/src/1.getting_started/the_swapchain/main.cpp"
+VkPresentModeKHR choose_present_mode(const std::vector<VkPresentModeKHR>& available) {
+    const bool has_mailbox =
+        std::ranges::find(available, VK_PRESENT_MODE_MAILBOX_KHR) != available.end();
+    return has_mailbox ? VK_PRESENT_MODE_MAILBOX_KHR : VK_PRESENT_MODE_FIFO_KHR;
+}
+```
+
+This decides what happens when frames are produced faster than the display consumes them.
 
 | Mode | Behaviour | Tearing | Latency |
 |---|---|---|---|
@@ -64,144 +201,788 @@ them.
 | `MAILBOX` | A waiting frame is *replaced* by a newer one | No | Low |
 | `IMMEDIATE` | Shown the instant it is ready | Yes | Lowest |
 
-```cpp title="code/src/1.getting_started/the_swapchain/main.cpp"
-const bool has_mailbox =
-    std::ranges::find(available, VK_PRESENT_MODE_MAILBOX_KHR) != available.end();
-return has_mailbox ? VK_PRESENT_MODE_MAILBOX_KHR : VK_PRESENT_MODE_FIFO_KHR;
+The difference between the two we care about, with frames arriving faster than refreshes:
+
+```
+  FIFO      queue: [ 1 ][ 2 ][ 3 ]   every frame waits its turn; the queue backs up,
+                                     and the CPU blocks when it is full → latency
+
+  MAILBOX   slot:  [ 3 ]             frame 2 replaced frame 1 before it was shown;
+                                     frames 1 and 2's work is thrown away → latency stays low
 ```
 
-`FIFO` is the only mode every implementation is required to support — it is the safe
-fallback and it is what "v-sync on" means. `MAILBOX` gives the same no-tearing
-guarantee with lower latency, at the cost of rendering frames that are then thrown
-away. On a desktop that is a good trade; on a laptop running on battery it is wasted
-power, which is why a real application makes this a setting.
+`FIFO` is the only mode every implementation is **required** to support — it is the safe
+fallback and it is what "v-sync on" means. `MAILBOX` gives the same no-tearing guarantee with
+lower latency, at the cost of rendering frames that are then discarded. On a desktop that is a
+good trade; on a laptop on battery it is wasted power, which is why a real application makes
+this a setting.
 
 ## Choosing a size
 
 ```cpp title="code/src/1.getting_started/the_swapchain/main.cpp"
-if (caps.currentExtent.width != UINT32_MAX) {
-    return caps.currentExtent;
+VkExtent2D choose_extent(const VkSurfaceCapabilitiesKHR& caps, VkExtent2D window_size) {
+    // A currentExtent of 0xFFFFFFFF is the window system saying "you choose".
+    // Anything else is it saying "this is the size, take it".
+    if (caps.currentExtent.width != UINT32_MAX) {
+        return caps.currentExtent;
+    }
+    return VkExtent2D{
+        .width = std::clamp(window_size.width, caps.minImageExtent.width,
+                            caps.maxImageExtent.width),
+        .height = std::clamp(window_size.height, caps.minImageExtent.height,
+                             caps.maxImageExtent.height),
+    };
 }
-return VkExtent2D{
-    .width = std::clamp(window_size.width, caps.minImageExtent.width,
-                        caps.maxImageExtent.width),
-    // ...
-};
 ```
 
-A `currentExtent` of `0xFFFFFFFF` is the window system saying "you decide"; anything
-else is it saying "this is the size, take it". When we do get to choose, the window's
-**pixel** size — from chapter 1.1 — is clamped into the supported range.
+`VkExtent2D` is the width-and-height pair chapter 1.3's header already mentioned, and this
+is the first place one is negotiated rather than simply read.
+
+A `currentExtent` of `0xFFFFFFFF` is the window system saying "you decide"; anything else is
+it saying "this is the size, take it". When we do get to choose, the window's **pixel** size —
+the distinction chapter 1.1 made with its 1280 → 1712 example — is clamped into the supported
+range.
+
+Only `width` is tested for the sentinel because the specification says both fields carry it
+together; testing one is enough, and testing both would imply they can disagree.
+
+## The class
+
+```cpp title="code/src/1.getting_started/the_swapchain/main.cpp"
+class SwapchainApp {
+public:
+    explicit SwapchainApp(const vkc::Args& args)
+        : args_(args),
+          window_("LearnVulkan - The Swapchain", args.width, args.height,
+                  /*resizable=*/args.screenshot.empty()),
+          instance_(vkc::Instance::Config{
+              .app_name = "LearnVulkan",
+              .enable_validation = args.validation,
+          }) {
+        surface_ = window_.create_surface(instance_.handle());
+        device_ = std::make_unique<vkc::Device>(instance_, surface_);
+        create_swapchain();
+    }
+```
+
+`device_` is a `unique_ptr` rather than a plain member, and the reason is ordering.
+`vkc::Device`'s constructor needs the surface, which needs the instance — so it cannot be
+built in the member initialiser list alongside them. A `unique_ptr` lets it be created in the
+body once its inputs exist, and `vkc::Device` is deliberately non-movable, so there is no
+assigning one into place afterwards.
+
+```cpp title="code/src/1.getting_started/the_swapchain/main.cpp"
+    ~SwapchainApp() {
+        // Strict reverse order. Vulkan will not warn you at run time if you get this
+        // wrong, but the validation layers will, loudly.
+        destroy_swapchain();
+        device_.reset();
+        window_.destroy_surface(instance_.handle());
+        // instance_ and window_ destroy themselves, in that order, after this runs.
+    }
+
+    SwapchainApp(const SwapchainApp&) = delete;
+    SwapchainApp& operator=(const SwapchainApp&) = delete;
+    SwapchainApp(SwapchainApp&&) = delete;
+    SwapchainApp& operator=(SwapchainApp&&) = delete;
+```
+
+`device_.reset()` destroys the device explicitly, before the surface it was chosen for. Letting
+the member destructor do it would run *after* this body, and therefore after the surface had
+gone.
+
+```cpp title="code/src/1.getting_started/the_swapchain/main.cpp"
+    int run() {
+        report();
+
+        uint64_t frames = 0;
+        bool running = true;
+        while (running) {
+            SDL_Event event;
+            while (SDL_PollEvent(&event)) {
+                if (event.type == SDL_EVENT_QUIT ||
+                    event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED ||
+                    (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_ESCAPE)) {
+                    running = false;
+                } else if (event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) {
+                    // The old swapchain is now the wrong size. Rebuilding here is
+                    // simple because nothing is in flight yet; from 1.6 onward there
+                    // will be frames on the GPU to wait for first.
+                    recreate_swapchain();
+                }
+            }
+            ++frames;
+            if (args_.frame_limit != 0 && frames >= args_.frame_limit) {
+                running = false;
+            }
+        }
+        return 0;
+    }
+```
+
+The resize branch chapter 1.1 wired up and left empty finally does something.
+
+## Asking the surface what it supports
+
+```cpp title="code/src/1.getting_started/the_swapchain/main.cpp"
+private:
+    void create_swapchain() {
+        const VkPhysicalDevice gpu = device_->physical_device();
+
+        VkSurfaceCapabilitiesKHR caps{};
+        VK_CHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(gpu, surface_, &caps));
+
+        uint32_t format_count = 0;
+        VK_CHECK(vkGetPhysicalDeviceSurfaceFormatsKHR(gpu, surface_, &format_count,
+                                                      nullptr));
+        std::vector<VkSurfaceFormatKHR> formats(format_count);
+        VK_CHECK(vkGetPhysicalDeviceSurfaceFormatsKHR(gpu, surface_, &format_count,
+                                                      formats.data()));
+
+        uint32_t mode_count = 0;
+        VK_CHECK(vkGetPhysicalDeviceSurfacePresentModesKHR(gpu, surface_, &mode_count,
+                                                           nullptr));
+        std::vector<VkPresentModeKHR> modes(mode_count);
+        VK_CHECK(vkGetPhysicalDeviceSurfacePresentModesKHR(gpu, surface_, &mode_count,
+                                                           modes.data()));
+```
+
+`vkGetPhysicalDeviceSurfaceCapabilitiesKHR` reports the limits — how many images are
+allowed, what sizes are legal, what transforms exist.
+`vkGetPhysicalDeviceSurfaceFormatsKHR` lists the format-and-colour-space pairs, and
+`vkGetPhysicalDeviceSurfacePresentModesKHR` lists the present modes. The three long names
+are one per decision from the table at the top of the chapter.
+
+Every one is about the **pair** of a physical device and a surface, not
+about the device alone. A second GPU in the same machine may support a different set of formats
+for the same window.
+
+Two of them are the count-then-fill idiom again. The capabilities query is not, because a
+surface has exactly one set of capabilities.
+
+```cpp title="code/src/1.getting_started/the_swapchain/main.cpp"
+        const VkSurfaceFormatKHR surface_format = choose_surface_format(formats);
+        present_mode_ = choose_present_mode(modes);
+        format_ = surface_format.format;
+
+        // The window's drawable size in pixels, which is not its size in points on a
+        // display with a scale factor. Chapter 1.1 made that distinction; this is the
+        // first place it matters.
+        extent_ = choose_extent(caps, window_.pixel_extent());
+```
+
+The format and present mode are stored as members because `report()` prints them and, more
+importantly, because every pipeline created from 1.7 onward has to be told the colour format it
+renders into.
 
 ## How many images
 
 ```cpp title="code/src/1.getting_started/the_swapchain/main.cpp"
-uint32_t image_count = caps.minImageCount + 1;
-if (caps.maxImageCount > 0 && image_count > caps.maxImageCount) {
-    image_count = caps.maxImageCount;
-}
+        // One more than the minimum, so that the CPU always has an image to draw into
+        // while the presentation engine is busy with another. A maxImageCount of 0
+        // means there is no upper limit.
+        uint32_t image_count = caps.minImageCount + 1;
+        if (caps.maxImageCount > 0 && image_count > caps.maxImageCount) {
+            image_count = caps.maxImageCount;
+        }
 ```
 
-One more than the minimum, so the CPU always has an image to draw into while the
-presentation engine is busy with another. Asking for exactly the minimum can mean
-blocking in `vkAcquireNextImageKHR` every single frame.
+One more than the minimum, so the CPU always has an image to draw into while the presentation
+engine is busy with another. Asking for exactly the minimum can mean blocking in
+`vkAcquireNextImageKHR` every single frame.
 
-A `maxImageCount` of `0` means there is no upper limit — not that zero images are
-allowed. This trips people up.
+A `maxImageCount` of `0` means there is **no upper limit** — not that zero images are allowed.
+This trips people up, and it is why the `> 0` test comes first.
 
-## Usage flags
+## Creating it
 
 ```cpp title="code/src/1.getting_started/the_swapchain/main.cpp"
-.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-              VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-              VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        const VkSwapchainCreateInfoKHR info{
+            .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+            .pNext = nullptr,
+            .flags = 0,
+            .surface = surface_,
+            .minImageCount = image_count,
+            .imageFormat = format_,
+            .imageColorSpace = surface_format.colorSpace,
+            .imageExtent = extent_,
+            // Always 1 unless you are rendering stereo for a headset.
+            .imageArrayLayers = 1,
+            // COLOR_ATTACHMENT to render into them; TRANSFER_DST so a later chapter
+            // can blit a finished offscreen image on instead; TRANSFER_SRC so the
+            // screenshot tooling can copy one back out.
+            .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                          VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                          VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+            // One queue family does everything here, so the images never need to be
+            // shared between families.
+            .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .queueFamilyIndexCount = 0,
+            .pQueueFamilyIndices = nullptr,
+            .preTransform = caps.currentTransform,
+            .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+            .presentMode = present_mode_,
+            // Lets the driver skip pixels another window is covering.
+            .clipped = VK_TRUE,
+            .oldSwapchain = VK_NULL_HANDLE,
+        };
+
+        VK_CHECK(vkCreateSwapchainKHR(device_->handle(), &info, nullptr, &swapchain_));
 ```
 
-You must declare every use in advance. `COLOR_ATTACHMENT` to render into them,
-`TRANSFER_DST` so a later chapter can blit a finished offscreen image on instead of
-rendering directly, and `TRANSFER_SRC` so a screenshot can be copied back out.
+Everything negotiated above, in one struct. The fields not yet discussed:
 
-Omitting a flag and then using the image that way is a validation error — and it is one
-this project hit while being written. The screenshot tooling failed with *"requires
-`VK_IMAGE_USAGE_2_TRANSFER_SRC_BIT`"* until the flag was added here.
+**`imageUsage`** declares every use in advance. Omitting a flag and then using the image that
+way is a validation error, and it is one this project hit while being written — the screenshot
+tooling failed with *"requires `VK_IMAGE_USAGE_2_TRANSFER_SRC_BIT`"* until the flag was added
+here.
 
-## Image views
+**`imageSharingMode`** is `EXCLUSIVE` because one queue family does everything in this series.
+`CONCURRENT` lets several families touch the images without explicit ownership transfers, at a
+cost, and it is the field that would change if you split rendering and presentation across two
+queues.
+
+**`preTransform`** is for devices that rotate the display in the presentation engine — phones,
+mostly. Passing `caps.currentTransform` means "whatever it already is, leave it alone".
+
+**`compositeAlpha`** is how the window system blends this surface with what is behind it.
+`OPAQUE` says ignore the alpha channel entirely; the alternatives make a transparent window,
+and not every compositor supports every mode.
+
+**`clipped = VK_TRUE`** lets the driver skip work on pixels another window is covering. Set it
+false only if you intend to read the swapchain image back and need the obscured pixels correct.
+
+**`oldSwapchain`** is left null, which is what makes `recreate_swapchain` below stall. Handing
+the previous swapchain over lets the driver reuse its memory and keep presenting from it during
+the changeover; doing that properly needs machinery we do not have yet.
+
+## Getting the images and their views
 
 ```cpp title="code/src/1.getting_started/the_swapchain/main.cpp"
-const VkImageViewCreateInfo view_info{
-    .image = images_[i],
-    .viewType = VK_IMAGE_VIEW_TYPE_2D,
-    .format = format_,
-    .subresourceRange = {
-        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-        .baseMipLevel = 0, .levelCount = 1,
-        .baseArrayLayer = 0, .layerCount = 1,
-    },
-};
+        // We asked for a minimum; the driver may well have given us more.
+        uint32_t actual_count = 0;
+        VK_CHECK(vkGetSwapchainImagesKHR(device_->handle(), swapchain_, &actual_count,
+                                         nullptr));
+        images_.resize(actual_count);
+        VK_CHECK(vkGetSwapchainImagesKHR(device_->handle(), swapchain_, &actual_count,
+                                         images_.data()));
+```
+
+`minImageCount` was a minimum. This is where you find out how many you actually got — the
+count-then-fill idiom one last time this chapter.
+
+```cpp title="code/src/1.getting_started/the_swapchain/main.cpp"
+        // A VkImage cannot be rendered into directly. A view says which part of it to
+        // use and how to interpret the bits -- here, all of it, as a 2D colour image.
+        views_.resize(actual_count);
+        for (uint32_t i = 0; i < actual_count; ++i) {
+            const VkImageViewCreateInfo view_info{
+                .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .image = images_[i],
+                .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                .format = format_,
+                .components = {},  // all VK_COMPONENT_SWIZZLE_IDENTITY
+                .subresourceRange =
+                    {
+                        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                        .baseMipLevel = 0,
+                        .levelCount = 1,
+                        .baseArrayLayer = 0,
+                        .layerCount = 1,
+                    },
+            };
+            VK_CHECK(vkCreateImageView(device_->handle(), &view_info, nullptr,
+                                       &views_[i]));
+        }
+    }
 ```
 
 A `VkImage` cannot be used directly. A **view** says which part of it to use and how to
-interpret the bits — which mip levels, which array layers, which format. Here it is
-all of a simple 2D colour image, so the view looks like pure ceremony, but views are
-what make one image usable as several things: a cubemap read as six 2D layers, one mip
-level of a chain, a depth image read as a texture.
+interpret the bits — which mip levels, which array layers, which format:
 
-The images belong to the swapchain and are freed with it. The views belong to us and
-must be destroyed.
+```
+   VkImage                         VkImageView
+   ┌──────────────────┐            "all of it, as 2D colour"
+   │ mip 0  ████████  │  ◀─────    "just mip 2, as 2D colour"
+   │ mip 1  ████      │  ◀─────    "layers 0-5, as a cubemap"
+   │ mip 2  ██        │
+   │ layers 0..5      │            one image, several ways to read it
+   └──────────────────┘
+```
+
+Here it is all of a simple 2D colour image, so the view looks like pure ceremony — but views
+are what make one image usable as several things, and chapters 1.11 and 4.4 rely on exactly
+that.
+
+`.components = {}` is worth pausing on. Zero-initialising means `VK_COMPONENT_SWIZZLE_IDENTITY`
+for all four channels, because the identity swizzle happens to be enumerator `0`. This is one
+of the few places where "write every field" produces something that reads as empty and means
+something specific.
+
+## Tearing it down
+
+```cpp title="code/src/1.getting_started/the_swapchain/main.cpp"
+    void destroy_swapchain() noexcept {
+        for (VkImageView view : views_) {
+            vkDestroyImageView(device_->handle(), view, nullptr);
+        }
+        views_.clear();
+        // The images belong to the swapchain. Destroying it frees them; destroying
+        // them yourself is an error.
+        images_.clear();
+
+        if (swapchain_ != VK_NULL_HANDLE) {
+            vkDestroySwapchainKHR(device_->handle(), swapchain_, nullptr);
+            swapchain_ = VK_NULL_HANDLE;
+        }
+    }
+```
+
+**The images belong to the swapchain and the views belong to us.** That is the created-versus-
+retrieved rule from 1.3, applied here: `vkGetSwapchainImagesKHR` retrieved the images, so they
+have no destroy function and `images_.clear()` merely drops handles. `vkCreateImageView` created
+the views, so each one must go.
+
+`noexcept` and the null reset are both because this runs from the destructor *and* from
+`recreate_swapchain`, which is about to build a new one on top.
 
 ## Swapchains expire
 
-This is the part that catches people out. A swapchain is **not permanent**. Resize the
-window, move it to a monitor with a different scale factor, or change display settings,
-and it becomes invalid. Vulkan reports this as `VK_ERROR_OUT_OF_DATE_KHR` from
-`vkAcquireNextImageKHR` or `vkQueuePresentKHR`.
-
-`VK_SUBOPTIMAL_KHR` is the softer version: it still works, but no longer matches the
-surface properly.
+This is the part that catches people out. A swapchain is **not permanent**. Resize the window,
+move it to a monitor with a different scale factor, or change display settings, and it becomes
+invalid. Vulkan reports this as `VK_ERROR_OUT_OF_DATE_KHR` from `vkAcquireNextImageKHR` or
+`vkQueuePresentKHR`. `VK_SUBOPTIMAL_KHR` is the softer version: it still works, but no longer
+matches the surface properly.
 
 ```cpp title="code/src/1.getting_started/the_swapchain/main.cpp"
-void recreate_swapchain() {
-    VK_CHECK(vkDeviceWaitIdle(device_));
-    destroy_swapchain();
-    create_swapchain();
+    void recreate_swapchain() {
+        // Nothing may be destroyed while the GPU could still be using it. Waiting for
+        // the whole device is the blunt version of this; a later chapter does it
+        // without the stall.
+        device_->wait_idle();
+        destroy_swapchain();
+        create_swapchain();
+        spdlog::info("Swapchain rebuilt at {}x{}", extent_.width, extent_.height);
+    }
+```
+
+Rebuilding is a normal part of running, not an error path — which is why it is built in from the
+chapter the swapchain first appears in rather than bolted on later.
+
+`wait_idle` is the blunt instrument: nothing may be destroyed while the GPU might still be
+reading it, and waiting for the entire device is the simplest way to guarantee that. It also
+stalls completely.
+
+Note that this sample rebuilds on the *event*, which is the simple version. Production code also
+has to handle the two result codes above, because the window system can invalidate a swapchain
+without SDL ever reporting a resize — chapter 1.5 adds that.
+
+## Reporting
+
+```cpp title="code/src/1.getting_started/the_swapchain/main.cpp"
+    void report() const {
+        spdlog::info("Swapchain:");
+        spdlog::info("  {} images at {}x{}", images_.size(), extent_.width,
+                     extent_.height);
+        spdlog::info("  format: {}", format_name(format_));
+        spdlog::info("  present mode: {}",
+                     present_mode_ == VK_PRESENT_MODE_MAILBOX_KHR ? "MAILBOX" : "FIFO");
+        spdlog::info(
+            "Images exist, but nothing has been recorded into them yet. Try resizing "
+            "the window - the swapchain is rebuilt each time.");
+    }
+
+    vkc::Args args_;
+    vkc::Window window_;
+    vkc::Instance instance_;
+    VkSurfaceKHR surface_ = VK_NULL_HANDLE;
+    std::unique_ptr<vkc::Device> device_;
+
+    VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
+    VkFormat format_ = VK_FORMAT_UNDEFINED;
+    VkPresentModeKHR present_mode_ = VK_PRESENT_MODE_FIFO_KHR;
+    VkExtent2D extent_{};
+    std::vector<VkImage> images_;     // owned by the swapchain
+    std::vector<VkImageView> views_;  // owned by us
+};
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    try {
+        SwapchainApp app(vkc::parse_args(argc, argv));
+        return app.run();
+    } catch (const std::exception& error) {
+        spdlog::error("{}", error.what());
+        return EXIT_FAILURE;
+    }
 }
 ```
 
-Rebuilding is a normal part of running, not an error path — which is why it is built in
-from the chapter the swapchain first appears in rather than bolted on later.
+Those two member comments are the ownership rule, written where it is easiest to get wrong.
 
-`vkDeviceWaitIdle` is the blunt instrument: nothing may be destroyed while the GPU might
-still be reading it, and waiting for the entire device is the simplest way to guarantee
-that. It also stalls completely. A later chapter does it without the stall, using the
-`oldSwapchain` field we are currently leaving null.
+## What moves into `vkcommon`
+
+All of it becomes `vkc::Swapchain`. The negotiation, the creation and the rebuilding are
+what you just wrote; the packaging is what is new.
+
+```cpp title="code/common/scaffold/include/vkc/swapchain.hpp"
+#include <volk.h>
+
+#include <cstdint>
+#include <vector>
+
+namespace vkc {
+
+class Context;
+class Window;
+
+class Swapchain {
+public:
+    Swapchain(Context& context, Window& window);
+    ~Swapchain();
+
+    Swapchain(const Swapchain&) = delete;
+    Swapchain& operator=(const Swapchain&) = delete;
+    Swapchain(Swapchain&&) = delete;
+    Swapchain& operator=(Swapchain&&) = delete;
+```
+
+One thing here has not been introduced yet: **`Context`**. Your sample carried four
+separate members — window, instance, surface, device — and passed whichever were needed to
+each function. A swapchain needs three of those four, and so does nearly everything after
+it, so chapter 1.5 bundles them into a single `vkc::Context`. It is forward-declared here
+and is 1.5's subject; treat it for now as "the instance, the surface and the device,
+together".
+
+Both parameters are **references**, not values or pointers. A reference cannot be null and
+cannot be reseated, which says exactly the right thing: a swapchain has a context and a
+window for its whole life, and does not own either.
+
+```cpp title="code/common/scaffold/include/vkc/swapchain.hpp"
+    // Tears down and rebuilds against the window's current size. Waits for the
+    // device to be idle first, which is the blunt-but-correct approach; a later
+    // chapter shows how to do it without the stall.
+    void recreate();
+
+    [[nodiscard]] VkSwapchainKHR handle() const noexcept { return swapchain_; }
+    [[nodiscard]] VkFormat format() const noexcept { return format_; }
+    [[nodiscard]] VkExtent2D extent() const noexcept { return extent_; }
+    [[nodiscard]] uint32_t image_count() const noexcept {
+        return static_cast<uint32_t>(images_.size());
+    }
+
+    [[nodiscard]] VkImage image(uint32_t index) const { return images_.at(index); }
+    [[nodiscard]] VkImageView view(uint32_t index) const { return views_.at(index); }
+```
+
+`recreate()` is `recreate_swapchain` promoted to public API, because from chapter 1.5
+onward the frame loop calls it when a present reports the swapchain is out of date.
+
+`format()` and `extent()` are not conveniences. Every pipeline built from chapter 1.7 has
+to be told the colour format it renders into, and every draw needs the size, so these two
+get read constantly.
+
+`image()` and `view()` use **`.at()`** rather than `[]`. `.at()` bounds-checks and throws;
+`[]` on an out-of-range index is undefined behaviour. The index here comes from
+`vkAcquireNextImageKHR`, so a wrong one means a genuine logic error, and an exception names
+it immediately instead of corrupting memory quietly.
+
+```cpp title="code/common/scaffold/include/vkc/swapchain.hpp"
+private:
+    void create();
+    void destroy() noexcept;
+
+    Context& context_;
+    Window& window_;
+
+    VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
+    VkFormat format_ = VK_FORMAT_UNDEFINED;
+    VkExtent2D extent_{};
+    std::vector<VkImage> images_;       // owned by the swapchain, not by us
+    std::vector<VkImageView> views_;    // owned by us, one per image
+};
+
+}  // namespace vkc
+```
+
+The `create` / `destroy` split is what lets the constructor, the destructor and `recreate`
+share one implementation each way, which is the whole reason rebuilding is cheap to get
+right. The two member comments are the ownership rule, kept next to the members it governs.
+
+Note there is no `present_mode_` member: your sample kept one only so `report()` could
+print it.
+
+```cpp title="code/common/scaffold/src/swapchain.cpp"
+#include "vkc/swapchain.hpp"
+
+#include "vkc/check.hpp"
+#include "vkc/context.hpp"
+#include "vkc/window.hpp"
+
+#include <spdlog/spdlog.h>
+
+#include <algorithm>
+#include <vector>
+
+namespace vkc {
+namespace {
+
+// We want an 8-bit-per-channel sRGB target. Asking for an sRGB *format* means the
+// hardware does the linear-to-sRGB conversion on write for free, which is the whole
+// gamma-correction story handled correctly by default. The gamma chapter explains
+// why that matters; until then it is simply the right thing to pick.
+VkSurfaceFormatKHR choose_surface_format(
+    const std::vector<VkSurfaceFormatKHR>& available) {
+    for (const VkSurfaceFormatKHR& candidate : available) {
+        const bool wanted_format = candidate.format == VK_FORMAT_B8G8R8A8_SRGB ||
+                                   candidate.format == VK_FORMAT_R8G8B8A8_SRGB;
+        if (wanted_format &&
+            candidate.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+            return candidate;
+        }
+    }
+    // The spec guarantees at least one format exists, so falling back to the first
+    // is always safe even if it is not ideal.
+    return available.front();
+}
+
+// FIFO is the only present mode every implementation must support, and it is
+// v-synced with no tearing. MAILBOX is the same guarantee without the latency, so
+// take it when it is offered.
+VkPresentModeKHR choose_present_mode(const std::vector<VkPresentModeKHR>& available) {
+    const bool has_mailbox = std::ranges::find(available, VK_PRESENT_MODE_MAILBOX_KHR) !=
+                             available.end();
+    return has_mailbox ? VK_PRESENT_MODE_MAILBOX_KHR : VK_PRESENT_MODE_FIFO_KHR;
+}
+
+VkExtent2D choose_extent(const VkSurfaceCapabilitiesKHR& caps, VkExtent2D window_size) {
+    // A currentExtent of 0xFFFFFFFF is the window system saying "you decide";
+    // anything else is it saying "this is the size, take it".
+    if (caps.currentExtent.width != UINT32_MAX) {
+        return caps.currentExtent;
+    }
+    return VkExtent2D{
+        .width = std::clamp(window_size.width, caps.minImageExtent.width,
+                            caps.maxImageExtent.width),
+        .height = std::clamp(window_size.height, caps.minImageExtent.height,
+                             caps.maxImageExtent.height),
+    };
+}
+
+}  // namespace
+```
+
+The three choosers, unchanged from yours apart from `format_name`, which existed only for
+the log.
+
+```cpp title="code/common/scaffold/src/swapchain.cpp"
+Swapchain::Swapchain(Context& context, Window& window)
+    : context_(context), window_(window) {
+    create();
+}
+
+Swapchain::~Swapchain() { destroy(); }
+
+void Swapchain::recreate() {
+    context_.wait_idle();
+    destroy();
+    create();
+    spdlog::info("Swapchain rebuilt at {}x{}", extent_.width, extent_.height);
+}
+```
+
+Reference members must be bound in the **initialiser list** — there is no way to assign a
+reference afterwards — which is why the constructor body holds only `create()`.
+
+```cpp title="code/common/scaffold/src/swapchain.cpp"
+void Swapchain::create() {
+    const VkPhysicalDevice gpu = context_.physical_device();
+    const VkSurfaceKHR surface = context_.surface();
+
+    VkSurfaceCapabilitiesKHR caps{};
+    VK_CHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(gpu, surface, &caps));
+
+    uint32_t format_count = 0;
+    VK_CHECK(vkGetPhysicalDeviceSurfaceFormatsKHR(gpu, surface, &format_count, nullptr));
+    std::vector<VkSurfaceFormatKHR> formats(format_count);
+    VK_CHECK(vkGetPhysicalDeviceSurfaceFormatsKHR(gpu, surface, &format_count,
+                                                  formats.data()));
+
+    uint32_t mode_count = 0;
+    VK_CHECK(vkGetPhysicalDeviceSurfacePresentModesKHR(gpu, surface, &mode_count,
+                                                       nullptr));
+    std::vector<VkPresentModeKHR> modes(mode_count);
+    VK_CHECK(vkGetPhysicalDeviceSurfacePresentModesKHR(gpu, surface, &mode_count,
+                                                       modes.data()));
+
+    const VkSurfaceFormatKHR surface_format = choose_surface_format(formats);
+    const VkPresentModeKHR present_mode = choose_present_mode(modes);
+    extent_ = choose_extent(caps, window_.pixel_extent());
+    format_ = surface_format.format;
+```
+
+The same three queries. `present_mode` is a local now rather than a member, since nothing
+outside `create()` needs it.
+
+The physical device and the surface come from the context instead of from two separate
+members, which is the entire practical difference the bundling makes.
+
+```cpp title="code/common/scaffold/src/swapchain.cpp"
+    // One more than the minimum, so the CPU always has an image to draw into while
+    // the presentation engine is busy with another. maxImageCount == 0 means
+    // "no limit".
+    uint32_t requested_images = caps.minImageCount + 1;
+    if (caps.maxImageCount > 0 && requested_images > caps.maxImageCount) {
+        requested_images = caps.maxImageCount;
+    }
+
+    const VkSwapchainCreateInfoKHR info{
+        .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+        .pNext = nullptr,
+        .flags = 0,
+        .surface = surface,
+        .minImageCount = requested_images,
+        .imageFormat = format_,
+        .imageColorSpace = surface_format.colorSpace,
+        .imageExtent = extent_,
+        .imageArrayLayers = 1,
+        // COLOR_ATTACHMENT to render into it; TRANSFER_DST so a later chapter can
+        // blit a finished offscreen image onto it instead; TRANSFER_SRC so the
+        // screenshot path can copy it back out to the CPU.
+        .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                      VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        // One queue family does everything in this series, so no sharing is needed.
+        .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = 0,
+        .pQueueFamilyIndices = nullptr,
+        .preTransform = caps.currentTransform,
+        .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+        .presentMode = present_mode,
+        // Let the driver discard pixels hidden by another window.
+        .clipped = VK_TRUE,
+        .oldSwapchain = VK_NULL_HANDLE,
+    };
+
+    VK_CHECK(vkCreateSwapchainKHR(context_.device(), &info, nullptr, &swapchain_));
+    context_.name(swapchain_, VK_OBJECT_TYPE_SWAPCHAIN_KHR, "swapchain");
+```
+
+Field for field what you wrote, with one new line at the end.
+
+`context_.name(...)` is `Device::set_debug_name` from chapter 1.3, reached through the
+context. This is the first object in the series to get a name, and the effect is that a
+validation message about it reads `VkSwapchainKHR "swapchain"` rather than a bare hex
+handle. `VK_OBJECT_TYPE_SWAPCHAIN_KHR` is the enum value saying which kind of handle the
+`uint64_t` is.
+
+```cpp title="code/common/scaffold/src/swapchain.cpp"
+    uint32_t image_count = 0;
+    VK_CHECK(vkGetSwapchainImagesKHR(context_.device(), swapchain_, &image_count,
+                                     nullptr));
+    images_.resize(image_count);
+    VK_CHECK(vkGetSwapchainImagesKHR(context_.device(), swapchain_, &image_count,
+                                     images_.data()));
+
+    views_.resize(image_count);
+    for (uint32_t i = 0; i < image_count; ++i) {
+        const VkImageViewCreateInfo view_info{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .image = images_[i],
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = format_,
+            .components = {},  // all VK_COMPONENT_SWIZZLE_IDENTITY
+            .subresourceRange =
+                {
+                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .baseMipLevel = 0,
+                    .levelCount = 1,
+                    .baseArrayLayer = 0,
+                    .layerCount = 1,
+                },
+        };
+        VK_CHECK(vkCreateImageView(context_.device(), &view_info, nullptr, &views_[i]));
+    }
+}
+
+void Swapchain::destroy() noexcept {
+    for (VkImageView view : views_) {
+        vkDestroyImageView(context_.device(), view, nullptr);
+    }
+    views_.clear();
+    // The images themselves belong to the swapchain; destroying it frees them.
+    images_.clear();
+
+    if (swapchain_ != VK_NULL_HANDLE) {
+        vkDestroySwapchainKHR(context_.device(), swapchain_, nullptr);
+        swapchain_ = VK_NULL_HANDLE;
+    }
+}
+
+}  // namespace vkc
+```
+
+Retrieving the images and building one view each, then the teardown that respects which of
+the two you own — both exactly as above.
+
+From chapter 1.5, `vkc::Swapchain swapchain_` is one member, `swapchain_.recreate()` is the
+whole of resize handling, and you have read every line of what those do.
 
 ## Running it
 
 ```
+[info] GPU: NVIDIA GeForce RTX 4080 (Vulkan 1.4.351)
 [info] Swapchain:
 [info]   3 images at 1712x1389
 [info]   format: VK_FORMAT_R8G8B8A8_SRGB
 [info]   present mode: MAILBOX
 ```
 
-Three images, not the two we asked for — the driver gave us more, which it is entitled
-to do. Still nothing on screen: the images exist but nothing has been recorded into
-them.
+Three images, not the two we asked for — the driver gave us more, which it is entitled to do.
+The `GPU:` line comes from `vkc::Device`, which logs it on creation.
 
-Resize the window and watch the swapchain rebuild each time. On a Wayland compositor
-with fractional scaling you will often see two rebuilds in quick succession at
-start-up, as the compositor settles on a final size.
+Still nothing on screen: the images exist but nothing has been recorded into them. Resize the
+window and watch the swapchain rebuild each time. On a Wayland compositor with fractional
+scaling you will often see two rebuilds in quick succession at start-up, as the compositor
+settles on a final size.
+
+## Words introduced in this chapter
+
+| | |
+|---|---|
+| **swapchain** | the set of images the window system displays, plus the rules for swapping them |
+| **presentation engine** | the part of the system that owns those images and shows them |
+| **tearing** | one displayed frame showing parts of two rendered frames |
+| **present mode** | the policy for what happens when frames outpace refreshes |
+| **image view** | a description of how to read part of an image: format, mips, layers |
+| **sRGB** | the non-linear encoding displays expect, converted for free by an `_SRGB` format |
+| **out of date** | a swapchain that no longer matches its surface and must be rebuilt |
+| **double / triple buffering** | two or three images taking turns, so drawing never happens in the image being displayed |
+| **colour space** | how the display should interpret the stored values, paired with the format |
+| **swizzle** | a per-channel remap in a view; the identity swizzle is enumerator `0` |
+| **sharing mode** | whether an image is used by one queue family (`EXCLUSIVE`) or several (`CONCURRENT`) |
 
 ## Exercises
 
-1. Print every supported format and present mode. Most surfaces support four or five
-   modes and a surprising number of formats.
-2. Force `VK_PRESENT_MODE_IMMEDIATE_KHR`. There is nothing animated yet, so save this
-   one for chapter 1.5 — then you can watch it tear.
-3. Request `caps.minImageCount` exactly instead of one more, and note the image count
-   in the log. The consequence only becomes visible once there is a frame loop.
-4. Pick a `_UNORM` format instead of `_SRGB`. Nothing appears to change yet — but make
-   a note, because in chapter 1.5 the clear colour will be visibly wrong.
+1. Print every supported format and present mode. You already have both vectors in
+   `create_swapchain`, and `format_name` covers the common cases. Most surfaces support four or
+   five modes and a surprising number of formats.
+2. Force `VK_PRESENT_MODE_IMMEDIATE_KHR` by returning it from `choose_present_mode`. There is
+   nothing animated yet, so save this one for chapter 1.5 — then you can watch it tear.
+3. Request `caps.minImageCount` exactly instead of one more, and note the image count in the log.
+   The consequence only becomes visible once there is a frame loop.
+4. Pick a `_UNORM` format instead of `_SRGB`. Nothing appears to change yet — but make a note,
+   because in chapter 1.5 the clear colour will be visibly wrong.
+5. Remove `VK_IMAGE_USAGE_TRANSFER_SRC_BIT` from `imageUsage` and run with
+   `--screenshot out.png`. The validation message names the flag it wanted.
+6. Delete `device_->wait_idle()` from `recreate_swapchain` and resize the window repeatedly.
+   Nothing is in flight yet, so it survives — then read chapter 1.6 and work out why that stops
+   being true.
 
-Next: [command buffers](/getting-started/command-buffers/) — and the first thing you
-will actually see.
+Next: [command buffers](/getting-started/command-buffers/) — and the first thing you will
+actually see.

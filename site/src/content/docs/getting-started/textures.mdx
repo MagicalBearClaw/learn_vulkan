@@ -1,6 +1,6 @@
 ---
 title: Textures
-description: Images, layouts, staging copies, mipmaps and samplers - putting a picture on a surface.
+description: Images, layouts, staging copies, mipmaps and samplers - putting a picture on a surface, every line of it.
 sidebar:
   order: 11
 ---
@@ -10,110 +10,249 @@ sidebar:
   <figcaption>Chapter 1.11: the same texture and the same sampler, drawn once and tiled four times.</figcaption>
 </figure>
 
-Per-vertex colours run out quickly. A texture attaches detail to a surface at a
-resolution that has nothing to do with how many triangles it has, and it is the single
-biggest step up in visual quality available.
+Per-vertex colours run out quickly. A texture attaches detail to a surface at a resolution that
+has nothing to do with how many triangles it has, and it is the single biggest step up in visual
+quality available.
+
+```cmake title="code/src/1.getting_started/textures/CMakeLists.txt"
+add_chapter(1.11.textures
+    SOURCES main.cpp
+    SHADERS textured.slang
+)
+```
 
 ## Three objects, not one
 
 This is the framing worth carrying forward.
 
-**`VkImage`** is the pixels. It has a format, a size, a mip count, and a *layout* — an
-arrangement in memory that the driver chooses for speed and that changes depending on
-what you are about to do with it.
+```
+   VkImage            VkImageView              VkSampler
+   the pixels         how to read them         how to read BETWEEN them
+   ───────────        ────────────────         ────────────────────────
+   format             which mip levels         filtering (linear/nearest)
+   size               which array layers       mip selection
+   mip count          which format             wrapping past 0..1
+   a LAYOUT                                    anisotropy
+```
 
-**`VkImageView`** is how a shader interprets the image: which format to read it as, which
-mip levels, which array layers.
+OpenGL merged all three into one texture object, which is why its sampler state was stuck to the
+texture and why using the same image with two different filters meant two copies of it. In Vulkan
+a sampler is an independent object, and a handful of them typically serve an entire scene.
 
-**`VkSampler`** is how to read *between* texels: filtering, mip selection, and what
-happens outside 0…1.
+```cpp title="code/src/1.getting_started/textures/main.cpp"
+#include <vkc/paths.hpp>
+```
 
-OpenGL merged all three into one texture object, which is why its sampler state was
-stuck to the texture and why using the same image with two different filters meant two
-copies of it. In Vulkan a sampler is an independent object, and a handful of them
-typically serve an entire scene.
+```cpp title="code/src/1.getting_started/textures/main.cpp"
+#define STB_IMAGE_STATIC
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb_image.h>
+```
+
+```cpp title="code/src/1.getting_started/textures/main.cpp"
+#include <algorithm>
+#include <bit>
+```
+
+```cpp title="code/src/1.getting_started/textures/main.cpp"
+#include <stdexcept>
+```
+
+`stb_image` is header-only, so exactly one translation unit has to compile its implementation.
+**`STB_IMAGE_STATIC` is not optional here**: from chapter 3.1 onward Assimp is linked in, and its
+static library exports all 43 `stbi_*` symbols itself. A second global definition makes every Part
+3 target fail to link with `multiple definition of stbi_load`. Keeping this copy internal to the
+file avoids that permanently.
+
+`<bit>` is for `std::bit_width`, which computes the mip count below.
 
 ## Getting pixels in
 
-Loading is the buffer story from 1.8 with one extra idea, and `stb_image` does the file
-parsing:
-
 ```cpp title="code/src/1.getting_started/textures/main.cpp"
-stbi_uc* pixels =
-    stbi_load(path.string().c_str(), &width, &height, &channels, STBI_rgb_alpha);
+class TextureApp : public vkc::App {
 ```
 
-`STBI_rgb_alpha` forces 4 channels whatever the file has. Three-channel *image* formats
-are patchily supported across hardware — unlike three-channel vertex formats, which are
-universal — and one wasted byte per texel is a far better trade than a support matrix.
+```cpp title="code/src/1.getting_started/textures/main.cpp"
+    void load_texture(const std::filesystem::path& path) {
+        int width = 0;
+        int height = 0;
+        int channels = 0;
 
-The image itself:
+        stbi_uc* pixels =
+            stbi_load(path.string().c_str(), &width, &height, &channels, STBI_rgb_alpha);
+        if (pixels == nullptr) {
+            throw std::runtime_error(std::format(
+                "Could not load '{}': {}. Did you run tools/make_textures.py?",
+                path.string(), stbi_failure_reason()));
+        }
+
+        const VkDeviceSize size =
+            static_cast<VkDeviceSize>(width) * static_cast<VkDeviceSize>(height) * 4;
+```
+
+`STBI_rgb_alpha` forces 4 channels whatever the file has. Three-channel *image* formats are
+patchily supported across hardware — unlike three-channel vertex formats, which are universal —
+and one wasted byte per texel is a far better trade than a support matrix. `channels` still
+reports what the file actually had, which is why it is logged below.
+
+The casts before the multiply matter: `width * height * 4` in `int` overflows at about 23 000
+pixels square, and the result would be silently negative.
 
 ```cpp title="code/src/1.getting_started/textures/main.cpp"
-const VkImageCreateInfo image_info{
-    .imageType = VK_IMAGE_TYPE_2D,
-    .format = VK_FORMAT_R8G8B8A8_SRGB,
-    .extent = {width, height, 1},
-    .mipLevels = mip_levels_,
-    .arrayLayers = 1,
-    .samples = VK_SAMPLE_COUNT_1_BIT,
-    .tiling = VK_IMAGE_TILING_OPTIMAL,
-    .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-             VK_IMAGE_USAGE_SAMPLED_BIT,
-    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-};
+        mip_levels_ = static_cast<uint32_t>(std::bit_width(static_cast<uint32_t>(
+                          std::max(width, height))));
+
+        spdlog::info("Loaded {}x{} texture ({} channels in the file), {} mip levels",
+                     width, height, channels, mip_levels_);
+```
+
+How many times the image can be halved before it reaches 1×1, inclusive. `bit_width(512)` is 10,
+and a 512×512 texture has exactly 10 levels: 512, 256, 128 … 2, 1.
+
+```cpp title="code/src/1.getting_started/textures/main.cpp"
+        vkc::Buffer staging(context().allocator(), size,
+                            VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                            VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                                VMA_ALLOCATION_CREATE_MAPPED_BIT);
+        std::memcpy(staging.mapped(), pixels, static_cast<size_t>(size));
+        stbi_image_free(pixels);
+
+        create_image(static_cast<uint32_t>(width), static_cast<uint32_t>(height));
+```
+
+Exactly chapter 1.8's staging pattern. The stb allocation is freed as soon as the bytes are in the
+staging buffer.
+
+## The image
+
+```cpp title="code/src/1.getting_started/textures/main.cpp"
+    void create_image(uint32_t width, uint32_t height) {
+        const VkImageCreateInfo image_info{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .imageType = VK_IMAGE_TYPE_2D,
+            .format = VK_FORMAT_R8G8B8A8_SRGB,
+            .extent = {width, height, 1},
+            .mipLevels = mip_levels_,
+            .arrayLayers = 1,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .tiling = VK_IMAGE_TILING_OPTIMAL,
+            .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                     VK_IMAGE_USAGE_SAMPLED_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .queueFamilyIndexCount = 0,
+            .pQueueFamilyIndices = nullptr,
+            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        };
 ```
 
 Four fields deserve a note.
 
-`VK_IMAGE_TILING_OPTIMAL` lets the driver store the texels in whatever order its texture
-units prefer — usually some tiled or Morton ordering, never plain rows. That locality is
-why a texture fetch hits cache; `LINEAR` tiling keeps row order and is dramatically
-slower to sample. It exists for images the CPU must read directly, and almost nothing
-else.
+**`VK_IMAGE_TILING_OPTIMAL`** lets the driver store the texels in whatever order its texture units
+prefer — usually some tiled or Morton ordering, never plain rows:
 
-`TRANSFER_SRC` as well as `TRANSFER_DST`, because generating mipmaps reads level *n* to
-write level *n+1*.
+```
+   LINEAR                          OPTIMAL (one possible scheme)
+   row 0: 0  1  2  3  4  5         0  1  4  5  16 17 20 21
+   row 1: 6  7  8  9  10 11        2  3  6  7  18 19 22 23
+                                   neighbouring texels in 2D are
+   a 2D neighbourhood is           near each other in memory, so one
+   scattered across memory         cache line serves a whole quad
+```
 
-`initialLayout` must be `UNDEFINED` or `PREINITIALIZED`. `UNDEFINED` says the contents
-are not worth preserving, which is exactly true for a new image and lets the first
-transition be free.
+That locality is why a texture fetch hits cache. `LINEAR` tiling keeps row order and is
+dramatically slower to sample; it exists for images the CPU must read directly.
+
+**`TRANSFER_SRC` as well as `TRANSFER_DST`**, because generating mipmaps reads level *n* to write
+level *n+1*. Forget it and mip generation is a validation error.
+
+**`extent`** is three-dimensional even for a 2D image, with depth 1. The same struct describes a
+3D texture.
+
+**`initialLayout`** must be `UNDEFINED` or `PREINITIALIZED`. `UNDEFINED` says the contents are not
+worth preserving, which is exactly true for a new image and lets the first transition be free.
 
 And `_SRGB` rather than `_UNORM`, which needs its own paragraph.
 
 :::note[Why the format ends in `_SRGB`]
-Image files store colour in sRGB: roughly, the square root of brightness, because that
-spends more bits where the eye is more sensitive. Adding or multiplying those values
-directly is meaningless — half of an sRGB value is not half the light.
+Image files store colour in sRGB: roughly, the square root of brightness, because that spends more
+bits where the eye is more sensitive. Adding or multiplying those values directly is meaningless —
+half of an sRGB value is not half the light.
 
-An `_SRGB` format makes the hardware convert to linear as each texel is sampled, for
-free. Our swapchain is also sRGB (chapter 1.4 chose it deliberately), so the conversion
-back happens on the way out, also free. Shading happens in linear space in between,
-which is the only place it is correct.
+An `_SRGB` format makes the hardware convert to linear as each texel is sampled, for free. Our
+swapchain is also sRGB (chapter 1.4 chose it deliberately), so the conversion back happens on the
+way out, also free. Shading happens in linear space in between, which is the only place it is
+correct.
 
 Rule of thumb: **colour** textures are `_SRGB`; **data** textures — normal maps, roughness,
-height, masks — are `_UNORM`, because they were never colour and converting them would
-corrupt them. Chapter 5.2 takes this apart in full.
+height, masks — are `_UNORM`, because they were never colour and converting them would corrupt
+them. Chapter 5.2 takes this apart in full.
 :::
 
-### The copy, and the layouts
-
-Same staging pattern as a vertex buffer, with layout transitions around it:
-
 ```cpp title="code/src/1.getting_started/textures/main.cpp"
-transition(cmd, VK_IMAGE_LAYOUT_UNDEFINED,
-           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, mip_levels_);
+        const VmaAllocationCreateInfo alloc_info{
+            .flags = 0,
+            .usage = VMA_MEMORY_USAGE_AUTO,
+            .requiredFlags = 0,
+            .preferredFlags = 0,
+            .memoryTypeBits = 0,
+            .pool = VK_NULL_HANDLE,
+            .pUserData = nullptr,
+            .priority = 0.0F,
+        };
 
-vkCmdCopyBufferToImage(cmd, staging.handle(), texture_,
-                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        VK_CHECK(vmaCreateImage(context().allocator(), &image_info, &alloc_info,
+                                &texture_, &texture_allocation_, nullptr));
+    }
 ```
 
-The layout is the new idea. A buffer is bytes and that is that; an image is arranged
-differently depending on what is about to touch it, and the arrangement that is fast to
-copy into is not the one that is fast to sample from. Chapter 1.5 met this already, for
-swapchain images. It is the same mechanism.
+`vmaCreateImage` is `vmaCreateBuffer`'s twin and solves the same problem: an image, like a buffer,
+is a description with no memory attached until something binds some to it. No host-access flag, so
+VMA puts it in device-local memory.
 
-The four layouts that cover most work:
+## The copy, and the layouts
+
+```cpp title="code/src/1.getting_started/textures/main.cpp"
+        vkc::immediate_submit(context(), [&](VkCommandBuffer cmd) {
+            transition(cmd, VK_IMAGE_LAYOUT_UNDEFINED,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, mip_levels_);
+
+            const VkBufferImageCopy region{
+                .bufferOffset = 0,
+                .bufferRowLength = 0,
+                .bufferImageHeight = 0,
+                .imageSubresource =
+                    {
+                        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                        .mipLevel = 0,
+                        .baseArrayLayer = 0,
+                        .layerCount = 1,
+                    },
+                .imageOffset = {0, 0, 0},
+                .imageExtent = {static_cast<uint32_t>(width),
+                                static_cast<uint32_t>(height), 1},
+            };
+            vkCmdCopyBufferToImage(cmd, staging.handle(), texture_,
+                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+            generate_mipmaps(cmd, width, height);
+        });
+
+        context().name(texture_, VK_OBJECT_TYPE_IMAGE, "lvk_grid");
+
+        create_texture_view();
+    }
+```
+
+`vkCmdCopyBufferToImage` moves bytes from a buffer into an image, and a `VkBufferImageCopy`
+describes one such move: where in the buffer to read, which mip level and array layer to
+write, and what rectangle of the image to cover. It is the image-shaped counterpart of
+chapter 1.8's `VkBufferCopy`, and it needs the extra fields because an image has a shape
+where a buffer has only a length.
+
+The layout is the new idea here. Chapter 1.5 met it for swapchain images; this is the same
+mechanism, and these are the four layouts that cover most work:
 
 | Layout | For |
 |---|---|
@@ -122,99 +261,258 @@ The four layouts that cover most work:
 | `TRANSFER_SRC_OPTIMAL` | being copied out of |
 | `SHADER_READ_ONLY_OPTIMAL` | being sampled |
 
-`bufferRowLength` and `bufferImageHeight` of zero mean "tightly packed", which is what
-stb gives us. Non-zero values describe a sub-rectangle of a larger source image.
+`bufferRowLength` and `bufferImageHeight` of zero mean "tightly packed", which is what stb gives
+us. Non-zero values describe a sub-rectangle of a larger source image.
+
+Note that the copy writes only `mipLevel = 0`. The rest of the chain does not exist yet — the
+image has ten levels of allocated memory with nothing in nine of them.
+
+```cpp title="code/src/1.getting_started/textures/main.cpp"
+    void transition(VkCommandBuffer cmd, VkImageLayout from, VkImageLayout to,
+                    uint32_t base_mip, uint32_t mip_count) {
+        const VkImageMemoryBarrier2 barrier{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+            .pNext = nullptr,
+            .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+            .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+            .dstAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT,
+            .oldLayout = from,
+            .newLayout = to,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = texture_,
+            .subresourceRange =
+                {
+                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .baseMipLevel = base_mip,
+                    .levelCount = mip_count,
+                    .baseArrayLayer = 0,
+                    .layerCount = 1,
+                },
+        };
+
+        const VkDependencyInfo dependency{
+            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .pNext = nullptr,
+            .dependencyFlags = 0,
+            .memoryBarrierCount = 0,
+            .pMemoryBarriers = nullptr,
+            .bufferMemoryBarrierCount = 0,
+            .pBufferMemoryBarriers = nullptr,
+            .imageMemoryBarrierCount = 1,
+            .pImageMemoryBarriers = &barrier,
+        };
+
+        vkCmdPipelineBarrier2(cmd, &dependency);
+    }
+```
+
+Chapter 1.5's `transition_image` with a **mip range** added. That is the whole difference, and it
+is the point of the chapter's middle section: `baseMipLevel` and `levelCount` mean a layout
+belongs to a *subresource*, not to an image. Different levels of the same image can be in
+different layouts at the same time, and mip generation depends on exactly that.
 
 ## Mipmaps
 
-Here is the problem mipmaps solve. When a texture is minified — many texels falling
-inside one pixel — sampling picks one of them and ignores the rest. Move the camera
-slightly and it picks a different one. The result shimmers, and it is far more
-distracting in motion than a still screenshot suggests.
+When a texture is minified — many texels falling inside one pixel — sampling picks one of them and
+ignores the rest. Move the camera slightly and it picks a different one. The result shimmers, and
+it is far more distracting in motion than a still screenshot suggests.
 
-A **mip chain** is the texture pre-filtered at successively half sizes: 512, 256, 128,
-down to 1×1. The hardware picks the level where one texel is about one pixel, so it is
-averaging over the right area instead of point-sampling a random texel.
+A **mip chain** is the texture pre-filtered at successively half sizes:
 
-```cpp title="code/src/1.getting_started/textures/main.cpp"
-mip_levels_ = static_cast<uint32_t>(std::bit_width(static_cast<uint32_t>(
-                  std::max(width, height))));
+```
+   level 0   512x512   ████████████████
+   level 1   256x256   ████████
+   level 2   128x128   ████
+   ...                                  total cost: +33% memory
+   level 9   1x1       ▪                and FASTER, because small levels fit in cache
 ```
 
-It costs a third more memory, and it is faster than not having it, because the smaller
-levels fit in cache.
+The hardware picks the level where one texel is about one pixel, so it averages over the right
+area instead of point-sampling a random texel.
 
-Vulkan has **no `vkCmdGenerateMipmaps`**. That is deliberate — a box filter is rarely the
-best downsample, and production pipelines generate mips offline with something better.
-At load time, `vkCmdBlitImage` is the pragmatic answer, and writing it once is the best
-way to understand that a layout is per *mip level*, not per image:
+Vulkan has **no `vkCmdGenerateMipmaps`**. That is deliberate — a box filter is rarely the best
+downsample, and production pipelines generate mips offline with something better. At load time,
+`vkCmdBlitImage` is the pragmatic answer.
 
 ```cpp title="code/src/1.getting_started/textures/main.cpp"
-for (uint32_t level = 1; level < mip_levels_; ++level) {
-    transition(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, level - 1, 1);
+    void generate_mipmaps(VkCommandBuffer cmd, int width, int height) {
+        VkFormatProperties properties{};
+        vkGetPhysicalDeviceFormatProperties(context().physical_device(),
+                                            VK_FORMAT_R8G8B8A8_SRGB, &properties);
+        if ((properties.optimalTilingFeatures &
+             VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) == 0) {
+            throw std::runtime_error(
+                "This GPU cannot linearly filter R8G8B8A8_SRGB blits, so mipmaps "
+                "cannot be generated this way.");
+        }
 
-    vkCmdBlitImage(cmd, texture_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, texture_,
-                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
-                   VK_FILTER_LINEAR);
-
-    transition(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, level - 1, 1);
-}
+        int mip_width = width;
+        int mip_height = height;
 ```
-
-Read the loop as a ladder. Level *n−1* has just been written, so move it to
-`TRANSFER_SRC` — the barrier both changes the layout *and* orders the write before the
-read. Blit it, halved, into level *n*. Level *n−1* is now finished forever, so move it
-to `SHADER_READ_ONLY` and never think about it again. The last level only ever was a
-blit destination, so it gets one transition after the loop.
-
-Notice the same image is both source and destination of the blit, at different mip
-levels. That is legal precisely because the levels are in different layouts and the
-barriers order them.
 
 :::caution[Linear blit is an optional feature]
-`VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT` is not guaranteed for every format.
-For 8-bit formats it is supported everywhere in practice — but "in practice" is not a
-guarantee, and the sample checks:
+`vkGetPhysicalDeviceFormatProperties` asks the GPU what it can do with one particular
+format — sample it, filter it, use it as an attachment, blit it — and returns a set of
+feature bits for each kind of tiling.
+
+`VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT` is not guaranteed for every format. For 8-bit
+formats it is supported everywhere in practice — but "in practice" is not a guarantee, so it is
+checked, in the same "ask, do not assume" spirit as chapter 1.3's device selection.
+
+For compressed formats (BC7, ASTC) blitting is not available at all, and their mips must be
+generated offline — which is what you want anyway.
+:::
 
 ```cpp title="code/src/1.getting_started/textures/main.cpp"
-vkGetPhysicalDeviceFormatProperties(context().physical_device(),
-                                    VK_FORMAT_R8G8B8A8_SRGB, &properties);
+        for (uint32_t level = 1; level < mip_levels_; ++level) {
+            transition(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, level - 1, 1);
+
+            const int next_width = std::max(mip_width / 2, 1);
+            const int next_height = std::max(mip_height / 2, 1);
+
+            const VkImageBlit blit{
+                .srcSubresource =
+                    {
+                        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                        .mipLevel = level - 1,
+                        .baseArrayLayer = 0,
+                        .layerCount = 1,
+                    },
+                .srcOffsets = {{0, 0, 0}, {mip_width, mip_height, 1}},
+                .dstSubresource =
+                    {
+                        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                        .mipLevel = level,
+                        .baseArrayLayer = 0,
+                        .layerCount = 1,
+                    },
+                .dstOffsets = {{0, 0, 0}, {next_width, next_height, 1}},
+            };
+
+            vkCmdBlitImage(cmd, texture_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, texture_,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                           VK_FILTER_LINEAR);
+
+            transition(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, level - 1, 1);
+
+            mip_width = next_width;
+            mip_height = next_height;
+        }
+
+        transition(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, mip_levels_ - 1, 1);
+    }
 ```
 
-For compressed formats (BC7, ASTC) blitting is not available at all, and their mips must
-be generated offline — which is what you want anyway.
-:::
+A `VkImageBlit` describes the rescaling copy: a source mip level with the rectangle to read
+from it, and a destination mip level with the rectangle to write into. The two `Offsets`
+arrays each hold two corners, so the source rectangle is the whole of level *n* and the
+destination is the whole of level *n+1*, which is half the size — and that size difference
+is what makes the blit filter rather than copy.
+
+Read the loop as a ladder, one level at a time:
+
+```
+   level 0:  DST ──▶ SRC ──blit──▶ level 1 (DST)
+             then 0: SRC ──▶ SHADER_READ_ONLY, finished forever
+
+   level 1:  DST ──▶ SRC ──blit──▶ level 2 (DST)
+             then 1: SRC ──▶ SHADER_READ_ONLY
+   ...
+   level 9:  never a source, so it is still DST after the loop
+             ──▶ one final transition
+```
+
+That last asymmetry is the easiest thing to get wrong here, and the symptom is a validation error
+naming exactly one mip level.
+
+Notice the same image is both source and destination of the blit, at different mip levels. That is
+legal precisely because the levels are in different layouts and the barriers order them.
+
+`std::max(mip_width / 2, 1)` is not decoration either: a non-square texture reaches 1 in one axis
+before the other, and halving 1 gives 0, which is not a legal extent.
+
+## The view
+
+```cpp title="code/src/1.getting_started/textures/main.cpp"
+    void create_texture_view() {
+        const VkImageViewCreateInfo view_info{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .image = texture_,
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = VK_FORMAT_R8G8B8A8_SRGB,
+            .components = {},  // VK_COMPONENT_SWIZZLE_IDENTITY is zero
+            .subresourceRange =
+                {
+                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .baseMipLevel = 0,
+                    .levelCount = mip_levels_,
+                    .baseArrayLayer = 0,
+                    .layerCount = 1,
+                },
+        };
+        VK_CHECK(vkCreateImageView(context().device(), &view_info, nullptr,
+                                   &texture_view_));
+    }
+```
+
+The same structure chapter 1.4 used for swapchain images, with `levelCount` now meaning something.
+A view exposing a subset of the chain is how you sample one specific level — which is what a bloom
+or blur pass does.
 
 ## The sampler
 
-The sampler is where most of the visible quality decisions live:
-
 ```cpp title="code/src/1.getting_started/textures/main.cpp"
-const VkSamplerCreateInfo sampler_info{
-    .magFilter = VK_FILTER_LINEAR,
-    .minFilter = VK_FILTER_LINEAR,
-    .mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
-    .addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT,
-    .addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT,
-    .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT,
-    .anisotropyEnable = VK_TRUE,
-    .maxAnisotropy = max_anisotropy,
-    .maxLod = VK_LOD_CLAMP_NONE,
-};
+    void create_sampler() {
+        const float max_anisotropy =
+            context().gpu_properties().limits.maxSamplerAnisotropy;
+
+        const VkSamplerCreateInfo sampler_info{
+            .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .magFilter = VK_FILTER_LINEAR,
+            .minFilter = VK_FILTER_LINEAR,
+            .mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+            .addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+            .addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+            .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+            .mipLodBias = 0.0F,
+            .anisotropyEnable = VK_TRUE,
+            .maxAnisotropy = max_anisotropy,
+            .compareEnable = VK_FALSE,
+            .compareOp = VK_COMPARE_OP_ALWAYS,
+            .minLod = 0.0F,
+            .maxLod = VK_LOD_CLAMP_NONE,
+            .borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
+            .unnormalizedCoordinates = VK_FALSE,
+        };
+        VK_CHECK(vkCreateSampler(context().device(), &sampler_info, nullptr, &sampler_));
+
+        spdlog::info("Sampler created with maxAnisotropy={}", max_anisotropy);
+    }
 ```
 
-**`magFilter`** is magnification — one texel covering many pixels. `LINEAR` blends the
-four nearest; `NEAREST` gives crisp squares, which is right for pixel art and wrong for
-nearly everything else.
+The sampler is where most of the visible quality decisions live. Note that it names **no image at
+all** — that is the point of it being a separate object.
 
-**`minFilter`** is minification, which is where aliasing lives, and where mipmaps do
-their work.
+**`magFilter`** is magnification, one texel covering many pixels. **`minFilter`** is minification,
+many texels per pixel, which is where aliasing lives:
 
-**`mipmapMode`** is how to blend *between* two mip levels. `LINEAR` gives trilinear
-filtering. `NEAREST` picks one level, and you can see the seam where it switches as a
-band across a floor.
+```
+   magnification          minification
+   NEAREST: blocky        NEAREST: shimmers as the camera moves
+   LINEAR:  smooth        LINEAR + mipmaps: stable
+```
+
+**`mipmapMode`** is how to blend *between* two mip levels. `LINEAR` gives trilinear filtering;
+`NEAREST` picks one level, and you can see the seam where it switches as a band across a floor.
 
 **`addressMode`** decides what `u` or `v` outside 0…1 means:
 
@@ -225,104 +523,991 @@ band across a floor.
 | `CLAMP_TO_EDGE` | stretches the edge texel outwards |
 | `CLAMP_TO_BORDER` | uses `borderColor` |
 
-`CLAMP_TO_EDGE` is the right default for anything that is not meant to tile. `REPEAT` on
-a non-tiling texture produces a thin wrong-coloured line at the edges, from the filter
-blending the left edge with the right.
+`CLAMP_TO_EDGE` is the right default for anything not meant to tile. `REPEAT` on a non-tiling
+texture produces a thin wrong-coloured line at the edges, from the filter blending the left edge
+with the right.
 
-**`anisotropyEnable`** is the best value for money in the whole struct. A surface seen at
-a glancing angle — a floor, a road, a wall — is compressed in one direction and not the
-other, and an ordinary mip lookup has to pick a level blurry enough for the worse axis.
-Anisotropic filtering takes several samples along the stretched direction instead. It
-costs little and it is very visible. It needs the `samplerAnisotropy` device feature,
-which `vkcommon` enables.
+**`anisotropyEnable`** is the best value for money in the whole struct. A surface at a glancing
+angle is compressed in one direction and not the other, and an ordinary mip lookup has to pick a
+level blurry enough for the worse axis. Anisotropic filtering takes several samples along the
+stretched direction instead. It needs the `samplerAnisotropy` device feature, which chapter 1.3
+enabled — and `maxSamplerAnisotropy` is read from the device rather than hard-coded to 16, because
+the limit is not guaranteed.
 
-**`maxLod = VK_LOD_CLAMP_NONE`** means no limit, which stays correct if a view later
-exposes a different number of levels. Setting it to `mip_levels_` also works and is one
-more thing to keep in step.
+**`compareEnable`** turns this into a *comparison* sampler, returning a pass/fail fraction rather
+than a colour. That is what shadow mapping uses, in chapter 5.3.
+
+**`maxLod = VK_LOD_CLAMP_NONE`** means no limit, which stays correct if a view later exposes a
+different number of levels.
 
 ## Reaching the shader
 
-A texture is bound through a descriptor, just as 1.10's uniform buffer was, with a
-different type:
-
 ```cpp title="code/src/1.getting_started/textures/main.cpp"
-const VkDescriptorSetLayoutBinding binding{
-    .binding = 0,
-    .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-    .descriptorCount = 1,
-    .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
-};
+    void create_descriptors() {
+        const VkDevice device = context().device();
+
+        const VkDescriptorSetLayoutBinding binding{
+            .binding = 0,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+            .pImmutableSamplers = nullptr,
+        };
+
+        const VkDescriptorSetLayoutCreateInfo layout_info{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .bindingCount = 1,
+            .pBindings = &binding,
+        };
+        VK_CHECK(vkCreateDescriptorSetLayout(device, &layout_info, nullptr,
+                                             &set_layout_));
+
+        const VkDescriptorPoolSize pool_size{
+            .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1,
+        };
+
+        const VkDescriptorPoolCreateInfo pool_info{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .maxSets = 1,
+            .poolSizeCount = 1,
+            .pPoolSizes = &pool_size,
+        };
+        VK_CHECK(vkCreateDescriptorPool(device, &pool_info, nullptr, &descriptor_pool_));
+
+        const VkDescriptorSetAllocateInfo alloc_info{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .pNext = nullptr,
+            .descriptorPool = descriptor_pool_,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &set_layout_,
+        };
+        VK_CHECK(vkAllocateDescriptorSets(device, &alloc_info, &descriptor_set_));
 ```
 
-`COMBINED_IMAGE_SAMPLER` is one descriptor holding both a view and a sampler. Vulkan also
-offers `SAMPLED_IMAGE` and `SAMPLER` separately, which is how one image gets paired with
-several samplers without duplicating anything — but combined is simpler and is where to
-start.
+`COMBINED_IMAGE_SAMPLER` is one descriptor holding both a view and a sampler. Vulkan also offers
+`SAMPLED_IMAGE` and `SAMPLER` separately, which is how one image gets paired with several samplers
+without duplicating anything — but combined is simpler and is where to start.
+`pImmutableSamplers` is a third option: a sampler baked into the *layout*, which the descriptor
+then cannot change.
 
-Note there is **one** descriptor set this time, not one per frame in flight. Nothing in
-it changes: it points at the same texture and sampler every frame. The per-frame
-duplication in 1.10 was needed because the *contents* of that buffer changed.
+Note there is **one** descriptor set this time, not one per frame in flight. Nothing in it changes:
+it points at the same texture and sampler every frame. The per-frame duplication in 1.10 was needed
+because the *contents* of that buffer changed.
 
-In Slang the type is `Sampler2D`:
+```cpp title="code/src/1.getting_started/textures/main.cpp"
+        const VkDescriptorImageInfo image_info{
+            .sampler = sampler_,
+            .imageView = texture_view_,
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
+
+        const VkWriteDescriptorSet write{
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .pNext = nullptr,
+            .dstSet = descriptor_set_,
+            .dstBinding = 0,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .pImageInfo = &image_info,
+            .pBufferInfo = nullptr,
+            .pTexelBufferView = nullptr,
+        };
+        vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+    }
+```
+
+A `VkDescriptorImageInfo` is the image-shaped descriptor, the counterpart of chapter 1.10's
+`VkDescriptorBufferInfo`: a sampler, a view, and the layout the image will be in when it is
+read. `pImageInfo` is populated where 1.10 populated `pBufferInfo` — the same
+`VkWriteDescriptorSet`, with a different one of its three pointers in use.
+
+The `imageLayout` here is a **promise**, checked by the validation layers at draw time: this is the
+layout the image will be in when it is sampled. Ours got there at the end of mip generation.
 
 ```slang title="code/src/1.getting_started/textures/textured.slang"
 [[vk::binding(0, 0)]] Sampler2D tex;
+```
 
+```slang title="code/src/1.getting_started/textures/textured.slang"
 [shader("fragment")]
 float4 fragmentMain(VSOutput input) : SV_Target {
     return tex.Sample(input.uv);
 }
 ```
 
-`Sampler2D` is the combined form: the view and the sampler arrive together in one
-descriptor, matching the `VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER` above. Slang can
-also describe the two halves separately, as a `Texture2D` plus a `SamplerState`, which is
-what a `SAMPLED_IMAGE` and a `SAMPLER` descriptor would be. That split is how you sample
-one texture with several different samplers without duplicating the image descriptor;
-this chapter takes the combined form because it is one descriptor to allocate and one
-object to reason about.
-
 :::note[`Sample()` does more than a memory read]
-The hardware compares this fragment's `uv` against its neighbours' — which is *why*
-fragment shaders run in groups of at least 2×2 — works out how fast the coordinate is
-changing across the screen, picks the mip level where one texel is about one pixel, and
-blends the two nearest levels. All of that is one instruction.
+The hardware compares this fragment's `uv` against its neighbours' — which is *why* fragment
+shaders run in groups of at least 2×2 — works out how fast the coordinate is changing across the
+screen, picks the mip level where one texel is about one pixel, and blends the two nearest levels.
+All of that is one instruction.
 
-It also means `Sample()` inside non-uniform control flow is trouble: if some fragments
-in the group took the other branch, their `uv` is undefined and so is the derivative.
-Sample first, branch afterwards. `SampleLevel()` names the mip level explicitly and is
-safe anywhere, at the cost of choosing it yourself.
+It also means `Sample()` inside non-uniform control flow is trouble: if some fragments in the group
+took the other branch, their `uv` is undefined and so is the derivative. Sample first, branch
+afterwards. `SampleLevel()` names the mip level explicitly and is safe anywhere.
 :::
 
 ## Texture coordinates
 
 ```cpp title="code/src/1.getting_started/textures/main.cpp"
-{{-1.0F, -1.0F}, {0.0F, 0.0F}},  // top left
-{{1.0F, -1.0F}, {1.0F, 0.0F}},   // top right
+struct Vertex {
+    glm::vec2 position;
+    glm::vec2 uv;
+};
+
+constexpr std::array<Vertex, 4> kVertices{{
+    {{-1.0F, -1.0F}, {0.0F, 0.0F}},  // top left
+    {{1.0F, -1.0F}, {1.0F, 0.0F}},   // top right
+    {{1.0F, 1.0F}, {1.0F, 1.0F}},    // bottom right
+    {{-1.0F, 1.0F}, {0.0F, 1.0F}},   // bottom left
+}};
 ```
 
 `u` runs 0 to 1 left to right, `v` runs 0 to 1 **top to bottom**.
 
 :::caution[v points the other way from OpenGL]
-Vulkan's v is downward, consistent with its downward y, and it means an image loaded in
-the usual top-row-first order maps on the right way up with no flip at all.
+Vulkan's v is downward, consistent with its downward y, so an image loaded in the usual
+top-row-first order maps on the right way up with no flip at all.
 
 OpenGL's v points up, which is why so much OpenGL code calls
-`stbi_set_flip_vertically_on_load(true)`. Porting a shader or a mesh format across
-without accounting for it gives you upside-down textures — the reason the test texture
-has an asymmetric marker in it: if the triangle points down, your v is flipped.
+`stbi_set_flip_vertically_on_load(true)`. Porting without accounting for it gives upside-down
+textures — the reason the test texture has an asymmetric marker: if the triangle points down, your
+v is flipped.
 :::
 
-Tiling is just multiplication in the vertex shader:
-
-```slang title="code/src/1.getting_started/textures/textured.slang"
-output.uv = input.uv * push.uv_scale;
+```cpp title="code/src/1.getting_started/textures/main.cpp"
+            {
+                .location = 1,
+                .binding = 0,
+                .format = VK_FORMAT_R32G32_SFLOAT,
+                .offset = offsetof(Vertex, uv),
+            },
 ```
 
-With `uv_scale` of 4 the coordinate runs 0…4 across the quad, and what happens past 1 is
-the sampler's address mode. That is the right-hand quad in the screenshot, and it is also
-where the mip chain earns its keep — the fine one-pixel grid lines in the texture stay
-clean instead of crawling.
+The colour attribute is gone and the uv takes its place, so the second attribute changes format.
+
+```cpp title="code/src/1.getting_started/textures/main.cpp"
+struct PushConstants {
+    glm::vec2 offset;
+    float scale;
+    float uv_scale;  // >1 tiles the texture, which is what the sampler's address mode
+                     // decides how to handle
+};
+static_assert(sizeof(PushConstants) == 16);
+
+constexpr std::array<PushConstants, 2> kQuads{{
+    {{-0.5F, 0.0F}, 0.45F, 1.0F},
+    {{0.5F, 0.0F}, 0.45F, 4.0F},
+}};
+```
+
+```slang title="code/src/1.getting_started/textures/textured.slang"
+struct VSInput {
+    [[vk::location(0)]] float2 position;
+    [[vk::location(1)]] float2 uv;
+};
+
+struct VSOutput {
+    float4 position : SV_Position;
+    [[vk::location(0)]] float2 uv;
+};
+
+struct PushConstants {
+    float2 offset;
+    float scale;
+    float uv_scale;
+};
+[[vk::push_constant]] PushConstants push;
+```
+
+```slang title="code/src/1.getting_started/textures/textured.slang"
+[shader("vertex")]
+VSOutput vertexMain(VSInput input) {
+    VSOutput output;
+    output.position = float4(input.position * push.scale + push.offset, 0.0, 1.0);
+
+    output.uv = input.uv * push.uv_scale;
+    return output;
+}
+```
+
+Tiling is just multiplication. With `uv_scale` of 4 the coordinate runs 0…4 across the quad, and
+what happens past 1 is the sampler's address mode — which is why the right-hand quad is where the
+mip chain earns its keep.
+
+```cpp title="code/src/1.getting_started/textures/main.cpp"
+        const VkPushConstantRange push_range{
+            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+            .offset = 0,
+            .size = sizeof(PushConstants),
+        };
+```
+
+```cpp title="code/src/1.getting_started/textures/main.cpp"
+            vkCmdPushConstants(frame.cmd, pipeline_layout_, VK_SHADER_STAGE_VERTEX_BIT,
+                               0, sizeof(PushConstants), &quad);
+```
+
+Vertex stage only this time — the fragment shader reads nothing from the push block.
+
+```cpp title="code/src/1.getting_started/textures/main.cpp"
+        load_texture(vkc::asset_path("textures/lvk_grid.png"));
+        create_sampler();
+```
+
+```cpp title="code/src/1.getting_started/textures/main.cpp"
+        vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                pipeline_layout_, 0, 1, &descriptor_set_, 0, nullptr);
+```
+
+```cpp title="code/src/1.getting_started/textures/main.cpp"
+        const VkShaderModule shader =
+            vkc::load_shader(device, LVK_CHAPTER_ID, "textured.slang");
+```
+
+```cpp title="code/src/1.getting_started/textures/main.cpp"
+    VkImage texture_ = VK_NULL_HANDLE;
+    VmaAllocation texture_allocation_ = VK_NULL_HANDLE;
+    VkImageView texture_view_ = VK_NULL_HANDLE;
+    VkSampler sampler_ = VK_NULL_HANDLE;
+    uint32_t mip_levels_ = 1;
+```
+
+```cpp title="code/src/1.getting_started/textures/main.cpp"
+    VkDescriptorSet descriptor_set_ = VK_NULL_HANDLE;
+```
+
+```cpp title="code/src/1.getting_started/textures/main.cpp"
+        vkDestroySampler(device, sampler_, nullptr);
+        vkDestroyImageView(device, texture_view_, nullptr);
+        vmaDestroyImage(context().allocator(), texture_, texture_allocation_);
+```
+
+```cpp title="code/src/1.getting_started/textures/main.cpp"
+        options.title = "LearnVulkan 1.11 - Textures";
+        TextureApp app(vkc::App::parse_args(argc, argv, options));
+```
+
+Five members for one texture, and four separate destroy calls. That observation is exactly why
+`vkc::Image` and `vkc::Sampler` exist from the next chapter.
+
+## What moves into `vkcommon`
+
+Five members and four destroy calls become `vkc::Image` and `vkc::Sampler`. Chapter 1.12
+uses both on its first page.
+
+```cpp title="code/common/scaffold/include/vkc/image.hpp"
+#include <volk.h>
+
+#include <vk_mem_alloc.h>
+
+#include <array>
+#include <cstdint>
+#include <filesystem>
+
+namespace vkc {
+
+class Context;
+
+// What an image is for. Everything an ImageDesc needs that is not a size.
+struct ImageDesc {
+    VkFormat format = VK_FORMAT_R8G8B8A8_SRGB;
+    VkExtent2D extent{};
+    VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+    uint32_t mip_levels = 1;
+    // COLOR for textures and render targets, DEPTH for a depth buffer. It appears in
+    // every barrier and every view, so it is part of the image's identity rather than
+    // something to remember at each use.
+    VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+    // How many images are stacked inside this one. Chapter 4.4 is the first to want
+    // more than one.
+    uint32_t array_layers = 1;
+    // Asks for VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT and makes the bundled view a
+    // VK_IMAGE_VIEW_TYPE_CUBE, so the image is sampled by direction rather than by a
+    // uv pair. Requires array_layers == 6, in the order the specification fixes:
+    // +X, -X, +Y, -Y, +Z, -Z. Chapter 4.4 builds one of these by hand and explains
+    // every field of it.
+    bool cube = false;
+};
+```
+
+A **descriptor struct** rather than eight constructor parameters, for the reason chapter
+1.2's `Instance::Config` gave: `Image(context, format, extent, usage, 10, aspect, 1, false)`
+tells you nothing at the call site.
+
+The `aspect` comment is the important one. A texture is `COLOR`; a depth buffer is `DEPTH`;
+and because the aspect has to match in the view and in every barrier, storing it with the
+image means no caller can get the two out of step. Chapter 1.13 is where that pays.
+
+An **array layer** is a whole image stacked inside another — the same size and format,
+addressed by index. Six of them with `cube = true` is a cubemap, sampled by a direction
+rather than a uv pair, which is chapter 4.4's subject.
+
+```cpp title="code/common/scaffold/include/vkc/image.hpp"
+class Image {
+public:
+    Image() = default;
+    Image(Context& context, const ImageDesc& desc);
+
+    ~Image();
+
+    Image(const Image&) = delete;
+    Image& operator=(const Image&) = delete;
+    Image(Image&& other) noexcept;
+    Image& operator=(Image&& other) noexcept;
+
+    [[nodiscard]] VkImage handle() const noexcept { return image_; }
+    [[nodiscard]] VkImageView view() const noexcept { return view_; }
+    [[nodiscard]] VkFormat format() const noexcept { return desc_.format; }
+    [[nodiscard]] VkExtent2D extent() const noexcept { return desc_.extent; }
+    [[nodiscard]] uint32_t mip_levels() const noexcept { return desc_.mip_levels; }
+    [[nodiscard]] VkImageAspectFlags aspect() const noexcept { return desc_.aspect; }
+    [[nodiscard]] uint32_t array_layers() const noexcept { return desc_.array_layers; }
+
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return image_ != VK_NULL_HANDLE;
+    }
+
+    // Moves some or all mip levels between layouts. Chapter 1.11's transition().
+    void transition(VkCommandBuffer cmd, VkImageLayout from, VkImageLayout to,
+                    uint32_t base_mip = 0,
+                    uint32_t mip_count = VK_REMAINING_MIP_LEVELS) const;
+
+    void destroy() noexcept;
+
+private:
+    VkDevice device_ = VK_NULL_HANDLE;
+    VmaAllocator allocator_ = VK_NULL_HANDLE;
+    VkImage image_ = VK_NULL_HANDLE;
+    VmaAllocation allocation_ = VK_NULL_HANDLE;
+    VkImageView view_ = VK_NULL_HANDLE;
+    ImageDesc desc_{};
+};
+```
+
+The same ownership shape as `vkc::Buffer`: copying deleted, moving allowed, destructor
+frees. Three of your five members — image, allocation, view — plus the device and allocator
+needed to free them, and the description kept so the accessors can answer from it.
+
+**The view is bundled with the image**, which the header's comment is careful to call a
+convenience rather than a rule. The two almost always travel together, and a second view
+onto the same image — one mip level, or a different format — is still created separately
+when a chapter needs one.
+
+`transition` is your `transition()` with a default argument, so the common "all of it" case
+needs no arguments.
+
+```cpp title="code/common/scaffold/include/vkc/image.hpp"
+// Number of mip levels a texture of this size can have, down to 1x1.
+[[nodiscard]] uint32_t mip_level_count(uint32_t width, uint32_t height) noexcept;
+
+// Uploads four-byte-per-texel pixels, builds the mip chain with vkCmdBlitImage, and
+// leaves the image in SHADER_READ_ONLY_OPTIMAL. This is the second half of chapter
+// 1.11 -- everything after the decode -- split out so that a caller who already has
+// pixels in memory need not write them to a file first. Chapter 3.2, whose textures
+// arrive as JPEG blobs inside a .glb, is the first such caller.
+[[nodiscard]] Image create_texture(Context& context, const void* rgba_pixels,
+                                   VkExtent2D extent,
+                                   VkFormat format = VK_FORMAT_R8G8B8A8_SRGB);
+
+// Loads an image file, uploads it, builds its mip chain with vkCmdBlitImage, and leaves
+// it in SHADER_READ_ONLY_OPTIMAL. Chapter 1.11, start to finish.
+//
+// Pass VK_FORMAT_R8G8B8A8_UNORM for data textures -- normal maps, roughness, masks --
+// which were never colour and must not go through the sRGB conversion.
+[[nodiscard]] Image load_texture(Context& context, const std::filesystem::path& path,
+                                 VkFormat format = VK_FORMAT_R8G8B8A8_SRGB);
+```
+
+The **split between `load_texture` and `create_texture`** is worth noticing. Your version
+decoded a file and uploaded it in one function. Here the decode is separate, because a
+texture does not always come from a file — chapter 3.2's arrive as JPEG blobs embedded
+inside a `.glb` model, already in memory.
+
+The `format` default carries the sRGB decision from earlier in this chapter, and the
+comment states the exception: data textures must be `_UNORM`.
+
+```cpp title="code/common/scaffold/include/vkc/image.hpp"
+// Loads six square images of equal size into the six faces of one cubemap and leaves it
+// in SHADER_READ_ONLY_OPTIMAL. The files must be given in the order the specification
+// fixes -- +X, -X, +Y, -Y, +Z, -Z -- because the array layer *is* the face.
+//
+// Chapter 4.4 writes this out in full and explains why the image needs
+// CUBE_COMPATIBLE, why the view type is CUBE, and why every face is uploaded from one
+// staging buffer with one copy region each.
+[[nodiscard]] Image load_cubemap(Context& context,
+                                 const std::array<std::filesystem::path, 6>& faces,
+                                 VkFormat format = VK_FORMAT_R8G8B8A8_SRGB);
+
+// Picks a depth format this GPU can use as a depth attachment, preferring the most
+// precise. Chapter 1.13 wrote this out and explained the order: D32_SFLOAT first, the
+// two stencil-carrying formats behind it as fallbacks.
+[[nodiscard]] VkFormat choose_depth_format(VkPhysicalDevice physical_device);
+
+// Creates a depth image and leaves it in DEPTH_ATTACHMENT_OPTIMAL, ready to attach.
+// Chapter 1.13 again, called once at start-up and again on every resize.
+[[nodiscard]] Image create_depth_buffer(Context& context, VkFormat format,
+                                        VkExtent2D extent);
+```
+
+Three declarations belonging to chapters you have not reached. `load_cubemap` is chapter
+4.4's; the two depth functions are the next chapter's, and 1.13 writes both out by hand
+before using them.
+
+```cpp title="code/common/scaffold/include/vkc/image.hpp"
+// How to read between texels. Kept separate from Image on purpose: a sampler is an
+// independent object in Vulkan, and a handful of them serve a whole scene.
+struct SamplerDesc {
+    VkFilter mag_filter = VK_FILTER_LINEAR;
+    VkFilter min_filter = VK_FILTER_LINEAR;
+    VkSamplerMipmapMode mipmap_mode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    VkSamplerAddressMode address_mode = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    bool anisotropy = true;
+};
+
+class Sampler {
+public:
+    Sampler() = default;
+    Sampler(Context& context, const SamplerDesc& desc);
+
+    ~Sampler();
+
+    Sampler(const Sampler&) = delete;
+    Sampler& operator=(const Sampler&) = delete;
+    Sampler(Sampler&& other) noexcept;
+    Sampler& operator=(Sampler&& other) noexcept;
+
+    [[nodiscard]] VkSampler handle() const noexcept { return sampler_; }
+
+    void destroy() noexcept;
+
+private:
+    VkDevice device_ = VK_NULL_HANDLE;
+    VkSampler sampler_ = VK_NULL_HANDLE;
+};
+
+}  // namespace vkc
+```
+
+The five settings that matter, defaulting to this chapter's choices, and the comment makes
+the design decision explicit: **the sampler is not folded into `Image`**. Vulkan keeps them
+separate, and bundling them would be convenient right up to the moment you want two filters
+on one texture — which is the exact mistake OpenGL made.
+
+One `address_mode` covers U, V and W rather than three fields, because wanting them to
+differ is rare enough to be worth writing out by hand on the day it happens.
+
+### The implementation
+
+```cpp title="code/common/scaffold/src/image.cpp"
+#include "vkc/image.hpp"
+
+#include "vkc/buffer.hpp"
+#include "vkc/check.hpp"
+#include "vkc/context.hpp"
+
+// stb_image's implementation is compiled into this file, and STB_IMAGE_STATIC keeps its
+// symbols private to it. Assimp ships its own copy of stb_image and exports the same
+// names from its static library, so one global definition anywhere in vkcommon would
+// collide with it the moment a chapter links both. A private copy cannot clash.
+#define STB_IMAGE_STATIC
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb_image.h>
+
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <cstring>
+#include <format>
+#include <memory>
+#include <stdexcept>
+#include <utility>
+
+namespace vkc {
+
+uint32_t mip_level_count(uint32_t width, uint32_t height) noexcept {
+    return std::bit_width(std::max(width, height));
+}
+```
+
+The same two `#define`s this chapter's `main.cpp` used, for the same Assimp reason.
+
+```cpp title="code/common/scaffold/src/image.cpp"
+Image::Image(Context& context, const ImageDesc& desc)
+    : device_(context.device()), allocator_(context.allocator()), desc_(desc) {
+    const VkImageCreateInfo image_info{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = desc_.cube ? static_cast<VkImageCreateFlags>(
+                                  VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT)
+                            : 0U,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = desc_.format,
+        .extent = {desc_.extent.width, desc_.extent.height, 1},
+        .mipLevels = desc_.mip_levels,
+        .arrayLayers = desc_.array_layers,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = desc_.usage,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = 0,
+        .pQueueFamilyIndices = nullptr,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+
+    const VmaAllocationCreateInfo alloc_info{
+        .flags = 0,
+        .usage = VMA_MEMORY_USAGE_AUTO,
+        .requiredFlags = 0,
+        .preferredFlags = 0,
+        .memoryTypeBits = 0,
+        .pool = VK_NULL_HANDLE,
+        .pUserData = nullptr,
+        .priority = 0.0F,
+    };
+
+    VK_CHECK(vmaCreateImage(allocator_, &image_info, &alloc_info, &image_, &allocation_,
+                            nullptr));
+
+    const VkImageViewCreateInfo view_info{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .image = image_,
+        .viewType = desc_.cube ? VK_IMAGE_VIEW_TYPE_CUBE : VK_IMAGE_VIEW_TYPE_2D,
+        .format = desc_.format,
+        .components = {},
+        .subresourceRange =
+            {
+                .aspectMask = desc_.aspect,
+                .baseMipLevel = 0,
+                .levelCount = desc_.mip_levels,
+                .baseArrayLayer = 0,
+                .layerCount = desc_.array_layers,
+            },
+    };
+    VK_CHECK(vkCreateImageView(device_, &view_info, nullptr, &view_));
+}
+```
+
+Your `create_image` and `create_texture_view` in one constructor, with the hard-coded
+values replaced by fields of the description. The `cube` flag touches exactly two of them —
+one image creation flag and the view type — which is why it earns a `bool` rather than a
+separate class.
+
+```cpp title="code/common/scaffold/src/image.cpp"
+Image::~Image() { destroy(); }
+
+Image::Image(Image&& other) noexcept
+    : device_(std::exchange(other.device_, VK_NULL_HANDLE)),
+      allocator_(std::exchange(other.allocator_, VK_NULL_HANDLE)),
+      image_(std::exchange(other.image_, VK_NULL_HANDLE)),
+      allocation_(std::exchange(other.allocation_, VK_NULL_HANDLE)),
+      view_(std::exchange(other.view_, VK_NULL_HANDLE)),
+      desc_(std::exchange(other.desc_, {})) {}
+
+Image& Image::operator=(Image&& other) noexcept {
+    if (this != &other) {
+        destroy();
+        device_ = std::exchange(other.device_, VK_NULL_HANDLE);
+        allocator_ = std::exchange(other.allocator_, VK_NULL_HANDLE);
+        image_ = std::exchange(other.image_, VK_NULL_HANDLE);
+        allocation_ = std::exchange(other.allocation_, VK_NULL_HANDLE);
+        view_ = std::exchange(other.view_, VK_NULL_HANDLE);
+        desc_ = std::exchange(other.desc_, {});
+    }
+    return *this;
+}
+
+void Image::destroy() noexcept {
+    if (view_ != VK_NULL_HANDLE) {
+        vkDestroyImageView(device_, view_, nullptr);
+        view_ = VK_NULL_HANDLE;
+    }
+    if (image_ != VK_NULL_HANDLE) {
+        vmaDestroyImage(allocator_, image_, allocation_);
+        image_ = VK_NULL_HANDLE;
+        allocation_ = VK_NULL_HANDLE;
+    }
+}
+```
+
+`vkc::Buffer`'s move and destroy, with one more handle each. `destroy()` frees the **view
+before the image**, which is the reverse of creation order.
+
+The move-assignment guard matters more here than it did for buffers: chapter 1.13 assigns a
+new depth buffer over the old one on every resize, and without the `destroy()` at the top
+that would leak an entire full-screen image each time.
+
+```cpp title="code/common/scaffold/src/image.cpp"
+void Image::transition(VkCommandBuffer cmd, VkImageLayout from, VkImageLayout to,
+                       uint32_t base_mip, uint32_t mip_count) const {
+    const VkImageMemoryBarrier2 barrier{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+        .pNext = nullptr,
+        .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        .dstAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT,
+        .oldLayout = from,
+        .newLayout = to,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = image_,
+        .subresourceRange =
+            {
+                .aspectMask = desc_.aspect,
+                .baseMipLevel = base_mip,
+                .levelCount = mip_count,
+                .baseArrayLayer = 0,
+                // Every layer. A cubemap transitioned one face at a time would leave
+                // the other five in whatever layout they were in, and the mismatch is
+                // undefined behaviour rather than a validation error on most paths.
+                .layerCount = desc_.array_layers,
+            },
+    };
+
+    const VkDependencyInfo dependency{
+        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .pNext = nullptr,
+        .dependencyFlags = 0,
+        .memoryBarrierCount = 0,
+        .pMemoryBarriers = nullptr,
+        .bufferMemoryBarrierCount = 0,
+        .pBufferMemoryBarriers = nullptr,
+        .imageMemoryBarrierCount = 1,
+        .pImageMemoryBarriers = &barrier,
+    };
+
+    vkCmdPipelineBarrier2(cmd, &dependency);
+}
+```
+
+Your `transition`, with two hard-coded values now read from the description: the **aspect**
+and the **layer count**. Both were `COLOR` and `1` in your version because this chapter has
+one colour texture; storing them is what makes the same function correct for a depth buffer
+and for a cubemap.
+
+```cpp title="code/common/scaffold/src/image.cpp"
+namespace {
+
+// Chapter 1.11's mip ladder: blit level n-1 into level n, halved, then park level n-1
+// in the layout the shader wants.
+void generate_mipmaps(VkCommandBuffer cmd, const Image& image) {
+    int mip_width = static_cast<int>(image.extent().width);
+    int mip_height = static_cast<int>(image.extent().height);
+
+    for (uint32_t level = 1; level < image.mip_levels(); ++level) {
+        image.transition(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, level - 1, 1);
+
+        const int next_width = std::max(mip_width / 2, 1);
+        const int next_height = std::max(mip_height / 2, 1);
+
+        const VkImageBlit blit{
+            .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level - 1, 0, 1},
+            .srcOffsets = {{0, 0, 0}, {mip_width, mip_height, 1}},
+            .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1},
+            .dstOffsets = {{0, 0, 0}, {next_width, next_height, 1}},
+        };
+
+        vkCmdBlitImage(cmd, image.handle(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       image.handle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                       VK_FILTER_LINEAR);
+
+        image.transition(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, level - 1, 1);
+
+        mip_width = next_width;
+        mip_height = next_height;
+    }
+
+    image.transition(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                     image.mip_levels() - 1, 1);
+}
+
+}  // namespace
+```
+
+Your ladder, including the final transition of the last level that the loop cannot reach.
+The subresource structs are written positionally here — `{aspect, mipLevel, baseArrayLayer,
+layerCount}` — rather than with designated initialisers, which is the one place this file
+trades a little clarity for four lines instead of sixteen.
+
+```cpp title="code/common/scaffold/src/image.cpp"
+Image create_texture(Context& context, const void* rgba_pixels, VkExtent2D extent,
+                     VkFormat format) {
+    VkFormatProperties properties{};
+    vkGetPhysicalDeviceFormatProperties(context.physical_device(), format, &properties);
+    if ((properties.optimalTilingFeatures &
+         VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) == 0) {
+        throw std::runtime_error(
+            "This GPU cannot linearly filter blits of this format, so mipmaps cannot "
+            "be generated at load time.");
+    }
+
+    const VkDeviceSize size = static_cast<VkDeviceSize>(extent.width) *
+                              static_cast<VkDeviceSize>(extent.height) * 4;
+
+    Image image(context,
+                ImageDesc{
+                    .format = format,
+                    .extent = extent,
+                    .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                             VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                             VK_IMAGE_USAGE_SAMPLED_BIT,
+                    .mip_levels = mip_level_count(extent.width, extent.height),
+                    .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
+                });
+
+    Buffer staging(context.allocator(), size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                   VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                       VMA_ALLOCATION_CREATE_MAPPED_BIT);
+    std::memcpy(staging.mapped(), rgba_pixels, static_cast<size_t>(size));
+
+    immediate_submit(context, [&](VkCommandBuffer cmd) {
+        image.transition(cmd, VK_IMAGE_LAYOUT_UNDEFINED,
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+        const VkBufferImageCopy region{
+            .bufferOffset = 0,
+            .bufferRowLength = 0,
+            .bufferImageHeight = 0,
+            .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+            .imageOffset = {0, 0, 0},
+            .imageExtent = {extent.width, extent.height, 1},
+        };
+        vkCmdCopyBufferToImage(cmd, staging.handle(), image.handle(),
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+        generate_mipmaps(cmd, image);
+    });
+
+    return image;
+}
+```
+
+The whole of this chapter's upload path, from the format check to the staging copy to the
+mip ladder, in one function. The `staging` buffer is a local, so chapter 1.8's lifetime
+lesson applies again: it is destroyed as the function returns, which is after
+`immediate_submit` has waited.
+
+```cpp title="code/common/scaffold/src/image.cpp"
+Image load_texture(Context& context, const std::filesystem::path& path,
+                   VkFormat format) {
+    int width = 0;
+    int height = 0;
+    int channels = 0;
+    // The deleter is not decoration: create_texture throws on a GPU that cannot filter
+    // this format, and a bare stbi_uc* would leak the decoded image on the way out.
+    const std::unique_ptr<stbi_uc, void (*)(void*)> pixels(
+        stbi_load(path.string().c_str(), &width, &height, &channels, STBI_rgb_alpha),
+        stbi_image_free);
+    if (pixels == nullptr) {
+        throw std::runtime_error(
+            std::format("Could not load '{}': {}. Did you run tools/make_textures.py?",
+                        path.string(), stbi_failure_reason()));
+    }
+
+    return create_texture(context, pixels.get(),
+                          {static_cast<uint32_t>(width), static_cast<uint32_t>(height)},
+                          format);
+}
+```
+
+The one genuine improvement over your version. Yours called `stbi_image_free(pixels)`
+explicitly after the memcpy; this wraps the pointer in a `std::unique_ptr` with
+`stbi_image_free` as a **custom deleter**, so the allocation is released however the
+function exits.
+
+The comment says why that matters: `create_texture` throws on a GPU that cannot filter the
+format, and a raw pointer would leak the decoded image on the way out. The
+`void (*)(void*)` in the type is the deleter's function-pointer type, which a `unique_ptr`
+needs spelled out when the deleter is not the default.
+
+```cpp title="code/common/scaffold/src/image.cpp"
+Image load_cubemap(Context& context, const std::array<std::filesystem::path, 6>& faces,
+                   VkFormat format) {
+    // Decode all six first, so that a missing or mis-sized file is discovered before any
+    // GPU memory is committed to it.
+    std::array<std::unique_ptr<stbi_uc, void (*)(void*)>, 6> pixels{
+        {{nullptr, stbi_image_free},
+         {nullptr, stbi_image_free},
+         {nullptr, stbi_image_free},
+         {nullptr, stbi_image_free},
+         {nullptr, stbi_image_free},
+         {nullptr, stbi_image_free}}};
+    int size = 0;
+
+    for (size_t face = 0; face < faces.size(); ++face) {
+        int width = 0;
+        int height = 0;
+        int channels = 0;
+        pixels[face] = {stbi_load(faces[face].string().c_str(), &width, &height,
+                                  &channels, STBI_rgb_alpha),
+                        stbi_image_free};
+        if (pixels[face] == nullptr) {
+            throw std::runtime_error(
+                std::format("Could not load cubemap face '{}': {}",
+                            faces[face].string(), stbi_failure_reason()));
+        }
+        if (width != height) {
+            throw std::runtime_error(std::format(
+                "Cubemap face '{}' is {}x{}; every face must be square.",
+                faces[face].string(), width, height));
+        }
+        if (face == 0) {
+            size = width;
+        } else if (width != size) {
+            throw std::runtime_error(std::format(
+                "Cubemap face '{}' is {}x{}, but the first face is {}x{}; all six must "
+                "match.",
+                faces[face].string(), width, height, size, size));
+        }
+    }
+```
+
+This function belongs to chapter 4.4 and is shown here only because it lives in this file.
+The one idea worth taking now is the **validate-everything-first** shape: all six faces are
+decoded and checked before any GPU memory is committed, so a typo in the fifth filename
+fails before five images have been allocated.
+
+```cpp title="code/common/scaffold/src/image.cpp"
+    const auto extent_side = static_cast<uint32_t>(size);
+    Image image(context, ImageDesc{
+                             .format = format,
+                             .extent = {extent_side, extent_side},
+                             .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                      VK_IMAGE_USAGE_SAMPLED_BIT,
+                             .mip_levels = 1,
+                             .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
+                             .array_layers = 6,
+                             .cube = true,
+                         });
+
+    const VkDeviceSize face_bytes =
+        static_cast<VkDeviceSize>(extent_side) * extent_side * 4;
+
+    // One staging buffer holding the six faces back to back: one allocation and one
+    // submit rather than six of each.
+    Buffer staging(context.allocator(), face_bytes * 6, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                   VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                       VMA_ALLOCATION_CREATE_MAPPED_BIT);
+    for (size_t face = 0; face < faces.size(); ++face) {
+        std::memcpy(static_cast<std::byte*>(staging.mapped()) +
+                        static_cast<size_t>(face_bytes) * face,
+                    pixels[face].get(), static_cast<size_t>(face_bytes));
+    }
+
+    immediate_submit(context, [&](VkCommandBuffer cmd) {
+        image.transition(cmd, VK_IMAGE_LAYOUT_UNDEFINED,
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+        // One region per face. baseArrayLayer is the only field that differs between
+        // them, and it is how the six blocks of the staging buffer find their faces.
+        std::array<VkBufferImageCopy, 6> regions{};
+        for (uint32_t face = 0; face < 6; ++face) {
+            regions[face] = VkBufferImageCopy{
+                .bufferOffset = face_bytes * face,
+                .bufferRowLength = 0,
+                .bufferImageHeight = 0,
+                .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, face, 1},
+                .imageOffset = {0, 0, 0},
+                .imageExtent = {extent_side, extent_side, 1},
+            };
+        }
+        vkCmdCopyBufferToImage(cmd, staging.handle(), image.handle(),
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                               static_cast<uint32_t>(regions.size()), regions.data());
+
+        image.transition(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    });
+
+    return image;
+}
+```
+
+The six faces go into **one** staging buffer back to back, and one
+`vkCmdCopyBufferToImage` with six regions puts each block into its array layer. That is the
+`regionCount` argument earning its keep — the same call this chapter made with one region.
+
+```cpp title="code/common/scaffold/src/image.cpp"
+Sampler::Sampler(Context& context, const SamplerDesc& desc)
+    : device_(context.device()) {
+    const VkSamplerCreateInfo info{
+        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .magFilter = desc.mag_filter,
+        .minFilter = desc.min_filter,
+        .mipmapMode = desc.mipmap_mode,
+        .addressModeU = desc.address_mode,
+        .addressModeV = desc.address_mode,
+        .addressModeW = desc.address_mode,
+        .mipLodBias = 0.0F,
+        .anisotropyEnable = desc.anisotropy ? VK_TRUE : VK_FALSE,
+        .maxAnisotropy = context.gpu_properties().limits.maxSamplerAnisotropy,
+        .compareEnable = VK_FALSE,
+        .compareOp = VK_COMPARE_OP_ALWAYS,
+        .minLod = 0.0F,
+        .maxLod = VK_LOD_CLAMP_NONE,
+        .borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
+        .unnormalizedCoordinates = VK_FALSE,
+    };
+    VK_CHECK(vkCreateSampler(device_, &info, nullptr, &sampler_));
+}
+
+Sampler::~Sampler() { destroy(); }
+
+Sampler::Sampler(Sampler&& other) noexcept
+    : device_(std::exchange(other.device_, VK_NULL_HANDLE)),
+      sampler_(std::exchange(other.sampler_, VK_NULL_HANDLE)) {}
+
+Sampler& Sampler::operator=(Sampler&& other) noexcept {
+    if (this != &other) {
+        destroy();
+        device_ = std::exchange(other.device_, VK_NULL_HANDLE);
+        sampler_ = std::exchange(other.sampler_, VK_NULL_HANDLE);
+    }
+    return *this;
+}
+
+void Sampler::destroy() noexcept {
+    if (sampler_ != VK_NULL_HANDLE) {
+        vkDestroySampler(device_, sampler_, nullptr);
+        sampler_ = VK_NULL_HANDLE;
+    }
+}
+
+}  // namespace vkc
+```
+
+Your `create_sampler`, with five of its fields coming from the description and the rest
+kept exactly as this chapter set them — including `maxAnisotropy` read from the device
+limit rather than hard-coded, and `maxLod` left unclamped.
+
+A `Sampler` holds no allocation, so its move and destroy are the same shape as `Image`'s
+with one handle instead of four.
+
+### And the other stb file
+
+```cpp title="code/common/base/src/stb_impl.cpp"
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include <stb_image_write.h>
+```
+
+Two lines, and the long comment above them in the source is the whole story: this file
+holds the **writing** half of stb, which chapter 1.5's screenshot harness uses, and
+deliberately not the reading half. Nothing exports `stbi_write_*`, so that one can be
+shared globally; `stbi_load` and its 42 companions cannot, which is why both this file and
+`image.cpp` above compile their own private copy with `STB_IMAGE_STATIC`.
 
 ## Running it
 
@@ -332,40 +1517,43 @@ clean instead of crawling.
 
 Two quads: the texture once, and the texture tiled four by four.
 
-The test texture is generated by `tools/make_textures.py` and committed, so there is
-nothing to download. It is built to make this chapter's topics visible: coarse squares
-for magnification, one-pixel lines for minification and mips, a border for the address
-modes, and a triangle so a flipped v is obvious.
+The test texture is generated by `tools/make_textures.py` and committed, so there is nothing to
+download. It is built to make this chapter's topics visible: coarse squares for magnification,
+one-pixel lines for minification and mips, a border for the address modes, and a triangle so a
+flipped v is obvious.
 
-## What changed
+## Words introduced in this chapter
 
-- `Vertex` gained a `glm::vec2 uv`
-- a `VkImage`, `VkImageView` and `VkSampler` exist, plus the mip chain
-- the descriptor set holds a `COMBINED_IMAGE_SAMPLER`, and there is one of it, not two
-- layout transitions moved from the swapchain image to a texture, per mip level
-
-Added to `vkcommon` after this chapter: `vkc::Image` (image, allocation and view
-together), `vkc::load_texture` (the staging copy and the mip ladder above, start to
-finish) and `vkc::Sampler`. The sampler is deliberately a *separate* class, because in
-Vulkan it is a separate object, and the moment you want two filters on one image the
-convenience of bundling them turns into a copy of the texture.
+| | |
+|---|---|
+| **texel** | one pixel of a texture, as distinct from a pixel of the screen |
+| **tiling** | how a driver orders texels in memory; `OPTIMAL` is swizzled for cache |
+| **subresource** | one mip level and array layer — the granularity a layout belongs to |
+| **mip chain** | the texture pre-filtered at halving sizes, to stop minification shimmering |
+| **blit** | a copy that may rescale and filter, unlike a plain copy |
+| **sampler** | the independent object describing filtering, wrapping and anisotropy |
+| **anisotropic filtering** | extra samples along the stretched axis of a glancing surface |
+| **array layer** | one image stacked inside another; six of them make a cubemap |
+| **trilinear filtering** | blending between two mip levels as well as between texels |
+| **combined image sampler** | one descriptor carrying both a view and a sampler |
 
 ## Exercises
 
-1. Set `magFilter` to `VK_FILTER_NEAREST` and make the left quad much larger. Crisp
-   texel squares. Now set `minFilter` to `NEAREST` too and look at the right-hand quad.
-2. Set `mipmapMode` to `VK_SAMPLER_MIPMAP_MODE_NEAREST`, then set `minLod` to `3.0`.
-   You are now forcing a blurrier level than the hardware would choose, which is exactly
-   what a `mipLodBias` does — and what some games expose as a "texture quality" slider.
-3. Force `mip_levels_` to 1 and delete the `generate_mipmaps` call, keeping the one
-   transition to `SHADER_READ_ONLY_OPTIMAL`. The tiled quad starts to shimmer. Resize
-   the window slowly to see it move.
-4. Change both address modes to `VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE` and look at the
-   tiled quad. Then `MIRRORED_REPEAT`, and note the border lines now meet.
+1. Set `magFilter` to `VK_FILTER_NEAREST` and make the left quad much larger. Crisp texel squares.
+   Now set `minFilter` to `NEAREST` too and look at the right-hand quad.
+2. Set `mipmapMode` to `VK_SAMPLER_MIPMAP_MODE_NEAREST`, then set `minLod` to `3.0`. You are now
+   forcing a blurrier level than the hardware would choose — which is what a `mipLodBias` does.
+3. Force `mip_levels_` to 1 and delete the `generate_mipmaps` call, keeping the one transition to
+   `SHADER_READ_ONLY_OPTIMAL`. The tiled quad starts to shimmer.
+4. Change both address modes to `CLAMP_TO_EDGE` and look at the tiled quad. Then `MIRRORED_REPEAT`,
+   and note the border lines now meet.
 5. Change the image format to `VK_FORMAT_R8G8B8A8_UNORM` in both `create_image` and
-   `create_texture_view`. Everything gets noticeably brighter and flatter, because the
-   sRGB-to-linear conversion is no longer happening and the values are being treated as
-   if they were already linear.
-6. Swap the `u` and `v` in `frag_uv` in the vertex shader. The triangle now points right.
-   That is what a transposed texture coordinate looks like, and recognising it saves
-   time later.
+   `create_texture_view`. Everything gets brighter and flatter, because the sRGB-to-linear
+   conversion is no longer happening.
+6. Swap `input.uv.x` and `input.uv.y` where `output.uv` is written. The triangle in the texture
+   points a different way — that is what a transposed texture coordinate looks like.
+7. Delete the final `transition` after the mip loop. The image still draws, because nine of its ten
+   levels are in the right layout, and the validation layers name the tenth precisely.
+
+Next: [transformations](/getting-started/transformations/) — matrices, and the one Slang setting
+that silently transposes them.

@@ -6,9 +6,16 @@
 // intend to use, which layers you want wrapped around your calls, and which
 // instance-level extensions you need. Everything else in Vulkan is created from it,
 // directly or indirectly.
+//
+// The window is no longer built by hand. Chapter 1.1 wrote SDL_Init, SDL_CreateWindow
+// and the destruction that pairs with them, and explained every line; from here it is
+// vkc::Window, which is that same code with a destructor attached. This is the first
+// time the scaffold carries something, and it is the pattern for the rest of the
+// series: what a chapter taught, the next chapter uses.
 
 #include <vkc/capture.hpp>
 #include <vkc/check.hpp>
+#include <vkc/window.hpp>
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
@@ -90,22 +97,26 @@ VkDebugUtilsMessengerCreateInfoEXT debug_messenger_info() {
 
 class InstanceApp {
 public:
-    explicit InstanceApp(const vkc::Args& args) : args_(args) {
-        init_window();
+    explicit InstanceApp(const vkc::Args& args)
+        : args_(args),
+          // Chapter 1.1's window, now built by the scaffold. Resizable except on a
+          // --screenshot run, for the reason 1.1 gave: a tiling window manager picks
+          // the size of a resizable window and the reference images would move.
+          window_("LearnVulkan - The Instance", args.width, args.height,
+                  /*resizable=*/args.screenshot.empty()) {
         init_instance();
     }
 
     ~InstanceApp() {
+        // The window destroys itself. Only what this chapter created is undone here,
+        // and still in strict reverse order: the messenger was made from the instance,
+        // so it goes first.
         if (debug_messenger_ != VK_NULL_HANDLE) {
             vkDestroyDebugUtilsMessengerEXT(instance_, debug_messenger_, nullptr);
         }
         if (instance_ != VK_NULL_HANDLE) {
             vkDestroyInstance(instance_, nullptr);
         }
-        if (window_ != nullptr) {
-            SDL_DestroyWindow(window_);
-        }
-        SDL_Quit();
     }
 
     InstanceApp(const InstanceApp&) = delete;
@@ -136,24 +147,6 @@ public:
     }
 
 private:
-    void init_window() {
-        if (!SDL_Init(SDL_INIT_VIDEO)) {
-            throw std::runtime_error(std::format("SDL_Init failed: {}", SDL_GetError()));
-        }
-        // Resizable, except on a --screenshot run: tiling window managers choose the size
-        // of a resizable window themselves, which would make the book's reference images
-        // depend on whatever else is open. A fixed-size window gets the size asked for.
-        window_ = SDL_CreateWindow("LearnVulkan - The Instance",
-                                   static_cast<int>(args_.width),
-                                   static_cast<int>(args_.height),
-                                   SDL_WINDOW_VULKAN |
-                                   (args_.screenshot.empty() ? SDL_WINDOW_RESIZABLE : 0));
-        if (window_ == nullptr) {
-            throw std::runtime_error(
-                std::format("SDL_CreateWindow failed: {}", SDL_GetError()));
-        }
-    }
-
     void init_instance() {
         // volk finds the Vulkan loader and fetches the three or four entry points that
         // exist before an instance does. Every other vk* function is a null pointer
@@ -175,6 +168,9 @@ private:
         // SDL knows which surface extension this platform needs -- VK_KHR_surface
         // plus VK_KHR_wayland_surface, VK_KHR_win32_surface, and so on. Asking it
         // rather than hard-coding is what keeps this file platform-independent.
+        //
+        // vkc::Window wraps this same call for later chapters; it is written out here
+        // because choosing an instance's extensions is this chapter's subject.
         uint32_t sdl_extension_count = 0;
         const char* const* sdl_extensions =
             SDL_Vulkan_GetInstanceExtensions(&sdl_extension_count);
@@ -254,7 +250,7 @@ private:
     }
 
     vkc::Args args_;
-    SDL_Window* window_ = nullptr;
+    vkc::Window window_;
     VkInstance instance_ = VK_NULL_HANDLE;
     VkDebugUtilsMessengerEXT debug_messenger_ = VK_NULL_HANDLE;
     std::vector<const char*> enabled_extensions_;

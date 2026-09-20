@@ -1,6 +1,6 @@
 ---
 title: Memory and Buffers
-description: VMA, staging uploads, vertex and index buffers - getting geometry out of the shader and into GPU memory.
+description: VMA, staging uploads, vertex and index buffers - getting geometry out of the shader and into GPU memory, every line of it.
 sidebar:
   order: 8
 ---
@@ -10,256 +10,902 @@ sidebar:
   <figcaption>Chapter 1.8: four vertices in GPU memory, drawn as two triangles through an index buffer.</figcaption>
 </figure>
 
-Chapter 1.7's triangle had its vertices written into the shader. That works for exactly
-one triangle. Everything you will ever draw after this lives in GPU memory, and this
-chapter is about how it gets there.
+Chapter 1.7's triangle had its vertices written into the shader. That works for exactly one
+triangle. Everything you will ever draw after this lives in GPU memory, and this chapter is
+about how it gets there.
 
 ## First, the scaffold
 
-This is the chapter the last seven have been building towards. From here on the samples
-link `vkcommon`, and `main.cpp` starts like this:
+The scaffold has been growing since chapter 1.2, a piece at a time, and this is the chapter
+where the last of it arrives. Chapters 1.1 to 1.7 each wrote their own subject by hand and
+handed it on: the window, the instance, the device, the swapchain, the frame loop, and the
+pipeline builder. From here there is nothing left to withhold, so this sample links the whole
+of `vkcommon` rather than naming pieces — its `CMakeLists.txt` has no `SCAFFOLD` line at all.
+
+```cmake title="code/src/1.getting_started/memory_and_buffers/CMakeLists.txt"
+# The first chapter that links vkcommon rather than building everything by hand, so
+# there is no NO_SCAFFOLD here.
+add_chapter(1.8.memory_and_buffers
+    SOURCES main.cpp
+    SHADERS quad.slang
+)
+```
+
+Neither `SCAFFOLD` nor `NO_SCAFFOLD`, which is the third of the three cases chapter 1.1
+described: link the whole scaffold. Every chapter from here to the end of the series looks
+like this.
+
+Two things arrive with it.
+
+**`vkc::PipelineBuilder`** is chapter 1.7's `create_pipeline`, with the parts a chapter needs
+to vary turned into methods and everything else keeping 1.7's value. Its `build()` is those
+same eleven structs:
+
+```cpp title="code/common/scaffold/src/pipeline.cpp"
+    // The counts matter even though the pointers are null: the pipeline needs to know
+    // there is one viewport and one scissor, and the values arrive at record time.
+    const VkPipelineViewportStateCreateInfo viewport_state{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .viewportCount = 1,
+        .pViewports = nullptr,
+        .scissorCount = 1,
+        .pScissors = nullptr,
+    };
+```
+
+with the hard-coded values of 1.7 replaced by members:
+
+```cpp title="code/common/scaffold/src/pipeline.cpp"
+        .polygonMode = polygon_mode_,
+        .cullMode = cull_mode_,
+        .frontFace = front_face_,
+```
+
+and a guard for the three things a pipeline cannot do without:
+
+```cpp title="code/common/scaffold/src/pipeline.cpp"
+VkPipeline PipelineBuilder::build() const {
+    if (module_ == VK_NULL_HANDLE) {
+        throw std::runtime_error("PipelineBuilder::build: shaders() was never called");
+    }
+```
+
+**`vkc::App`** is the frame loop of 1.5 and 1.6 with the event handling of 1.1 wrapped around
+it. It could not exist as a helper until both had been taught, which is why it appears now and
+not earlier:
+
+```cpp title="code/common/scaffold/src/app.cpp"
+        std::optional<FrameInfo> frame = frames_->begin();
+        if (!frame.has_value()) {
+            swapchain_dirty_ = true;
+            continue;
+        }
+
+        // Swapchain images come back in UNDEFINED layout (their previous contents are
+        // not ours to keep) and must be in COLOR_ATTACHMENT_OPTIMAL before anything
+        // renders into them.
+        transition_image(frame->cmd, frame->image, VK_IMAGE_LAYOUT_UNDEFINED,
+                         VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
+        on_render(*frame);
+```
+
+That is chapter 1.7's `run()`, with `record()` replaced by a virtual call. A sample now
+overrides three functions instead of writing a loop:
+
+```cpp title="code/common/scaffold/include/vkc/app.hpp"
+    // Called once after the context and swapchain exist, before the first frame.
+    virtual void on_start() {}
+    // Called with an open command buffer, once per frame.
+    virtual void on_render(const FrameInfo& frame) = 0;
+    // Called before anything is destroyed, with the GPU already idle.
+    virtual void on_shutdown() {}
+```
+
+:::note[Nothing in `vkcommon` is new]
+Every line of it is code you have already read. `window.cpp` is 1.1, `instance.cpp` and
+`check.cpp` are 1.2, `device.cpp` is 1.3, `swapchain.cpp` is 1.4, `context.cpp` and
+`capture.cpp` are 1.5, `frame.cpp` is 1.5 and 1.6, `pipeline.cpp` and `paths.cpp` are 1.7.
+Each of those chapters ends with the finished file written out in full.
+
+The two exceptions are `app.cpp` and `buffer.cpp`, which belong to *this* chapter. Both are
+below.
+
+You can read the lot at `code/common/scaffold/` and `code/common/base/`, and if any of it
+looks unfamiliar, the chapter that wrote it is the place to go.
+:::
+
+## The application loop, in full
+
+`vkc::App` is the one piece of the scaffold that is not simply an earlier chapter moved. It
+is a **composition** — chapter 1.1's event loop, 1.5 and 1.6's frame loop and 1.7's
+`run()`, arranged so a sample overrides three functions instead of writing a loop. Since
+every chapter from here on inherits from it, it is written out here in full.
+
+```cpp title="code/common/scaffold/include/vkc/app.hpp"
+#include "vkc/capture.hpp"
+#include "vkc/context.hpp"
+#include "vkc/frame.hpp"
+#include "vkc/swapchain.hpp"
+#include "vkc/window.hpp"
+
+#include <SDL3/SDL_events.h>
+
+#include <cstdint>
+#include <filesystem>
+#include <memory>
+#include <string>
+
+namespace vkc {
+
+class App {
+public:
+    // Everything in Args (size, frame limit, screenshot path, validation) plus the
+    // window title. Args is shared with the hand-written chapters so that
+    // tools/capture.py can drive every sample in the book identically.
+    struct Options : Args {
+        std::string title = "LearnVulkan";
+    };
+
+    explicit App(Options options);
+    virtual ~App();
+
+    App(const App&) = delete;
+    App& operator=(const App&) = delete;
+    App(App&&) = delete;
+    App& operator=(App&&) = delete;
+```
+
+`Options` **inherits** from `Args` rather than containing one. That is what lets
+`App::parse_args` hand the base part to the same `vkc::parse_args` chapter 1.1 wrote, so
+there is one command-line parser for the whole book and `--frames 90` means the same thing
+in every sample.
+
+The destructor is **`virtual`**, which matters for any class meant to be inherited from:
+deleting a derived object through a base pointer with a non-virtual destructor is undefined
+behaviour, and the derived part never gets destroyed.
+
+```cpp title="code/common/scaffold/include/vkc/app.hpp"
+    [[nodiscard]] static Options parse_args(int argc, char** argv, Options defaults);
+
+    int run();
+
+protected:
+    // Called once after the context and swapchain exist, before the first frame.
+    virtual void on_start() {}
+    // Called with an open command buffer, once per frame.
+    virtual void on_render(const FrameInfo& frame) = 0;
+    // Called before anything is destroyed, with the GPU already idle.
+    virtual void on_shutdown() {}
+    // Called after the swapchain has been rebuilt at a new size.
+    virtual void on_resize(VkExtent2D /*extent*/) {}
+
+    // Called for every SDL event, before App itself looks at it. Quit, Escape and
+    // resize are still handled by App regardless of what a sample does here.
+    virtual void on_event(const SDL_Event& /*event*/) {}
+```
+
+Five hooks, and the difference between them is worth reading carefully.
+
+`on_render` is **pure virtual** — the `= 0` — so it has no default and a derived class
+*must* provide one. An `App` that draws nothing is not a thing worth having, and the
+compiler enforces it.
+
+The other four have empty bodies, so a sample overrides only what it needs. Chapter 1.8
+uses `on_start`, `on_render` and `on_shutdown`; `on_resize` waits until 1.13 has a depth
+buffer to rebuild, and `on_event` until 1.14 reads input.
+
+They are **`protected`**, not public: they are called by the base class, never from outside.
+
+`on_shutdown` is documented as running with the GPU already idle, which is the guarantee
+that lets a sample destroy its pipeline without thinking about frames in flight.
+
+```cpp title="code/common/scaffold/include/vkc/app.hpp"
+    [[nodiscard]] Context& context() noexcept { return *context_; }
+    [[nodiscard]] Swapchain& swapchain() noexcept { return *swapchain_; }
+    [[nodiscard]] Window& window() noexcept { return *window_; }
+
+    // Seconds since the first frame, and since the previous one.
+    [[nodiscard]] float elapsed() const noexcept { return elapsed_; }
+    [[nodiscard]] float delta_time() const noexcept { return delta_time_; }
+
+private:
+    bool poll_events();
+    void rebuild_swapchain();
+
+    Options options_;
+    std::unique_ptr<Window> window_;
+    std::unique_ptr<Context> context_;
+    std::unique_ptr<Swapchain> swapchain_;
+    std::unique_ptr<FrameContext> frames_;
+
+    Capture capture_;
+
+    bool swapchain_dirty_ = false;
+    bool running_ = true;
+    uint64_t frames_rendered_ = 0;
+    float elapsed_ = 0.0F;
+    float delta_time_ = 0.0F;
+    uint64_t last_tick_ = 0;
+};
+
+}  // namespace vkc
+```
+
+The four objects every chapter from 1.7 declared by hand, now owned here in dependency
+order. They are `unique_ptr`s for chapter 1.4's reason: each needs the one before it to
+exist first, so they cannot be built in a member initialiser list.
+
+`elapsed()` and `delta_time()` are the two clocks. `elapsed` is what chapter 1.12 animates
+from; `delta_time` is what 1.14's camera moves by.
+
+```cpp title="code/common/scaffold/src/app.cpp"
+#include "vkc/app.hpp"
+
+#include "vkc/check.hpp"
+
+#include <SDL3/SDL.h>
+#include <spdlog/spdlog.h>
+
+#include <optional>
+#include <utility>
+
+namespace vkc {
+App::Options App::parse_args(int argc, char** argv, Options defaults) {
+    // The flags themselves are shared with every hand-written chapter, so they are
+    // parsed in one place. Only the title is App's own.
+    static_cast<Args&>(defaults) = vkc::parse_args(argc, argv, defaults);
+    return defaults;
+}
+```
+
+`static_cast<Args&>(defaults)` is the inheritance doing its work: it takes a reference to
+just the `Args` part of the `Options` object, passes that to chapter 1.1's parser, and
+assigns the result back into it. The `title` field is untouched, because the base parser
+does not know it exists.
+
+```cpp title="code/common/scaffold/src/app.cpp"
+App::App(Options options) : options_(std::move(options)) {
+    window_ = std::make_unique<Window>(options_.title, options_.width, options_.height,
+                                       /*resizable=*/options_.screenshot.empty());
+
+    const Context::Config config{
+        .app_name = options_.title,
+        .enable_validation = options_.validation,
+    };
+    context_ = std::make_unique<Context>(config, *window_);
+    swapchain_ = std::make_unique<Swapchain>(*context_, *window_);
+    frames_ = std::make_unique<FrameContext>(*context_, *swapchain_);
+
+    capture_.init(context_->device(), context_->allocator());
+}
+
+App::~App() = default;
+```
+
+The constructor is every sample's initialiser list from 1.5 through 1.7, written once. The
+`/*resizable=*/` comment on a bare `false` is a habit worth copying — a lone boolean
+argument at a call site says nothing about what it means.
+
+`= default` on the destructor still matters. It has to be **defined in the `.cpp`** rather
+than the header, because destroying a `unique_ptr<Window>` requires `Window` to be a
+complete type at the point the destructor is generated, and this is the file where it is.
+
+```cpp title="code/common/scaffold/src/app.cpp"
+int App::run() {
+    on_start();
+
+    last_tick_ = SDL_GetPerformanceCounter();
+    const double tick_frequency =
+        static_cast<double>(SDL_GetPerformanceFrequency());
+
+    while (running_) {
+        if (!poll_events()) {
+            break;
+        }
+
+        // A minimised window has a zero-sized drawable. There is nothing to render
+        // into and the swapchain cannot be built, so idle rather than spin.
+        if (window_->is_minimised()) {
+            SDL_WaitEvent(nullptr);
+            continue;
+        }
+
+        if (swapchain_dirty_) {
+            rebuild_swapchain();
+        }
+```
+
+`on_start()` is called **before** the loop rather than from the constructor, and the reason
+is a C++ rule worth knowing: virtual calls from a constructor do not dispatch to the
+derived class. During the base constructor the derived part does not exist yet, so a
+virtual call resolves to the base's own version. Calling `on_start()` here, after
+construction is complete, is what makes `QuadApp::on_start` actually run.
+
+`SDL_GetPerformanceCounter` is a monotonic tick count and `SDL_GetPerformanceFrequency` is
+how many ticks a second, so dividing gives seconds.
+
+```cpp title="code/common/scaffold/src/app.cpp"
+        const uint64_t now = SDL_GetPerformanceCounter();
+        delta_time_ = static_cast<float>(
+            static_cast<double>(now - last_tick_) / tick_frequency);
+        last_tick_ = now;
+        elapsed_ += delta_time_;
+
+        std::optional<FrameInfo> frame = frames_->begin();
+        if (!frame.has_value()) {
+            swapchain_dirty_ = true;
+            continue;
+        }
+
+        // Swapchain images come back in UNDEFINED layout (their previous contents are
+        // not ours to keep) and must be in COLOR_ATTACHMENT_OPTIMAL before anything
+        // renders into them.
+        transition_image(frame->cmd, frame->image, VK_IMAGE_LAYOUT_UNDEFINED,
+                         VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
+        on_render(*frame);
+```
+
+The subtraction happens in `uint64_t` and the division in `double`, then the result narrows
+to `float`. Doing it the other way — converting the tick counts to float first — loses
+precision badly, because a performance counter is a large number and the difference between
+two consecutive ones is tiny.
+
+The **entry transition happens here, not in the sample**. Every chapter from 1.5 to 1.7
+wrote that barrier itself; from now on a sample's `on_render` receives an image already in
+`COLOR_ATTACHMENT_OPTIMAL`.
+
+```cpp title="code/common/scaffold/src/app.cpp"
+        // A requested screenshot is taken on the final frame, while this image is
+        // still ours. Once it has been handed to vkQueuePresentKHR it may not be
+        // read, copied or transitioned again.
+        const bool capture_this_frame =
+            !options_.screenshot.empty() && options_.frame_limit != 0 &&
+            frames_rendered_ + 1 == options_.frame_limit;
+
+        if (capture_this_frame) {
+            capture_.record(frame->cmd, frame->image, frame->extent);
+        } else {
+            // ...and in PRESENT_SRC_KHR before the presentation engine will take them.
+            transition_image(frame->cmd, frame->image,
+                             VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                             VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+        }
+
+        if (!frames_->end(*frame)) {
+            swapchain_dirty_ = true;
+        }
+
+        ++frames_rendered_;
+
+        if (options_.frame_limit != 0 && frames_rendered_ >= options_.frame_limit) {
+            running_ = false;
+        }
+    }
+
+    context_->wait_idle();
+
+    if (capture_.has_pending_capture()) {
+        capture_.write(options_.screenshot, swapchain_->format());
+    }
+    capture_.destroy();
+
+    on_shutdown();
+    return 0;
+}
+```
+
+The exit transition and the capture hook, exactly as chapter 1.5 arranged them.
+
+The shutdown order is the guarantee the header promised: `wait_idle()`, then write any
+pending screenshot, then `on_shutdown()`. A sample's own destruction therefore always
+happens with the GPU idle and with nothing of `App`'s torn down yet.
+
+```cpp title="code/common/scaffold/src/app.cpp"
+bool App::poll_events() {
+    SDL_Event event;
+    while (SDL_PollEvent(&event)) {
+        // Samples see every event first. Nothing here can suppress the window
+        // management below, which a chapter should never have to think about.
+        on_event(event);
+
+        switch (event.type) {
+            case SDL_EVENT_QUIT:
+                return false;
+            case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+                return false;
+            case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+                swapchain_dirty_ = true;
+                break;
+            case SDL_EVENT_KEY_DOWN:
+                if (event.key.key == SDLK_ESCAPE) {
+                    return false;
+                }
+                break;
+            default:
+                break;
+        }
+    }
+    return true;
+}
+
+void App::rebuild_swapchain() {
+    swapchain_->recreate();
+    frames_->on_swapchain_recreated();
+    swapchain_dirty_ = false;
+    on_resize(swapchain_->extent());
+}
+
+}  // namespace vkc
+```
+
+Chapter 1.1's event loop, with `on_event` spliced in ahead of it. The ordering is
+deliberate and the comment says why: a sample sees every event **first**, but nothing it
+does can stop the window closing. A chapter cannot accidentally make its own window
+unclosable.
+
+Returning `false` rather than setting `running_` lets the loop `break` immediately instead
+of finishing the current frame.
+
+`rebuild_swapchain` is chapter 1.7's three lines plus the `on_resize` notification, which
+is how a sample learns it needs to rebuild anything sized to the window.
+
+## New includes
+
+```cpp title="code/src/1.getting_started/memory_and_buffers/main.cpp"
+#include <vkc/app.hpp>
+#include <vkc/check.hpp>
+#include <vkc/pipeline.hpp>
+
+#include <glm/glm.hpp>
+#include <spdlog/spdlog.h>
+
+#include <array>
+#include <cstddef>
+#include <cstdlib>
+#include <cstring>
+#include <exception>
+#include <span>
+```
+
+No SDL, no Slang, no volk, no window, no swapchain. `vkc/app.hpp` brings all of them.
+`<cstddef>` is for `offsetof`, `<cstring>` for `std::memcpy`, and **glm** makes its first
+appearance — it is the maths library for the rest of the series.
 
 ```cpp title="code/src/1.getting_started/memory_and_buffers/main.cpp"
 class QuadApp : public vkc::App {
+public:
+    using vkc::App::App;
+
 protected:
-    void on_start() override { /* create resources */ }
-    void on_render(const vkc::FrameInfo& frame) override { /* record one frame */ }
-    void on_shutdown() override { /* destroy resources */ }
-};
+    void on_start() override {
+        create_geometry();
+        create_pipeline();
+    }
 ```
 
-`vkc::App` owns the window, the instance, the device, the swapchain and the frame loop.
-`on_render` is handed an open command buffer with a swapchain image already transitioned
-to `COLOR_ATTACHMENT_OPTIMAL`.
+`using vkc::App::App` inherits the base constructor, since this class adds nothing to it.
 
-:::note[Nothing in `vkcommon` is new]
-Every line of it is code from chapters 1.1 to 1.7, moved rather than written. `window.cpp`
-is 1.1, `context.cpp` is 1.2 and 1.3, `swapchain.cpp` is 1.4, `frame.cpp` is 1.5 and 1.6,
-`pipeline.cpp` is 1.7. You can read the lot at `code/common/scaffold/`, and if any of it
-looks unfamiliar, the chapter that wrote it is the place to go.
+```cpp title="code/src/1.getting_started/memory_and_buffers/main.cpp"
+    void on_shutdown() override {
+        const VkDevice device = context().device();
 
-From now on each chapter says explicitly what it added to the scaffold and what it took
-out of `main.cpp`.
-:::
+        vkDestroyPipeline(device, pipeline_, nullptr);
+        vkDestroyPipelineLayout(device, pipeline_layout_, nullptr);
+
+        destroy_buffer(index_buffer_);
+        destroy_buffer(vertex_buffer_);
+    }
+```
+
+The strict reverse-order rule still applies, but only to *this* chapter's objects. `vkc::App`
+calls `on_shutdown` after waiting for the device to go idle and before tearing down anything of
+its own, so the ordering question is confined to six lines.
 
 ## A buffer is not memory
 
-This is the idea the whole chapter rests on, and it is the one that surprises people
-coming from OpenGL, where `glBufferData` allocates and uploads in a single call.
+This is the idea the whole chapter rests on, and it is the one that surprises people coming
+from OpenGL, where `glBufferData` allocates and uploads in a single call.
 
-In Vulkan, `vkCreateBuffer` gives you a `VkBuffer` that has **no memory behind it at
-all**. It is a description: this many bytes, used in these ways. Getting memory attached
-takes three more steps:
+In Vulkan, `vkCreateBuffer` gives you a `VkBuffer` that has **no memory behind it at all**. It
+is a description: this many bytes, used in these ways.
 
-1. ask the buffer what its memory requirements are — size, alignment, and which memory
-   types are acceptable
-2. look through the physical device's memory types for one that is both acceptable *and*
-   has the properties you need, such as being visible to the CPU
-3. `vkAllocateMemory`, then `vkBindBufferMemory` to attach it
+```
+   vkCreateBuffer()          → a VkBuffer describing 96 bytes, no memory
+   vkGetBufferMemoryRequirements() → "96 bytes, 16-byte aligned, memory types 0b1101 will do"
+   find a memory type       → which of the device's types is both allowed and host-visible?
+   vkAllocateMemory()       → a VkDeviceMemory
+   vkBindBufferMemory()     → now the buffer has somewhere to live
+```
 
-And then there is a trap waiting. `maxMemoryAllocationCount` is commonly **4096**. One
-`vkAllocateMemory` per buffer runs out of allocations on a scene of any size, so a real
-program allocates a few large blocks and hands out slices of them — writing a memory
-allocator, complete with alignment and free-list management, before drawing anything.
+Each step has a function. `vkGetBufferMemoryRequirements` reports how many bytes the buffer
+really needs — which may be more than you asked for — what alignment it demands, and a
+bitmask of which of the device's memory types are acceptable. `vkAllocateMemory` then
+produces a `VkDeviceMemory`, which is the actual block, and `vkBindBufferMemory` attaches
+it to the buffer. Only after that third call is the buffer usable.
+
+Sizes and offsets throughout this API are `VkDeviceSize`, a 64-bit unsigned integer. It is
+not `size_t`: GPU memory is addressed independently of the host, and a 32-bit host can
+perfectly well drive a GPU with more than 4 GiB of it.
+
+And then a trap is waiting. `maxMemoryAllocationCount` is commonly **4096**. One
+`vkAllocateMemory` per buffer runs out of allocations on a scene of any size, so a real program
+allocates a few large blocks and hands out slices of them — writing a memory allocator,
+complete with alignment and free-list management, before drawing anything.
 
 ## Which is why we use VMA
 
-The [Vulkan Memory Allocator](https://gpuopen.com/vulkan-memory-allocator/) is AMD's
-library that does all of the above, and it is close to universal in Vulkan code. It
-suballocates from large blocks, picks the memory type, respects alignment, and hands
-back a single call:
+The [Vulkan Memory Allocator](https://gpuopen.com/vulkan-memory-allocator/) does all of the
+above and is close to universal in Vulkan code. It suballocates from large blocks, picks the
+memory type, and respects alignment:
 
-```cpp title="code/src/1.getting_started/memory_and_buffers/main.cpp"
-VK_CHECK(vmaCreateBuffer(context().allocator(), &buffer_info, &alloc_info,
-                         &buffer.handle, &buffer.allocation, &buffer.info));
+```
+   VMA block (256 MiB, device-local)
+   ┌──────────┬──────────┬────────────┬─────────────────────────────┐
+   │ vertices │ indices  │  texture   │  free                       │
+   └──────────┴──────────┴────────────┴─────────────────────────────┘
+     one vkAllocateMemory, many VkBuffers
 ```
 
-Two handles come back, and both must be kept. The `VkBuffer` is what Vulkan commands
-take; the `VmaAllocation` is VMA's record of which block the memory came from, needed to
-free it again.
-
-The buffer side is ordinary Vulkan:
-
 ```cpp title="code/src/1.getting_started/memory_and_buffers/main.cpp"
-const VkBufferCreateInfo buffer_info{
-    .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-    .size = size,
-    .usage = usage,
-    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+struct Buffer {
+    VkBuffer handle = VK_NULL_HANDLE;
+    VmaAllocation allocation = VK_NULL_HANDLE;
+    VmaAllocationInfo info{};
 };
 ```
 
-`usage` is a promise about what the buffer is for, and the driver picks memory and
+Two handles and a block of information, and all three must be kept. The `VkBuffer` is what
+Vulkan commands take; the `VmaAllocation` is VMA's record of which block the memory came from,
+needed to free it again; `VmaAllocationInfo` carries the mapped pointer, among other things.
+
+```cpp title="code/src/1.getting_started/memory_and_buffers/main.cpp"
+    [[nodiscard]] Buffer create_buffer(VkDeviceSize size, VkBufferUsageFlags usage,
+                                       VmaAllocationCreateFlags flags,
+                                       VmaMemoryUsage memory_usage) {
+        const VkBufferCreateInfo buffer_info{
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .size = size,
+            .usage = usage,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .queueFamilyIndexCount = 0,
+            .pQueueFamilyIndices = nullptr,
+        };
+```
+
+`usage` is a **promise** about what the buffer is for, and the driver picks memory and
 alignment to suit it. It is also enforced: binding a buffer as a vertex buffer without
 `VK_BUFFER_USAGE_VERTEX_BUFFER_BIT` is a validation error, not a silent slowdown.
 
-The allocation side is where you say what you want from the *memory*:
-
 ```cpp title="code/src/1.getting_started/memory_and_buffers/main.cpp"
-const VmaAllocationCreateInfo alloc_info{
-    .flags = flags,
-    .usage = memory_usage,
-};
+        const VmaAllocationCreateInfo alloc_info{
+            .flags = flags,
+            .usage = memory_usage,
+            .requiredFlags = 0,
+            .preferredFlags = 0,
+            .memoryTypeBits = 0,
+            .pool = VK_NULL_HANDLE,
+            .pUserData = nullptr,
+            .priority = 0.0F,
+        };
+
+        Buffer buffer{};
+        VK_CHECK(vmaCreateBuffer(context().allocator(), &buffer_info, &alloc_info,
+                                 &buffer.handle, &buffer.allocation, &buffer.info));
+        return buffer;
+    }
+
+    void destroy_buffer(Buffer& buffer) noexcept {
+        if (buffer.handle != VK_NULL_HANDLE) {
+            vmaDestroyBuffer(context().allocator(), buffer.handle, buffer.allocation);
+            buffer = {};
+        }
+    }
 ```
 
-`VMA_MEMORY_USAGE_AUTO` means "you work it out from the buffer usage", which is the
-modern VMA style and almost always right. The `flags` are where the interesting choice
-is, and to make it we need to know what kinds of memory exist.
+This is where you say what you want from the *memory* rather than the buffer.
+`VMA_MEMORY_USAGE_AUTO` means "work it out from the buffer usage", which is the modern VMA
+style and almost always right — the `requiredFlags`/`preferredFlags`/`memoryTypeBits` trio is
+the manual override and stays zero.
+
+One call frees both the buffer and its allocation, and they must go together —
+`vkDestroyBuffer` alone would leak the memory.
 
 ## Host-visible and device-local
 
-Chapter 1.3 printed the memory heaps of your GPU. On a discrete card they look roughly
-like this:
+Chapter 1.3 printed the memory heaps of your GPU. This is the chapter where the difference
+between them starts costing you something:
 
 ```
-heap 0: 16376 MiB (device local)
-heap 1: 23868 MiB
-heap 2:   246 MiB (device local)
+   heap 0  device-local     GPU reads at ~700 GB/s    CPU cannot see it
+   heap 1  host-visible     GPU reads at ~25 GB/s     CPU writes directly
 ```
 
-Heap 0 is the memory on the card. The GPU reads it at hundreds of gigabytes per second.
-The CPU cannot see it at all.
-
-Heap 1 is ordinary system RAM. The CPU writes it directly; the GPU reaches it across
-PCIe at maybe a thirtieth of the speed.
-
-Heap 2 is the small device-local heap the CPU *can* write — a window into video memory
-opened by the BIOS. With Resizable BAR enabled this one grows to cover the whole card.
-
-So memory the CPU can write and memory the GPU likes best are, on a discrete GPU,
-usually different memory. Data that never changes belongs in device-local memory, and
-the CPU cannot put it there directly. It has to be copied.
+Data that never changes belongs in device-local memory, and the CPU cannot put it there
+directly. It has to be copied.
 
 ## Staging
 
-The pattern is called a **staging upload** and it is three steps.
-
-First, a buffer the CPU can write, whose only purpose is to be the source of a copy:
-
 ```cpp title="code/src/1.getting_started/memory_and_buffers/main.cpp"
-const Buffer staging =
-    create_buffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                  VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
-                      VMA_ALLOCATION_CREATE_MAPPED_BIT,
-                  VMA_MEMORY_USAGE_AUTO);
+    [[nodiscard]] Buffer upload_to_device_local(const void* data, VkDeviceSize size,
+                                                VkBufferUsageFlags usage) {
+        const Buffer staging =
+            create_buffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                          VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                              VMA_ALLOCATION_CREATE_MAPPED_BIT,
+                          VMA_MEMORY_USAGE_AUTO);
 
-std::memcpy(staging.info.pMappedData, data, static_cast<size_t>(size));
+        std::memcpy(staging.info.pMappedData, data, static_cast<size_t>(size));
 ```
 
-`HOST_ACCESS_SEQUENTIAL_WRITE` says we will write this front to back and never read it
-back. That is not a formality: it lets VMA choose **write-combined** memory, which is
-fast to write in order and catastrophically slow to read. If you ever need to read from a
-mapped buffer, ask for `HOST_ACCESS_RANDOM` instead.
-
-`MAPPED_BIT` asks VMA to keep the allocation permanently mapped and hand back the
-pointer in `pMappedData`, so there is no `vkMapMemory`/`vkUnmapMemory` pair to balance.
-
-Second, the real buffer, in device-local memory, with `TRANSFER_DST` added to whatever
-it is actually for:
-
-```cpp title="code/src/1.getting_started/memory_and_buffers/main.cpp"
-const Buffer result = create_buffer(size, usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                                    0, VMA_MEMORY_USAGE_AUTO);
+```
+   CPU memcpy ──▶ [ staging buffer ]  host-visible, TRANSFER_SRC
+                          │
+                          │ vkCmdCopyBuffer, on the GPU
+                          ▼
+                  [ vertex buffer ]   device-local, TRANSFER_DST | VERTEX_BUFFER
 ```
 
-No host-access flag this time, so VMA is free to put it where the GPU wants it.
+`HOST_ACCESS_SEQUENTIAL_WRITE` says we will write this front to back and never read it back.
+That is not a formality: it lets VMA choose **write-combined** memory, which is fast to write
+in order and catastrophically slow to read — reads from it bypass the cache entirely. If you
+ever need to read from a mapped buffer, ask for `HOST_ACCESS_RANDOM` instead.
 
-Third, a copy — which is GPU work, so it needs a command buffer:
-
-```cpp title="code/src/1.getting_started/memory_and_buffers/main.cpp"
-immediate_submit([&](VkCommandBuffer cmd) {
-    const VkBufferCopy region{.srcOffset = 0, .dstOffset = 0, .size = size};
-    vkCmdCopyBuffer(cmd, staging.handle, result.handle, 1, &region);
-});
-
-vmaDestroyBuffer(context().allocator(), staging.handle, staging.allocation);
-```
-
-The ordering matters. `immediate_submit` waits on a fence before it returns, so by the
-time the staging buffer is destroyed the GPU has definitely finished reading it.
-Destroying it earlier would free memory a queued copy is about to read, and that is the
-kind of bug that works fine on your machine and corrupts geometry on someone else's.
-
-### One-off GPU work
-
-`immediate_submit` is a command buffer recorded, submitted, and waited on:
+`MAPPED_BIT` asks VMA to keep the allocation permanently mapped and hand back the pointer in
+`pMappedData`, so there is no `vkMapMemory`/`vkUnmapMemory` pair to balance.
 
 ```cpp title="code/src/1.getting_started/memory_and_buffers/main.cpp"
-VK_CHECK(vkQueueSubmit2(context().queue(), 1, &submit, fence));
-VK_CHECK(vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX));
+        const Buffer result = create_buffer(size, usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                            0, VMA_MEMORY_USAGE_AUTO);
+
+        immediate_submit([&](VkCommandBuffer cmd) {
+            const VkBufferCopy region{.srcOffset = 0, .dstOffset = 0, .size = size};
+            vkCmdCopyBuffer(cmd, staging.handle, result.handle, 1, &region);
+        });
+
+        vmaDestroyBuffer(context().allocator(), staging.handle, staging.allocation);
+
+        return result;
+    }
 ```
 
-Blocking on a fence is exactly what chapter 1.6 spent its length getting rid of — but
-that was about the *frame loop*, where a stall costs you frames. This runs once at load
-time with nothing to overlap it with, so the simple version is also the honest one.
+`vkCmdCopyBuffer` records the copy, and a `VkBufferCopy` describes one region of it: where
+to read from, where to write to, and how many bytes. Several regions can be copied in one
+call, which is how a single command moves scattered pieces of a staging buffer into
+different places; here there is one region covering everything.
 
-The pool is created with `VK_COMMAND_POOL_CREATE_TRANSIENT_BIT`, which tells the driver
-these command buffers are recorded once and discarded.
+The real buffer gets `TRANSFER_DST` added to whatever it is actually for — without that bit the
+copy is invalid. No host-access flag this time, so VMA is free to put it where the GPU wants it.
+
+**The ordering matters.** `immediate_submit` waits on a fence before it returns, so by the time
+the staging buffer is destroyed the GPU has definitely finished reading it. Destroying it
+earlier would free memory a queued copy is about to read, and that is the kind of bug that works
+fine on your machine and corrupts geometry on someone else's.
+
+## One-off GPU work
+
+```cpp title="code/src/1.getting_started/memory_and_buffers/main.cpp"
+    template <typename Recorder>
+    void immediate_submit(Recorder&& record) {
+        const VkDevice device = context().device();
+
+        const VkCommandPoolCreateInfo pool_info{
+            .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
+            .queueFamilyIndex = context().queue_family(),
+        };
+        VkCommandPool pool = VK_NULL_HANDLE;
+        VK_CHECK(vkCreateCommandPool(device, &pool_info, nullptr, &pool));
+
+        const VkCommandBufferAllocateInfo alloc_info{
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .pNext = nullptr,
+            .commandPool = pool,
+            .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            .commandBufferCount = 1,
+        };
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        VK_CHECK(vkAllocateCommandBuffers(device, &alloc_info, &cmd));
+```
+
+Chapter 1.5's pool and buffer creation again, with one flag changed.
+`VK_COMMAND_POOL_CREATE_TRANSIENT_BIT` replaces `RESET_COMMAND_BUFFER_BIT` and tells the driver
+these buffers are recorded once and discarded, which lets it allocate them differently. Nothing
+here is ever reset.
+
+```cpp title="code/src/1.getting_started/memory_and_buffers/main.cpp"
+        const VkCommandBufferBeginInfo begin_info{
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .pNext = nullptr,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+            .pInheritanceInfo = nullptr,
+        };
+        VK_CHECK(vkBeginCommandBuffer(cmd, &begin_info));
+
+        record(cmd);
+
+        VK_CHECK(vkEndCommandBuffer(cmd));
+```
+
+`record(cmd)` is the caller's lambda. Making this a template rather than taking a
+`std::function` keeps the lambda inlined and costs nothing at run time.
+
+```cpp title="code/src/1.getting_started/memory_and_buffers/main.cpp"
+        const VkCommandBufferSubmitInfo cmd_info{
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+            .pNext = nullptr,
+            .commandBuffer = cmd,
+            .deviceMask = 0,
+        };
+
+        const VkSubmitInfo2 submit{
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+            .pNext = nullptr,
+            .flags = 0,
+            .waitSemaphoreInfoCount = 0,
+            .pWaitSemaphoreInfos = nullptr,
+            .commandBufferInfoCount = 1,
+            .pCommandBufferInfos = &cmd_info,
+            .signalSemaphoreInfoCount = 0,
+            .pSignalSemaphoreInfos = nullptr,
+        };
+
+        const VkFenceCreateInfo fence_info{
+            .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+        };
+        VkFence fence = VK_NULL_HANDLE;
+        VK_CHECK(vkCreateFence(device, &fence_info, nullptr, &fence));
+
+        VK_CHECK(vkQueueSubmit2(context().queue(), 1, &submit, fence));
+        VK_CHECK(vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX));
+
+        vkDestroyFence(device, fence, nullptr);
+        vkDestroyCommandPool(device, pool, nullptr);
+    }
+```
+
+No semaphores, and an unsignalled fence waited on immediately — which is exactly chapter 1.5's
+shape, the one chapter 1.6 spent its length getting rid of.
+
+That is deliberate and it is not a regression. Chapter 1.6 was about the *frame loop*, where a
+stall costs you frames. This runs once at load time with nothing to overlap it with, so the
+simple version is also the honest one.
 
 :::note[Integrated GPUs, and `vkCmdUpdateBuffer`]
-On an integrated GPU there is only one pool of memory and the staging copy is pure
-overhead; VMA will usually return host-visible device-local memory and the copy becomes
-a memcpy across the same RAM. It costs little enough to be worth keeping one code path.
+On an integrated GPU there is only one pool of memory and the staging copy is pure overhead;
+VMA will usually return host-visible device-local memory and the copy becomes a memcpy across
+the same RAM. It costs little enough to be worth keeping one code path.
 
-For very small uploads — 64 KiB or less — `vkCmdUpdateBuffer` writes data straight into
-a command buffer with no staging buffer at all. Handy for a one-off constant.
+For very small uploads — 64 KiB or less — `vkCmdUpdateBuffer` writes data straight into a
+command buffer with no staging buffer at all.
 :::
 
-## Describing a vertex
-
-The data is on the GPU. Now the pipeline has to be told how to read it.
-
-The C++ side is a plain struct with no Vulkan in it:
+## The geometry
 
 ```cpp title="code/src/1.getting_started/memory_and_buffers/main.cpp"
 struct Vertex {
     glm::vec2 position;
     glm::vec3 colour;
 };
+
+constexpr std::array<Vertex, 4> kVertices{{
+    {{-0.5F, -0.5F}, {1.0F, 0.0F, 0.0F}},  // top left,     red
+    {{0.5F, -0.5F}, {0.0F, 1.0F, 0.0F}},   // top right,    green
+    {{0.5F, 0.5F}, {0.0F, 0.0F, 1.0F}},    // bottom right, blue
+    {{-0.5F, 0.5F}, {1.0F, 1.0F, 0.0F}},   // bottom left,  yellow
+}};
+
+constexpr std::array<uint16_t, 6> kIndices{0, 1, 2, 2, 3, 0};
 ```
 
-Two structures turn that into something a pipeline understands. The **binding** says how
-to step through the buffer:
+A plain C++ struct with no Vulkan in it at all. What makes it a vertex is the binding and
+attribute descriptions below.
+
+Remember y points down in Vulkan clip space, so `-0.5` is the top of the screen. The doubled
+braces are `std::array`'s aggregate initialisation — the outer pair for the array, the inner for
+the internal C array it wraps.
+
+The quad is two triangles, and the indices are why there are four vertices rather than six:
+
+```
+   0 ────── 1        triangle A: 0, 1, 2
+   │ ╲    A │        triangle B: 2, 3, 0
+   │   ╲    │
+   │ B   ╲  │        vertices 0 and 2 are each used twice
+   3 ────── 2
+```
+
+On a real mesh the saving is much larger: a cube has 8 distinct corners and 36 triangle
+vertices, and typical models reuse each vertex six times or more. The GPU also keeps a small
+cache of recently transformed vertices keyed by index, so a shared vertex may run the vertex
+shader only once no matter how many triangles use it.
+
+`uint16_t` indices are half the bandwidth of `uint32_t` and enough for any mesh under 65 536
+vertices.
 
 ```cpp title="code/src/1.getting_started/memory_and_buffers/main.cpp"
-const VkVertexInputBindingDescription binding{
-    .binding = 0,
-    .stride = sizeof(Vertex),
-    .inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
-};
+    void create_geometry() {
+        vertex_buffer_ =
+            upload_to_device_local(kVertices.data(), sizeof(kVertices),
+                                   VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+        index_buffer_ = upload_to_device_local(kIndices.data(), sizeof(kIndices),
+                                               VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+
+        context().name(vertex_buffer_.handle, VK_OBJECT_TYPE_BUFFER, "quad vertices");
+        context().name(index_buffer_.handle, VK_OBJECT_TYPE_BUFFER, "quad indices");
+
+        spdlog::info("Uploaded {} vertices ({} bytes) and {} indices ({} bytes).",
+                     kVertices.size(), sizeof(kVertices), kIndices.size(),
+                     sizeof(kIndices));
+    }
 ```
 
-`stride` is how far apart consecutive vertices are, and `VK_VERTEX_INPUT_RATE_VERTEX`
-means advance once per vertex. The alternative, `_INSTANCE`, advances once per instance
-instead and is how per-instance data reaches the shader — that is chapter 4.8.
+`context().name` is the `VK_EXT_debug_utils` object naming that chapter 1.2 enabled the
+extension for, finally being used. It costs nothing in a release build and turns
+`VkBuffer 0x5d2f1a` in a validation message — or in RenderDoc's resource list — into
+`quad vertices`.
+
+## Describing a vertex
+
+```cpp title="code/src/1.getting_started/memory_and_buffers/main.cpp"
+private:
+```
+
+```cpp title="code/src/1.getting_started/memory_and_buffers/main.cpp"
+    void create_pipeline() {
+        const VkDevice device = context().device();
+
+        const VkVertexInputBindingDescription binding{
+            .binding = 0,
+            .stride = sizeof(Vertex),
+            .inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
+        };
+```
+
+A `VkVertexInputBindingDescription` — the **binding** — says how to step through the buffer. `stride` is how far apart consecutive
+vertices are, and `VK_VERTEX_INPUT_RATE_VERTEX` means advance once per vertex. The alternative,
+`_INSTANCE`, advances once per instance instead — that is chapter 4.8.
+
+```cpp title="code/src/1.getting_started/memory_and_buffers/main.cpp"
+        const std::array<VkVertexInputAttributeDescription, 2> attributes{{
+            {
+                .location = 0,
+                .binding = 0,
+                .format = VK_FORMAT_R32G32_SFLOAT,
+                .offset = offsetof(Vertex, position),
+            },
+            {
+                .location = 1,
+                .binding = 0,
+                .format = VK_FORMAT_R32G32B32_SFLOAT,
+                .offset = offsetof(Vertex, colour),
+            },
+        }};
+```
 
 The **attributes** say where each shader input lives inside one vertex:
 
-```cpp title="code/src/1.getting_started/memory_and_buffers/main.cpp"
-const std::array<VkVertexInputAttributeDescription, 2> attributes{{
-    {
-        .location = 0,
-        .binding = 0,
-        .format = VK_FORMAT_R32G32_SFLOAT,
-        .offset = offsetof(Vertex, position),
-    },
-    {
-        .location = 1,
-        .binding = 0,
-        .format = VK_FORMAT_R32G32B32_SFLOAT,
-        .offset = offsetof(Vertex, colour),
-    },
-}};
+```
+   buffer:  [ Vertex 0 ][ Vertex 1 ][ Vertex 2 ][ Vertex 3 ]
+              │                                      stride = 20 bytes
+              ├─ offset 0   position  R32G32_SFLOAT     (8 bytes)  → location 0
+              └─ offset 8   colour    R32G32B32_SFLOAT  (12 bytes) → location 1
 ```
 
-Three things to notice.
+`format` uses image-format vocabulary for vertex data, which looks strange the first time. It
+reads directly, though: `R32G32_SFLOAT` is two 32-bit signed floats, `R32G32B32_SFLOAT` is
+three.
 
-`format` uses image-format vocabulary for vertex data, which looks strange the first
-time. It is the same vocabulary, though, and it reads directly: `R32G32_SFLOAT` is two
-32-bit signed floats, `R32G32B32_SFLOAT` is three.
-
-`offset` comes from `offsetof`. Adding up `sizeof` by hand works until a struct has
-padding in it, and then it silently does not.
+`offset` comes from `offsetof`. Adding up `sizeof` by hand works until a struct has padding in
+it, and then it silently does not.
 
 `location` is the pairing with the shader, and it is the whole contract:
 
@@ -271,55 +917,173 @@ struct VSInput {
 ```
 
 :::caution[The one mistake validation cannot fully catch]
-If the `location` numbers or the formats disagree between C++ and the shader, it reads
-the wrong bytes. The validation layers catch some cases — a missing attribute, a
-mismatched type — but they cannot know that you meant to swap position and colour. The
-symptom is geometry in the wrong place or colours that make no sense, with no error
-message anywhere.
-
-When something looks wrong in a way that suggests garbage input, check these two blocks
-against each other first.
+If the `location` numbers or the formats disagree between C++ and the shader, it reads the wrong
+bytes. The validation layers catch some cases — a missing attribute, a mismatched type — but
+they cannot know that you meant to swap position and colour. The symptom is geometry in the
+wrong place or colours that make no sense, with no error message anywhere.
 :::
 
-## Index buffers
-
-The quad is two triangles. Drawn as six vertices, two of them would be exact duplicates.
-Instead there are four vertices and a list of six indices into them:
+## The pipeline, in four lines
 
 ```cpp title="code/src/1.getting_started/memory_and_buffers/main.cpp"
-constexpr std::array<uint16_t, 6> kIndices{0, 1, 2, 2, 3, 0};
+        const VkPipelineLayoutCreateInfo layout_info{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .setLayoutCount = 0,
+            .pSetLayouts = nullptr,
+            .pushConstantRangeCount = 0,
+            .pPushConstantRanges = nullptr,
+        };
+        VK_CHECK(vkCreatePipelineLayout(device, &layout_info, nullptr,
+                                        &pipeline_layout_));
 ```
 
-On a quad that saves two vertices. On a real mesh the saving is much larger: a cube has
-8 distinct corners and 36 triangle vertices, and typical models reuse each vertex six
-times or more. The GPU also keeps a small cache of recently transformed vertices keyed by
-index, so a shared vertex may run the vertex shader only once no matter how many
-triangles use it.
-
-`uint16_t` indices are half the bandwidth of `uint32_t` and enough for any mesh under
-65 536 vertices. Which one a buffer holds is stated at bind time, not in the pipeline.
-
-## Binding and drawing
+Still empty, still 1.7's. The layout stays in `main.cpp` rather than moving into the builder
+because chapter 1.10 is about filling it in.
 
 ```cpp title="code/src/1.getting_started/memory_and_buffers/main.cpp"
-const VkDeviceSize offset = 0;
-vkCmdBindVertexBuffers(frame.cmd, 0, 1, &vertex_buffer_.handle, &offset);
-vkCmdBindIndexBuffer(frame.cmd, index_buffer_.handle, 0, VK_INDEX_TYPE_UINT16);
+        const VkShaderModule shader =
+            vkc::load_shader(device, LVK_CHAPTER_ID, "quad.slang");
 
-vkCmdDrawIndexed(frame.cmd, static_cast<uint32_t>(kIndices.size()), 1, 0, 0, 0);
+        pipeline_ = vkc::PipelineBuilder(device)
+                        .shaders(shader)
+                        .vertex_input(std::span(&binding, 1), attributes)
+                        .colour_attachment(swapchain().format())
+                        .layout(pipeline_layout_)
+                        .build();
+
+        vkDestroyShaderModule(device, shader, nullptr);
+    }
 ```
 
-Binding a vertex buffer supplies only the memory — binding index 0, this buffer, starting
-at this byte offset. The stride and the attribute layout are already baked into the
-pipeline.
+That is chapter 1.7's two hundred lines of pipeline creation. The one line worth knowing is
+`.vertex_input(...)`, which is new in this chapter — 1.7's pipeline left that struct empty.
 
-`vkCmdDrawIndexed` takes an index count where `vkCmdDraw` took a vertex count. The vertex
-shader still runs per vertex; which vertex it runs on now comes from the index buffer.
+`std::span(&binding, 1)` makes a one-element view of a single object, because the builder takes
+a span and there is only one binding.
 
-The shader itself barely changed. The vertex index and the constant array are gone,
-replaced by a `VSInput` parameter:
+## Recording the frame
+
+```cpp title="code/src/1.getting_started/memory_and_buffers/main.cpp"
+    void on_render(const vkc::FrameInfo& frame) override {
+        const VkClearValue clear{.color = {{0.02F, 0.02F, 0.04F, 1.0F}}};
+
+        const VkRenderingAttachmentInfo colour_attachment{
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .pNext = nullptr,
+            .imageView = frame.view,
+            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .resolveMode = VK_RESOLVE_MODE_NONE,
+            .resolveImageView = VK_NULL_HANDLE,
+            .resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .clearValue = clear,
+        };
+
+        const VkRenderingInfo rendering{
+            .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .renderArea = {{0, 0}, frame.extent},
+            .layerCount = 1,
+            .viewMask = 0,
+            .colorAttachmentCount = 1,
+            .pColorAttachments = &colour_attachment,
+            .pDepthAttachment = nullptr,
+            .pStencilAttachment = nullptr,
+        };
+
+        vkCmdBeginRendering(frame.cmd, &rendering);
+```
+
+Identical to 1.7's. The attachment description stays in the sample rather than moving into
+`vkcommon`, because it is the thing a chapter varies — 1.13 adds a depth attachment to it, 4.1
+changes its `loadOp` — so hiding it would hide the subject.
+
+```cpp title="code/src/1.getting_started/memory_and_buffers/main.cpp"
+        vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
+
+        const VkViewport viewport{
+            .x = 0.0F,
+            .y = 0.0F,
+            .width = static_cast<float>(frame.extent.width),
+            .height = static_cast<float>(frame.extent.height),
+            .minDepth = 0.0F,
+            .maxDepth = 1.0F,
+        };
+        vkCmdSetViewport(frame.cmd, 0, 1, &viewport);
+
+        const VkRect2D scissor{.offset = {0, 0}, .extent = frame.extent};
+        vkCmdSetScissor(frame.cmd, 0, 1, &scissor);
+```
+
+```cpp title="code/src/1.getting_started/memory_and_buffers/main.cpp"
+        // Binding a vertex buffer says "binding 0 reads from this buffer, starting at
+        // this byte offset". The pipeline already knows the stride and the attribute
+        // layout; this only supplies the memory.
+        const VkDeviceSize offset = 0;
+        vkCmdBindVertexBuffers(frame.cmd, 0, 1, &vertex_buffer_.handle, &offset);
+
+        // Index type is a property of the bind, not of the pipeline. uint16 halves the
+        // bandwidth of uint32 and is enough for any mesh under 65536 vertices.
+        vkCmdBindIndexBuffer(frame.cmd, index_buffer_.handle, 0, VK_INDEX_TYPE_UINT16);
+
+        // Six indices rather than six vertices. The vertex shader still runs per
+        // vertex, but which vertex it runs on comes from the index buffer.
+        vkCmdDrawIndexed(frame.cmd, static_cast<uint32_t>(kIndices.size()), 1, 0, 0, 0);
+
+        vkCmdEndRendering(frame.cmd);
+    }
+```
+
+`vkCmdBindVertexBuffers` takes an array of buffers and an array of byte offsets, one pair
+per binding, starting at the binding number given. There is one binding here, so both
+arrays have one element. A mesh whose positions and colours lived in two separate buffers
+would bind two.
+
+The index **type** is a property of the bind, not of the pipeline. That is the opposite of the
+vertex layout, and it is the reason a mesh can switch between 16- and 32-bit indices without
+recompiling anything.
+
+`vkCmdDrawIndexed` takes an index count where `vkCmdDraw` took a vertex count. The last three
+arguments — first index, vertex offset, first instance — all stay zero here.
+
+```cpp title="code/src/1.getting_started/memory_and_buffers/main.cpp"
+    Buffer vertex_buffer_{};
+    Buffer index_buffer_{};
+
+    VkPipelineLayout pipeline_layout_ = VK_NULL_HANDLE;
+    VkPipeline pipeline_ = VK_NULL_HANDLE;
+};
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    try {
+        vkc::App::Options options{};
+        options.title = "LearnVulkan 1.8 - Memory and buffers";
+        QuadApp app(vkc::App::parse_args(argc, argv, options));
+        return app.run();
+    } catch (const std::exception& error) {
+        spdlog::error("{}", error.what());
+        return EXIT_FAILURE;
+    }
+}
+```
+
+The same `try`/`catch` as every chapter since 1.1, with the window title now passed through
+`Options` rather than written into an `SDL_CreateWindow` call.
+
+## The shader
 
 ```slang title="code/src/1.getting_started/memory_and_buffers/quad.slang"
+struct VSOutput {
+    float4 position : SV_Position;
+    [[vk::location(0)]] float3 colour;
+};
+
 [shader("vertex")]
 VSOutput vertexMain(VSInput input) {
     VSOutput output;
@@ -327,9 +1091,317 @@ VSOutput vertexMain(VSInput input) {
     output.colour = input.colour;
     return output;
 }
+
+[shader("fragment")]
+float4 fragmentMain(VSOutput input) : SV_Target {
+    return float4(input.colour, 1.0);
+}
 ```
 
-The fragment shader is untouched. It never knew where the colour came from.
+`VSOutput` is unchanged from 1.7 and so is `fragmentMain`. The vertex shader lost its constant
+arrays and its `SV_VulkanVertexID` parameter and gained a `VSInput` one.
+
+Note that `[[vk::location(0)]]` appears in both `VSInput` and `VSOutput` with different
+meanings. In `VSInput` it names a *vertex attribute* and pairs with the C++ attribute
+description; in `VSOutput` it names an *interpolant* and pairs with the fragment shader's input.
+The two numbering spaces are unrelated, which is confusing exactly once.
+
+## What moves into `vkcommon`
+
+The `Buffer` struct, `immediate_submit` and `upload_to_device_local` become `vkc::Buffer`
+and two free functions. Chapter 1.10 uses all three.
+
+```cpp title="code/common/scaffold/include/vkc/buffer.hpp"
+#include <volk.h>
+
+#include <vk_mem_alloc.h>
+
+#include <cstdint>
+#include <functional>
+
+namespace vkc {
+
+class Context;
+
+class Buffer {
+public:
+    Buffer() = default;
+
+    // `flags` is where host access is requested. Pass 0 for device-local memory the
+    // CPU never touches; pass HOST_ACCESS_SEQUENTIAL_WRITE_BIT | MAPPED_BIT for
+    // something the CPU writes and the mapped pointer comes back from mapped().
+    Buffer(VmaAllocator allocator, VkDeviceSize size, VkBufferUsageFlags usage,
+           VmaAllocationCreateFlags flags,
+           VmaMemoryUsage memory_usage = VMA_MEMORY_USAGE_AUTO);
+
+    ~Buffer();
+
+    Buffer(const Buffer&) = delete;
+    Buffer& operator=(const Buffer&) = delete;
+    Buffer(Buffer&& other) noexcept;
+    Buffer& operator=(Buffer&& other) noexcept;
+```
+
+This is the one place in the series where the four special members are **not** all deleted.
+Copying is still forbidden, for the reason chapter 1.1 gave: two objects would free the same
+allocation. But **moving is allowed**, and that is what makes
+`vertex_buffer_ = upload_to_device_local(...)` work — the function builds a `Buffer` and
+hands over ownership of its handles, leaving the original empty.
+
+A default constructor exists so a sample can declare `Buffer vertex_buffer_;` as a member
+and fill it in later.
+
+```cpp title="code/common/scaffold/include/vkc/buffer.hpp"
+    [[nodiscard]] VkBuffer handle() const noexcept { return buffer_; }
+    [[nodiscard]] VkDeviceSize size() const noexcept { return size_; }
+
+    // Non-null only if the allocation was created with VMA_ALLOCATION_CREATE_MAPPED_BIT.
+    [[nodiscard]] void* mapped() const noexcept { return info_.pMappedData; }
+
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return buffer_ != VK_NULL_HANDLE;
+    }
+
+    void destroy() noexcept;
+
+private:
+    VmaAllocator allocator_ = VK_NULL_HANDLE;
+    VkBuffer buffer_ = VK_NULL_HANDLE;
+    VmaAllocation allocation_ = VK_NULL_HANDLE;
+    VmaAllocationInfo info_{};
+    VkDeviceSize size_ = 0;
+};
+```
+
+The same three pieces of state your `Buffer` struct held, plus the allocator needed to free
+them and the size, which turns out to be wanted often enough to keep.
+
+`explicit operator bool` lets you write `if (buffer)` to ask whether it holds anything.
+**`explicit`** is what stops that conversion happening where you did not ask for it — without
+it, a `Buffer` would silently convert to `bool` and then to `int`, and `buffer + 1` would
+compile.
+
+```cpp title="code/common/scaffold/include/vkc/buffer.hpp"
+// Records one-off GPU work and waits for it to finish. Chapter 1.8's immediate_submit.
+void immediate_submit(Context& context,
+                      const std::function<void(VkCommandBuffer)>& record);
+
+// Uploads CPU data into a device-local buffer through a staging buffer, exactly as
+// chapter 1.8 did it. TRANSFER_DST is added to `usage` for you.
+[[nodiscard]] Buffer upload_to_device_local(Context& context, const void* data,
+                                            VkDeviceSize size,
+                                            VkBufferUsageFlags usage);
+
+}  // namespace vkc
+```
+
+`immediate_submit` takes a **`std::function`** where your version was a template. The
+trade is deliberate: a template must live in a header, and this way the implementation
+stays in one `.cpp`. The cost is an indirect call and possibly an allocation, which is
+irrelevant for something called a handful of times at load and would not be in a loop.
+
+### The implementation
+
+```cpp title="code/common/scaffold/src/buffer.cpp"
+#include "vkc/buffer.hpp"
+
+#include "vkc/check.hpp"
+#include "vkc/context.hpp"
+
+#include <cstring>
+#include <utility>
+
+namespace vkc {
+
+Buffer::Buffer(VmaAllocator allocator, VkDeviceSize size, VkBufferUsageFlags usage,
+               VmaAllocationCreateFlags flags, VmaMemoryUsage memory_usage)
+    : allocator_(allocator), size_(size) {
+    const VkBufferCreateInfo buffer_info{
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .size = size,
+        .usage = usage,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = 0,
+        .pQueueFamilyIndices = nullptr,
+    };
+
+    const VmaAllocationCreateInfo alloc_info{
+        .flags = flags,
+        .usage = memory_usage,
+        .requiredFlags = 0,
+        .preferredFlags = 0,
+        .memoryTypeBits = 0,
+        .pool = VK_NULL_HANDLE,
+        .pUserData = nullptr,
+        .priority = 0.0F,
+    };
+
+    VK_CHECK(vmaCreateBuffer(allocator_, &buffer_info, &alloc_info, &buffer_,
+                             &allocation_, &info_));
+}
+
+Buffer::~Buffer() { destroy(); }
+```
+
+Your `create_buffer`, with the result stored in members instead of returned in a struct.
+
+```cpp title="code/common/scaffold/src/buffer.cpp"
+Buffer::Buffer(Buffer&& other) noexcept
+    : allocator_(std::exchange(other.allocator_, VK_NULL_HANDLE)),
+      buffer_(std::exchange(other.buffer_, VK_NULL_HANDLE)),
+      allocation_(std::exchange(other.allocation_, VK_NULL_HANDLE)),
+      info_(std::exchange(other.info_, {})),
+      size_(std::exchange(other.size_, 0)) {}
+
+Buffer& Buffer::operator=(Buffer&& other) noexcept {
+    if (this != &other) {
+        destroy();
+        allocator_ = std::exchange(other.allocator_, VK_NULL_HANDLE);
+        buffer_ = std::exchange(other.buffer_, VK_NULL_HANDLE);
+        allocation_ = std::exchange(other.allocation_, VK_NULL_HANDLE);
+        info_ = std::exchange(other.info_, {});
+        size_ = std::exchange(other.size_, 0);
+    }
+    return *this;
+}
+```
+
+`std::exchange(x, v)` sets `x` to `v` and returns what it held. That is exactly what a move
+needs: take the value, and leave the source in a state where its destructor does nothing.
+Without the second half, both objects would free the same allocation.
+
+The assignment operator has two guards the constructor does not need. `if (this != &other)`
+covers **self-assignment**, which would otherwise destroy the buffer and then move it into
+itself. And `destroy()` comes first, because this object may already own a buffer, and
+overwriting the handle without freeing it would leak.
+
+Both are `noexcept`, which is not decoration: `std::vector` will only *move* its elements
+when it grows if their move operations promise not to throw, and otherwise copies them —
+which, for a non-copyable type, fails to compile.
+
+```cpp title="code/common/scaffold/src/buffer.cpp"
+void Buffer::destroy() noexcept {
+    if (buffer_ != VK_NULL_HANDLE) {
+        vmaDestroyBuffer(allocator_, buffer_, allocation_);
+        buffer_ = VK_NULL_HANDLE;
+        allocation_ = VK_NULL_HANDLE;
+        info_ = {};
+        size_ = 0;
+    }
+}
+```
+
+Your `destroy_buffer`, as a method. Clearing the members afterwards is what makes it safe
+to call twice — which the destructor does after an explicit `destroy()`.
+
+```cpp title="code/common/scaffold/src/buffer.cpp"
+void immediate_submit(Context& context,
+                      const std::function<void(VkCommandBuffer)>& record) {
+    const VkDevice device = context.device();
+
+    const VkCommandPoolCreateInfo pool_info{
+        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
+        .queueFamilyIndex = context.queue_family(),
+    };
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateCommandPool(device, &pool_info, nullptr, &pool));
+
+    const VkCommandBufferAllocateInfo alloc_info{
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .pNext = nullptr,
+        .commandPool = pool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1,
+    };
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    VK_CHECK(vkAllocateCommandBuffers(device, &alloc_info, &cmd));
+
+    const VkCommandBufferBeginInfo begin_info{
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .pNext = nullptr,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        .pInheritanceInfo = nullptr,
+    };
+    VK_CHECK(vkBeginCommandBuffer(cmd, &begin_info));
+
+    record(cmd);
+
+    VK_CHECK(vkEndCommandBuffer(cmd));
+
+    const VkCommandBufferSubmitInfo cmd_info{
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+        .pNext = nullptr,
+        .commandBuffer = cmd,
+        .deviceMask = 0,
+    };
+
+    const VkSubmitInfo2 submit{
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+        .pNext = nullptr,
+        .flags = 0,
+        .waitSemaphoreInfoCount = 0,
+        .pWaitSemaphoreInfos = nullptr,
+        .commandBufferInfoCount = 1,
+        .pCommandBufferInfos = &cmd_info,
+        .signalSemaphoreInfoCount = 0,
+        .pSignalSemaphoreInfos = nullptr,
+    };
+
+    const VkFenceCreateInfo fence_info{
+        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+    };
+    VkFence fence = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateFence(device, &fence_info, nullptr, &fence));
+
+    VK_CHECK(vkQueueSubmit2(context.queue(), 1, &submit, fence));
+    VK_CHECK(vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX));
+
+    vkDestroyFence(device, fence, nullptr);
+    vkDestroyCommandPool(device, pool, nullptr);
+}
+```
+
+Line for line the function you wrote, taking the context as a parameter rather than reading
+it from `this`.
+
+```cpp title="code/common/scaffold/src/buffer.cpp"
+Buffer upload_to_device_local(Context& context, const void* data, VkDeviceSize size,
+                              VkBufferUsageFlags usage) {
+    Buffer staging(context.allocator(), size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                   VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                       VMA_ALLOCATION_CREATE_MAPPED_BIT);
+
+    std::memcpy(staging.mapped(), data, static_cast<size_t>(size));
+
+    Buffer result(context.allocator(), size, usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                  0);
+
+    immediate_submit(context, [&](VkCommandBuffer cmd) {
+        const VkBufferCopy region{.srcOffset = 0, .dstOffset = 0, .size = size};
+        vkCmdCopyBuffer(cmd, staging.handle(), result.handle(), 1, &region);
+    });
+
+    // `staging` is destroyed as this returns, after immediate_submit has waited on its
+    // fence -- so the GPU has certainly finished reading it.
+    return result;
+}
+
+}  // namespace vkc
+```
+
+The ordering lesson from earlier in this chapter, now enforced by the language rather than
+by remembering. Your version called `vmaDestroyBuffer` on the staging buffer explicitly,
+after `immediate_submit`. Here `staging` is a local, so its destructor runs when the
+function returns — which is necessarily after `immediate_submit` has waited on its fence.
+The bug of freeing it too early is no longer possible to write.
+
+`return result` moves rather than copies, using the move constructor above.
 
 ## Running it
 
@@ -337,47 +1409,55 @@ The fragment shader is untouched. It never knew where the colour came from.
 ./code/out/build/linux-debug/bin/1.8.memory_and_buffers
 ```
 
-A quad with red, green, blue and yellow corners. Two details in that image are worth a
-second look, because both get fixed later.
+A quad with red, green, blue and yellow corners. Two details are worth a second look, because
+both get fixed later.
 
-**There is a visible seam along the diagonal.** Colours are interpolated across each
-triangle independently, and the shared edge is where two independent interpolations meet.
-Nothing is wrong; this is what per-vertex interpolation does, and it is the same
-phenomenon that makes low-polygon Gouraud-shaded models look faceted. Chapter 2.2 does
-the lighting equivalent per pixel instead, and the artefact disappears.
+**There is a visible seam along the diagonal.** Colours are interpolated across each triangle
+independently, and the shared edge is where two independent interpolations meet. Nothing is
+wrong; this is what per-vertex interpolation does, and it is the same phenomenon that makes
+low-polygon Gouraud-shaded models look faceted. Chapter 2.2 does the lighting equivalent per
+pixel instead, and the artefact disappears.
 
-**The quad is not square.** Its coordinates run −0.5 to 0.5 in both axes, which is square
-in clip space, but clip space is stretched to fill whatever shape the window is. Resize
-the window and watch it distort. A projection matrix is what corrects for that, and it
-arrives in chapter 1.13.
+**The quad is not square.** Its coordinates run −0.5 to 0.5 in both axes, which is square in
+clip space, but clip space is stretched to fill whatever shape the window is. Resize the window
+and watch it distort. A projection matrix corrects for that, and it arrives in chapter 1.13.
 
-## What changed
+## Words introduced in this chapter
 
-Compared to 1.7:
-
-- `main.cpp` lost around 900 lines to `vkcommon` and gained buffers
-- vertices moved from a constant array in the shader into device-local GPU memory
-- the pipeline gained a vertex input description
-- `vkCmdDraw` became `vkCmdDrawIndexed`
-
-Added to `vkcommon` this chapter: **nothing yet**. `create_buffer`, `upload_to_device_local`
-and `immediate_submit` are written out in full in `main.cpp` because they are what this
-chapter teaches. Chapter 1.9 is the first that gets to use them from the scaffold.
+| | |
+|---|---|
+| **buffer** | a description of some bytes and their uses; it starts with no memory attached |
+| **allocation** | the memory VMA bound to it, and the handle you need to free it |
+| **staging buffer** | a host-visible buffer whose only job is to be the source of a copy |
+| **write-combined** | memory that is fast to write sequentially and very slow to read |
+| **vertex binding** | how far apart consecutive vertices are, and how the input rate advances |
+| **vertex attribute** | where one shader input lives inside a vertex, by offset and format |
+| **index buffer** | a list of which vertices to use, so shared ones are stored once |
+| **device-local** | memory on the card: fastest for the GPU, invisible to the CPU |
+| **host-visible** | memory the CPU can map and write, which the GPU reaches more slowly |
+| **RAII wrapper** | a type whose destructor frees the handle, so no path can leak it |
+| **move semantics** | transferring ownership of a handle rather than copying it |
+| **pure virtual** | a method with `= 0`, which a derived class is obliged to provide |
 
 ## Exercises
 
-1. Delete `VK_BUFFER_USAGE_TRANSFER_DST_BIT` from the device-local buffer and run it.
-   Read the validation message carefully — it is a good example of the layers catching a
-   promise you broke.
-2. Change the index array to `{0, 1, 2}` and drop the count to 3. You get one triangle,
-   and the vertex buffer is unchanged. Indices and vertices really are independent.
-3. Add a fourth `float` to `Vertex` — say a brightness — pass it through to the fragment
-   shader, and multiply the colour by it. You will need a third attribute, a new
-   location, and `VK_FORMAT_R32_SFLOAT`.
+1. Delete `VK_BUFFER_USAGE_TRANSFER_DST_BIT` from the device-local buffer and run it. Read the
+   validation message carefully — it is a good example of the layers catching a promise you
+   broke.
+2. Change the index array to `{0, 1, 2}` and drop the count to 3. You get one triangle, and the
+   vertex buffer is unchanged. Indices and vertices really are independent.
+3. Add a fourth `float` to `Vertex` — say a brightness — pass it through to the fragment shader,
+   and multiply the colour by it. You will need a third attribute, a new location, and
+   `VK_FORMAT_R32_SFLOAT`.
 4. Skip the staging buffer entirely: create the vertex buffer with
    `VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT`
    and `memcpy` straight into it. It works, and for four vertices you will not measure a
    difference. Now consider a million-vertex model read across PCIe every frame.
-5. Call `vmaDestroyBuffer` on the staging buffer *before* `immediate_submit` rather than
-   after. On most drivers it will still draw correctly, which is precisely why the
-   validation layers exist — run it with them on and see what they say.
+5. Call `vmaDestroyBuffer` on the staging buffer *before* `immediate_submit` rather than after.
+   On most drivers it will still draw correctly, which is precisely why the validation layers
+   exist — run it with them on and see what they say.
+6. Swap the two `offsetof` values in the attribute array so position reads the colour bytes.
+   Note that it compiles, runs, and draws something — and that no layer says a word.
+
+Next: [shaders](/getting-started/shaders/) — what the compiler is doing, and what the two stages
+can and cannot say to each other.

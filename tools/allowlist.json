@@ -1,0 +1,25 @@
+{
+  "_comment": "Names that need no paragraph of their own. Families are matched as a prefix on enum constants; terms are exact. Everything here is a deliberate decision that the reader loses nothing by not seeing it explained -- keep the list short, and prefer explaining the concept to adding an entry.",
+
+  "families": [
+    "VK_STRUCTURE_TYPE_",
+    "VK_API_VERSION_",
+    "VK_MAKE_VERSION",
+    "VK_HEADER_VERSION"
+  ],
+
+  "terms": [
+    "VK_NULL_HANDLE",
+    "VK_TRUE",
+    "VK_FALSE",
+    "VK_SUCCESS",
+    "VK_WHOLE_SIZE",
+    "VK_QUEUE_FAMILY_IGNORED",
+    "VK_REMAINING_MIP_LEVELS",
+    "VK_REMAINING_ARRAY_LAYERS",
+    "VK_SUBPASS_EXTERNAL",
+    "VK_ATTACHMENT_UNUSED",
+    "VK_NO_PROTOTYPES",
+    "VK_USE_PLATFORM_WIN32_KHR"
+  ]
+}

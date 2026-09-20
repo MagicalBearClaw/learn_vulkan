@@ -1,0 +1,93 @@
+{
+  "_comment": [
+    "Reading order for tools/coverage.py. 'previous' names the sample a chapter's",
+    "reader already has in front of them, so the diff between the two is what that",
+    "chapter has to teach. Chapters that ship no code are not listed."
+  ],
+  "chapters": [
+    {
+      "id": "1.1.creating_a_window",
+      "sample": "1.getting_started/creating_a_window",
+      "previous": null,
+      "article": "getting-started/creating-a-window.mdx"
+    },
+    {
+      "id": "1.2.the_instance",
+      "sample": "1.getting_started/the_instance",
+      "previous": "1.getting_started/creating_a_window",
+      "article": "getting-started/the-instance.mdx"
+    },
+    {
+      "id": "1.3.devices_and_queues",
+      "sample": "1.getting_started/devices_and_queues",
+      "previous": "1.getting_started/the_instance",
+      "article": "getting-started/devices-and-queues.mdx"
+    },
+    {
+      "id": "1.4.the_swapchain",
+      "sample": "1.getting_started/the_swapchain",
+      "previous": "1.getting_started/devices_and_queues",
+      "article": "getting-started/the-swapchain.mdx"
+    },
+    {
+      "id": "1.5.command_buffers",
+      "sample": "1.getting_started/command_buffers",
+      "previous": "1.getting_started/the_swapchain",
+      "article": "getting-started/command-buffers.mdx"
+    },
+    {
+      "id": "1.6.synchronisation",
+      "sample": "1.getting_started/synchronisation",
+      "previous": "1.getting_started/command_buffers",
+      "article": "getting-started/synchronisation.mdx"
+    },
+    {
+      "id": "1.7.hello_triangle",
+      "sample": "1.getting_started/hello_triangle",
+      "previous": "1.getting_started/synchronisation",
+      "article": "getting-started/hello-triangle.mdx"
+    },
+    {
+      "id": "1.8.memory_and_buffers",
+      "sample": "1.getting_started/memory_and_buffers",
+      "previous": "1.getting_started/hello_triangle",
+      "article": "getting-started/memory-and-buffers.mdx"
+    },
+    {
+      "id": "1.9.shaders",
+      "sample": "1.getting_started/shaders",
+      "previous": "1.getting_started/memory_and_buffers",
+      "article": "getting-started/shaders.mdx"
+    },
+    {
+      "id": "1.10.descriptors",
+      "sample": "1.getting_started/descriptors",
+      "previous": "1.getting_started/shaders",
+      "article": "getting-started/descriptors.mdx"
+    },
+    {
+      "id": "1.11.textures",
+      "sample": "1.getting_started/textures",
+      "previous": "1.getting_started/descriptors",
+      "article": "getting-started/textures.mdx"
+    },
+    {
+      "id": "1.12.transformations",
+      "sample": "1.getting_started/transformations",
+      "previous": "1.getting_started/textures",
+      "article": "getting-started/transformations.mdx"
+    },
+    {
+      "id": "1.13.coordinate_systems",
+      "sample": "1.getting_started/coordinate_systems",
+      "previous": "1.getting_started/transformations",
+      "article": "getting-started/coordinate-systems.mdx"
+    },
+    {
+      "id": "1.14.camera",
+      "sample": "1.getting_started/camera",
+      "previous": "1.getting_started/coordinate_systems",
+      "article": "getting-started/camera.mdx"
+    }
+  ]
+}

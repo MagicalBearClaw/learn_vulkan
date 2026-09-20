@@ -1,6 +1,6 @@
 ---
 title: Hello Triangle
-description: Shader modules, the graphics pipeline object, dynamic state, and finally a draw call.
+description: Shader modules, the graphics pipeline object, dynamic state, and finally a draw call - every line of it.
 sidebar:
   order: 7
 ---
@@ -13,66 +13,154 @@ sidebar:
 Everything so far has been preparation. This chapter adds shaders, a pipeline, and one
 `vkCmdDraw`.
 
+## What chapters 1.5 and 1.6 left behind
+
+The frame loop is no longer written here. Chapters 1.5 and 1.6 built it by hand and explained
+every fence and semaphore in it; it is now `vkc::FrameContext`, and it hands out one open
+command buffer per frame.
+
+```cpp title="code/common/scaffold/include/vkc/frame.hpp"
+struct FrameInfo {
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    uint32_t image_index = 0;
+    VkImage image = VK_NULL_HANDLE;      // the swapchain image being drawn into
+    VkImageView view = VK_NULL_HANDLE;   // its view, for dynamic rendering
+    VkExtent2D extent{};
+    uint64_t frame_number = 0;           // monotonic, never resets
+};
+```
+
+`begin()` is chapter 1.6's opening: wait on the slot's fence, acquire an image signalling the
+slot's semaphore, reset, and open the command buffer.
+
+```cpp title="code/common/scaffold/src/frame.cpp"
+std::optional<FrameInfo> FrameContext::begin() {
+    PerFrame& frame = frames_[frame_number_ % kFramesInFlight];
+
+    // Wait until the GPU has finished the last frame that used this slot. This is
+    // the only CPU/GPU sync point in a well-behaved frame loop.
+    VK_CHECK(vkWaitForFences(context_.device(), 1, &frame.in_flight, VK_TRUE,
+                             UINT64_MAX));
+```
+
+It returns `std::optional` rather than throwing, because "the swapchain expired" is not an
+error:
+
+```cpp title="code/common/scaffold/src/frame.cpp"
+    if (acquired == VK_ERROR_OUT_OF_DATE_KHR) {
+        // The window changed size under us. Nothing was acquired and the semaphore
+        // was not signalled, so we can simply bail out and rebuild.
+        return std::nullopt;
+    }
+```
+
+And `end()` is 1.6's closing half — the two `VkSemaphoreSubmitInfo` structs, the submit, and
+the present — returning `false` when the swapchain needs rebuilding.
+
+```cpp title="code/common/scaffold/src/frame.cpp"
+    const VkSemaphoreSubmitInfo wait{
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+        .pNext = nullptr,
+        .semaphore = frame.image_available,
+        .value = 0,  // ignored for binary semaphores
+        // Wait only at the point where we actually write colour. Vertex processing
+        // can start before the image is ready.
+        .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+        .deviceIndex = 0,
+    };
+```
+
+So the loop becomes `begin()` → record → `end()`, and the rule about *where* a chapter's own
+work goes is now visible in the shape of the code: between those two calls.
+
+```cmake title="code/src/1.getting_started/hello_triangle/CMakeLists.txt"
+# This chapter teaches shader modules and the graphics pipeline, so it writes both by
+# hand -- the Slang compiler calls and all eleven pipeline structs. It stands on
+# everything 1.1 to 1.6 taught, including the frame loop that is now vkc::FrameContext.
+# vkc_pipeline, which is what this chapter becomes, is deliberately not named.
+add_chapter(1.7.hello_triangle
+    SOURCES main.cpp
+    SHADERS triangle.slang
+    SCAFFOLD vkc_context vkc_swapchain vkc_frame
+)
+```
+
+`vkc_pipeline` — what this chapter becomes — is absent, and `SHADERS` is new: it stages
+`triangle.slang` next to the binary so the program can compile it at startup.
+
+## New includes
+
+```cpp title="code/src/1.getting_started/hello_triangle/main.cpp"
+#include <vkc/capture.hpp>
+#include <vkc/check.hpp>
+#include <vkc/context.hpp>
+#include <vkc/frame.hpp>
+#include <vkc/paths.hpp>
+#include <vkc/swapchain.hpp>
+#include <vkc/window.hpp>
+
+#include <slang-com-ptr.h>
+#include <slang.h>
+
+#include <SDL3/SDL.h>
+#include <spdlog/spdlog.h>
+
+#include <cstdlib>
+#include <exception>
+#include <format>
+#include <stdexcept>
+#include <string>
+#include <vector>
+```
+
+Slang's compiler API, and `vkc::shader_dir` from `paths.hpp` to find the file.
+
 ## Vulkan takes SPIR-V, not source
 
 Vulkan does not accept shader source. It accepts **SPIR-V**, a binary intermediate
 representation, so something has to do the translation.
 
-That is already a real improvement over the OpenGL model, where you handed the driver a
-string of GLSL and every vendor's front end understood it slightly differently. SPIR-V
-moves parsing out of the driver: there is one compiler, one dialect, and the driver
-receives something much closer to machine code.
+That is already an improvement over the OpenGL model, where you handed the driver a string of
+GLSL and every vendor's front end understood it slightly differently. SPIR-V moves parsing out
+of the driver: one compiler, one dialect, and the driver receives something much closer to
+machine code.
 
-*When* the translation happens is a separate question, and you have a choice. Shipping
-engines do it offline and load the binary. This series does it **when the program
-starts**: the samples link Slang's compiler as a library and hand it the `.slang` file
-sitting beside the binary. The file next to the executable *is* the shader — edit it,
-run again, and the change is there, with no build step in between. The cost is a
-library to link and a few milliseconds at startup; chapter 1.9 weighs that properly.
+*When* the translation happens is a separate question, and you have a choice. Shipping engines
+do it offline and load the binary. This series does it **when the program starts**: the samples
+link Slang's compiler as a library and hand it the `.slang` file sitting beside the binary.
+Edit it, run again, and the change is there, with no build step in between.
 
-Several languages compile to SPIR-V. This series uses **Slang** — an open-source
-shading language stewarded by Khronos, shipped in the Vulkan SDK, with a syntax
-descended from HLSL. Two of its properties matter immediately:
+Several languages compile to SPIR-V. This series uses **Slang** — an open-source shading
+language stewarded by Khronos, with a syntax descended from HLSL. Two of its properties matter
+immediately:
 
-- **One file holds every stage of a pipeline**, and compiles to one SPIR-V module with
-  one entry point per stage. The vertex-to-fragment interface is a struct that both
-  stages share rather than two lists of declarations you keep in step by hand.
-- **It is an ordinary modern language**, with generics, modules, interfaces and real
-  type checking, which starts to matter around the lighting chapters where the same
-  shading code gets reused across a dozen pipelines.
-
-If you know GLSL, nothing here will be unfamiliar for long: the types are spelled
-`float3` instead of `vec3`, `mix` is `lerp`, and the layout qualifiers become
-attributes. Appendix *Slang for GLSL programmers* is the full table.
-
-Declaring it takes one line:
-
-```cmake title="code/src/1.getting_started/hello_triangle/CMakeLists.txt"
-add_chapter(1.7.hello_triangle
-    SOURCES main.cpp
-    SHADERS triangle.slang
-    NO_SCAFFOLD
-)
-```
-
-One shader file, not two. The build does not compile it — it copies it to
-`bin/shaders/1.7.hello_triangle/`, where the running program will find it. There is no
-`.spv` file anywhere in this project.
+- **One file holds every stage of a pipeline**, compiling to one SPIR-V module with one entry
+  point per stage. The vertex-to-fragment interface is a struct both stages share rather than
+  two lists you keep in step by hand.
+- **It is an ordinary modern language**, with generics, modules and real type checking, which
+  starts to matter in Part 2 where shading code is reused across a dozen pipelines.
 
 :::note[Where Slang comes from]
-CMake looks for an installed Slang and, not finding one, downloads the official release
-build and uses that. Nothing to install by hand on either platform. The Vulkan SDK ships
-Slang too, and is picked up if you have it.
+From vcpkg, as the `shader-slang` port, pinned in `code/vcpkg.json` along with every other
+dependency. Nothing is fetched at configure time — the articles quote Slang's diagnostics and
+its SPIR-V output, so the version has to be pinned for those quotes to stay true.
 :::
 
-## The vertex shader
+## The shader, in full
 
 ```slang title="code/src/1.getting_started/hello_triangle/triangle.slang"
 struct VSOutput {
     float4 position : SV_Position;
     [[vk::location(0)]] float3 colour;
 };
+```
 
+`SV_Position` is a **system-value semantic**: it marks the one output every vertex shader must
+write, the clip-space position. GLSL spells this `gl_Position` and makes it a global; Slang
+makes it a field of the output struct, which is why the struct is the return type. Everything
+else is an ordinary varying, and `[[vk::location(n)]]` is the slot it travels in.
+
+```slang title="code/src/1.getting_started/hello_triangle/triangle.slang"
 static const float2 kPositions[3] = {
     float2( 0.0, -0.5),   // top
     float2( 0.5,  0.5),   // bottom right
@@ -84,7 +172,33 @@ static const float3 kColours[3] = {
     float3(0.0, 1.0, 0.0),
     float3(0.0, 0.0, 1.0),
 };
+```
 
+The vertices are in the shader. There is no vertex buffer in this chapter, deliberately:
+buffers, GPU memory and staging uploads are chapter 1.8's subject, and meeting them here would
+mean learning two large things at once.
+
+:::caution[Vulkan's y axis points down]
+In clip space, x and y run −1 to 1 with **y pointing down** the screen, and z runs **0 to 1**.
+OpenGL has y pointing up and z running −1 to 1.
+
+```
+        Vulkan                    OpenGL
+    (-1,-1) ┌─────┐ (1,-1)    (-1, 1) ┌─────┐ (1, 1)
+            │     │                   │     │
+    (-1, 1) └─────┘ (1, 1)    (-1,-1) └─────┘ (1,-1)
+      y increases downward       y increases upward
+```
+
+So `-0.5` in y is the *top* of the screen here. A shader or projection matrix copied from
+OpenGL material renders upside down, and a depth buffer set up for OpenGL's range produces
+results that look almost right, which is worse.
+
+This project sets `GLM_FORCE_DEPTH_ZERO_TO_ONE` globally to deal with the depth half. The y
+flip is handled where it arises, and flagged each time.
+:::
+
+```slang title="code/src/1.getting_started/hello_triangle/triangle.slang"
 [shader("vertex")]
 VSOutput vertexMain(uint vertex_index: SV_VulkanVertexID) {
     VSOutput output;
@@ -94,48 +208,19 @@ VSOutput vertexMain(uint vertex_index: SV_VulkanVertexID) {
 }
 ```
 
-`[shader("vertex")]` is what makes a function an entry point and says which stage it
-belongs to. The name `vertexMain` is this project's convention, not a rule — Vulkan
-takes the entry point by name, and we will pass that name in shortly.
-
-`SV_Position` is a **system-value semantic**: it marks the one output every vertex
-shader must write, the clip-space position. GLSL spells this `gl_Position` and makes it
-a global; Slang makes it a field of the output struct, which is why the struct is the
-return type. Everything else is an ordinary varying, and `[[vk::location(n)]]` is the
-slot it travels in.
-
-The vertices are in the shader. There is no vertex buffer in this chapter, deliberately:
-buffers, GPU memory and staging uploads are chapter 1.8's subject, and meeting them
-here would mean learning two large things at once.
-
-`SV_VulkanVertexID` counts 0, 1, 2 across the three vertices we asked for, so it can
-index a constant array directly.
+`[shader("vertex")]` is what makes a function an entry point and says which stage it belongs
+to. The name `vertexMain` is this project's convention, not a rule — Vulkan takes the entry
+point by name, and we pass that name in shortly.
 
 :::caution[`SV_VertexID` is not the same thing]
-Slang inherits `SV_VertexID` from HLSL, where the index is relative to the draw. It
-compiles to `VertexIndex - BaseVertex`, which pulls in SPIR-V's `DrawParameters`
-capability — so the validation layers will reject the module unless you enabled
-`shaderDrawParameters` on the device.
+Slang inherits `SV_VertexID` from HLSL, where the index is relative to the draw. It compiles
+to `VertexIndex - BaseVertex`, which pulls in SPIR-V's `DrawParameters` capability — so the
+validation layers reject the module unless you enabled `shaderDrawParameters` on the device.
 
-`SV_VulkanVertexID` is Vulkan's `VertexIndex` builtin with nothing subtracted and
-nothing to enable. The two agree whenever `firstVertex` is 0, which is why the mistake
-can survive a long time before it bites. `SV_InstanceID` and `SV_VulkanInstanceID` are
-the same story.
+`SV_VulkanVertexID` is Vulkan's `VertexIndex` builtin with nothing subtracted and nothing to
+enable. The two agree whenever `firstVertex` is 0, which is why the mistake can survive a long
+time before it bites.
 :::
-
-:::caution[Vulkan's y axis points down]
-In clip space, x and y run -1 to 1 with **y pointing down** the screen, and z runs
-**0 to 1**. OpenGL has y pointing up and z running -1 to 1.
-
-So `-0.5` in y is the *top* of the screen here. A shader or projection matrix copied
-from OpenGL material renders upside down, and a depth buffer set up for OpenGL's range
-produces results that look almost right, which is worse.
-
-This project sets `GLM_FORCE_DEPTH_ZERO_TO_ONE` globally to deal with the depth half.
-The y flip is handled where it arises, and flagged each time.
-:::
-
-## The fragment shader
 
 ```slang title="code/src/1.getting_started/hello_triangle/triangle.slang"
 [shader("fragment")]
@@ -144,61 +229,135 @@ float4 fragmentMain(VSOutput input) : SV_Target {
 }
 ```
 
-Same file, a few lines further down. One invocation per pixel the triangle covers.
+Same file, one invocation per pixel the triangle covers. It takes the **same `VSOutput`
+struct** the vertex shader returned, so there is one declaration of the interface rather than
+two that must agree.
 
-It takes the **same `VSOutput` struct** the vertex shader returned. That is the part
-worth pausing on: the interface between the two stages is one declaration, so the two
-ends cannot drift apart. In GLSL this is a list of `out` declarations in one file and a
-matching list of `in` declarations in another, and keeping the `location` numbers and
-types in step is your problem. Chapter 1.9 looks at what the validation layers do and
-do not catch when they disagree.
+`input.colour` is not the value any single vertex wrote. The hardware **interpolates** the
+three vertex outputs across the triangle, weighted by how close the pixel is to each corner:
 
-`SV_Target` is the semantic for a colour attachment output — `SV_Target0` through
-`SV_TargetN` once there is more than one attachment to address.
-
-`input.colour` is not the value any single vertex wrote. The hardware **interpolates**
-the three vertex outputs across the triangle, weighted by how close the pixel is to
-each corner, which is why the result is a smooth gradient rather than three flat
-regions. That interpolation is free, it is done by fixed-function hardware, and it is
-the basis of nearly everything in the lighting chapters — normals, texture coordinates
-and world positions all reach the fragment shader the same way.
+```
+        red
+         ●
+        ╱ ╲        every pixel gets a weighted blend of the
+       ╱   ╲       three corner values — free, in fixed-function
+      ●─────●      hardware, and the basis of nearly everything
+   blue     green  in the lighting chapters
+```
 
 ## Compiling the shader
 
-`load_shader` is longer than anything else in this chapter that is not the pipeline, and
-almost all of it is Slang's compiler API rather than Vulkan. The shape is four steps:
-
 ```cpp title="code/src/1.getting_started/hello_triangle/main.cpp"
-// 1. The compiler itself, and its standard library.
-Slang::ComPtr<slang::IGlobalSession> global;
-slang::createGlobalSession(global.writeRef());
-
-// 2. What to generate, and where to look for source.
-slang::TargetDesc target{};
-target.format = SLANG_SPIRV;
-target.profile = global->findProfile("spirv_1_6");
-// ... session_desc.searchPaths points at bin/shaders/1.7.hello_triangle/
-
-// 3. Load the file and collect its entry points.
-slang::IModule* module = session->loadModule("triangle", diagnostics.writeRef());
-
-// 4. Compose, link, and ask for the bytes.
-composed->link(linked.writeRef(), diagnostics.writeRef());
-linked->getTargetCode(0, spirv.writeRef(), diagnostics.writeRef());
+    [[nodiscard]] static std::string blob_text(slang::IBlob* blob) {
+        if (blob == nullptr || blob->getBufferSize() == 0) {
+            return {};
+        }
+        return std::string(static_cast<const char*>(blob->getBufferPointer()),
+                           blob->getBufferSize());
+    }
 ```
 
-The global session is the expensive object — it loads the standard module and sets up
-the compiler — and it is meant to be created once and shared. There is one shader here
-so it hardly matters; from 1.8, `vkcommon` caches it.
+Slang reports what went wrong through a **blob** rather than a return code. Every call below
+takes a diagnostics blob, and skipping the check gets you a null module and no idea why.
 
-Step 3 is where the "one file, both stages" property becomes concrete.
-`getDefinedEntryPointCount()` reports how many `[shader("...")]` functions the file has,
-and composing those with the module before linking is what produces a single SPIR-V
-binary containing all of them.
+```cpp title="code/src/1.getting_started/hello_triangle/main.cpp"
+    [[nodiscard]] VkShaderModule load_shader(const char* name) const {
+        Slang::ComPtr<slang::IGlobalSession> global;
+        if (SLANG_FAILED(slang::createGlobalSession(global.writeRef()))) {
+            throw std::runtime_error("slang::createGlobalSession failed");
+        }
 
-Every call takes a `diagnostics` blob rather than returning an error string, and if you
-skip checking them you get a null module and no idea why. Break the shader on purpose
-and you get Slang's own diagnostics, with the line and a caret:
+        slang::TargetDesc target{};
+        target.format = SLANG_SPIRV;
+        target.profile = global->findProfile("spirv_1_6");
+```
+
+The global session owns the compiler and its standard library. It is the expensive object —
+create it once and share it. There is one shader here so it hardly matters; `vkcommon` caches
+it from 1.8 onward.
+
+`Slang::ComPtr` is a reference-counting smart pointer and `writeRef()` hands out the address to
+write into. The API is COM-shaped, which looks odd on Linux and works fine.
+
+SPIR-V 1.6 is the version Vulkan 1.3 consumes.
+
+```cpp title="code/src/1.getting_started/hello_triangle/main.cpp"
+        const slang::CompilerOptionEntry options[]{
+            {slang::CompilerOptionName::EmitSpirvDirectly,
+             {slang::CompilerOptionValueKind::Int, 1, 0, nullptr, nullptr}},
+            {slang::CompilerOptionName::VulkanUseEntryPointName,
+             {slang::CompilerOptionValueKind::Int, 1, 0, nullptr, nullptr}},
+            {slang::CompilerOptionName::DebugInformation,
+             {slang::CompilerOptionValueKind::Int, SLANG_DEBUG_INFO_LEVEL_STANDARD, 0,
+              nullptr, nullptr}},
+        };
+```
+
+Three options, and the middle one is load-bearing. **`VulkanUseEntryPointName`** keeps the
+entry points named after the Slang functions; without it a module's entry point gets renamed
+to `main` and the names stop matching what `pName` asks for below. `slangc` has a
+`-fvk-use-entrypoint-name` flag for the same thing, but this project never runs `slangc` — the
+option is set here, through the API, and that is the only place it exists.
+
+```cpp title="code/src/1.getting_started/hello_triangle/main.cpp"
+        const std::string search_path = vkc::shader_dir(LVK_CHAPTER_ID).string();
+        const char* search_paths[]{search_path.c_str()};
+
+        slang::SessionDesc session_desc{};
+        session_desc.targets = &target;
+        session_desc.targetCount = 1;
+        session_desc.searchPaths = search_paths;
+        session_desc.searchPathCount = 1;
+        session_desc.compilerOptionEntries = options;
+        session_desc.compilerOptionEntryCount = 3;
+```
+
+`LVK_CHAPTER_ID` is a define the build sets to `1.7.hello_triangle`, so the search path
+resolves to the directory the build staged the shader into.
+
+```cpp title="code/src/1.getting_started/hello_triangle/main.cpp"
+        session_desc.defaultMatrixLayoutMode = SLANG_MATRIX_LAYOUT_COLUMN_MAJOR;
+```
+
+:::caution[The matrix layout default is wrong for glm]
+`SessionDesc::defaultMatrixLayoutMode` defaults to row-major, and a `glm::mat4` is sixteen
+floats stored **column** by column, memcpy'd into a uniform buffer with no transpose on the
+way. Leave the default and every transform comes out transposed — it still draws, nothing
+errors, it is simply wrong.
+
+Setting `SLANG_MATRIX_LAYOUT_COLUMN_MAJOR` fixes it, and confusingly makes Slang emit a
+`RowMajor` decoration in the SPIR-V. That is not a contradiction: Slang pairs that decoration
+with `OpVectorTimesMatrix`, and the two conventions cancel.
+
+This does not matter until chapter 1.12, which is exactly when it will cost you an afternoon
+if you have not read this.
+:::
+
+```cpp title="code/src/1.getting_started/hello_triangle/main.cpp"
+        Slang::ComPtr<slang::ISession> session;
+        if (SLANG_FAILED(global->createSession(session_desc, session.writeRef()))) {
+            throw std::runtime_error("slang::IGlobalSession::createSession failed");
+        }
+
+        std::string module_name(name);
+        if (module_name.ends_with(".slang")) {
+            module_name.resize(module_name.size() - 6);
+        }
+
+        Slang::ComPtr<slang::IBlob> diagnostics;
+        slang::IModule* module =
+            session->loadModule(module_name.c_str(), diagnostics.writeRef());
+        if (module == nullptr) {
+            throw std::runtime_error(
+                std::format("Could not compile '{}' from '{}'.\n{}", module_name,
+                            search_path, blob_text(diagnostics)));
+        }
+```
+
+Slang names a file by **module**, without the extension: `triangle.slang` on disk is the module
+`triangle`, found by walking the search paths.
+
+Break the shader on purpose and you get Slang's own diagnostics, with the line and a caret:
 
 ```
 error[E30027]: member not found
@@ -208,188 +367,1969 @@ error[E30027]: member not found
    |        ^^^^^^^^^^^ 'flat_colour' is not a member of 'VSOutput'.
 ```
 
-:::caution[The matrix layout default is wrong for glm]
-`SessionDesc::defaultMatrixLayoutMode` defaults to row-major, and a `glm::mat4` is
-sixteen floats stored **column** by column. Leave the default and every transform comes
-out transposed — it still draws, nothing errors, it is simply wrong.
-
-Setting `SLANG_MATRIX_LAYOUT_COLUMN_MAJOR` fixes it, and confusingly makes Slang emit a
-`RowMajor` decoration in the SPIR-V. That is not a contradiction: Slang pairs that
-decoration with `OpVectorTimesMatrix`, and the two conventions cancel. `slangc`'s command
-line defaults to column-major; the API does not. This does not matter until chapter
-1.12, which is exactly when it will cost you an afternoon if you have not read this.
-:::
-
-## Shader modules
-
 ```cpp title="code/src/1.getting_started/hello_triangle/main.cpp"
-const VkShaderModuleCreateInfo info{
-    .codeSize = spirv->getBufferSize(),
-    .pCode = static_cast<const uint32_t*>(spirv->getBufferPointer()),
-};
+        std::vector<slang::IComponentType*> components{module};
+        const SlangInt entry_point_count = module->getDefinedEntryPointCount();
+        std::vector<Slang::ComPtr<slang::IEntryPoint>> entry_points(
+            static_cast<size_t>(entry_point_count));
+        for (SlangInt i = 0; i < entry_point_count; ++i) {
+            const auto index = static_cast<size_t>(i);
+            if (SLANG_FAILED(
+                    module->getDefinedEntryPoint(i, entry_points[index].writeRef()))) {
+                throw std::runtime_error("slang::IModule::getDefinedEntryPoint failed");
+            }
+            components.push_back(entry_points[index]);
+        }
 ```
 
-After all that, the Vulkan part is six lines. A shader module is just the SPIR-V blob
-handed to the driver. It is *not* compiled to machine code here — that happens at
-pipeline creation, when the driver finally knows the rest of the state the shader will
-run under.
-
-Note `codeSize` is in **bytes** while `pCode` is a `const uint32_t*`. SPIR-V is a stream
-of 32-bit words and must be 4-byte aligned; Slang's blob already is, and that is worth
-checking if you ever change where the bytes come from.
-
-There is **one** module here, not two, because `triangle.slang` compiles to one binary.
-Both pipeline stages point at it and pick their entry point by name:
+This is where "one file, both stages" becomes concrete. `getDefinedEntryPointCount()` reports
+how many `[shader("...")]` functions the file has — two, here — and collecting them alongside
+the module is what will produce a single SPIR-V binary containing both.
 
 ```cpp title="code/src/1.getting_started/hello_triangle/main.cpp"
-const VkShaderModule shader = load_shader("triangle.slang");
+        Slang::ComPtr<slang::IComponentType> composed;
+        diagnostics = nullptr;
+        if (SLANG_FAILED(session->createCompositeComponentType(
+                components.data(), static_cast<SlangInt>(components.size()),
+                composed.writeRef(), diagnostics.writeRef()))) {
+            throw std::runtime_error(std::format("Composing '{}' failed.\n{}",
+                                                 module_name, blob_text(diagnostics)));
+        }
 
-const VkPipelineShaderStageCreateInfo stages[2]{
-    {
-        .stage = VK_SHADER_STAGE_VERTEX_BIT,
-        .module = shader,
-        .pName = "vertexMain",
-    },
-    {
-        .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-        .module = shader,
-        .pName = "fragmentMain",
-    },
-};
+        Slang::ComPtr<slang::IComponentType> linked;
+        diagnostics = nullptr;
+        if (SLANG_FAILED(composed->link(linked.writeRef(), diagnostics.writeRef()))) {
+            throw std::runtime_error(std::format("Linking '{}' failed.\n{}",
+                                                 module_name, blob_text(diagnostics)));
+        }
+
+        Slang::ComPtr<slang::IBlob> spirv;
+        diagnostics = nullptr;
+        if (SLANG_FAILED(
+                linked->getTargetCode(0, spirv.writeRef(), diagnostics.writeRef()))) {
+            throw std::runtime_error(std::format("Generating SPIR-V for '{}' failed.\n{}",
+                                                 module_name, blob_text(diagnostics)));
+        }
 ```
 
-A SPIR-V module can hold as many entry points as you like — that has always been true
-of the format, and `pName` has always been how you select one. It is just that glslang
-never emitted more than one, and always called it `main`, so the field looked like
-boilerplate. With Slang it does real work.
+Compose, link, ask for the bytes. `diagnostics = nullptr` before each call releases the
+previous blob so the next one is not written into a live reference.
 
-The build passes `-fvk-use-entrypoint-name` to keep the SPIR-V entry points named after
-the Slang functions. Without it, a module with a single entry point gets renamed to
-`main`, and the names stop matching what `pName` asks for.
+```cpp title="code/src/1.getting_started/hello_triangle/main.cpp"
+        const VkShaderModuleCreateInfo info{
+            .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .codeSize = spirv->getBufferSize(),
+            .pCode = static_cast<const uint32_t*>(spirv->getBufferPointer()),
+        };
+        VkShaderModule shader_module = VK_NULL_HANDLE;
+        VK_CHECK(vkCreateShaderModule(context_.device(), &info, nullptr,
+                                      &shader_module));
+        return shader_module;
+    }
+```
+
+After all that, the Vulkan part is six lines — the same six they would be if the bytes had come
+from a `.spv` file on disk.
+
+A shader module is just the SPIR-V blob handed to the driver. It is *not* compiled to machine
+code here; that happens at pipeline creation, when the driver finally knows the rest of the
+state the shader will run under.
+
+Note `codeSize` is in **bytes** while `pCode` is a `const uint32_t*`. SPIR-V is a stream of
+32-bit words and must be 4-byte aligned; Slang's blob already is.
+
+## Two stages, one module
+
+```cpp title="code/src/1.getting_started/hello_triangle/main.cpp"
+    void create_pipeline() {
+        const VkDevice device = context_.device();
+
+        const VkShaderModule shader = load_shader("triangle.slang");
+
+        const VkPipelineShaderStageCreateInfo stages[2]{
+            {
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .stage = VK_SHADER_STAGE_VERTEX_BIT,
+                .module = shader,
+                .pName = "vertexMain",
+                .pSpecializationInfo = nullptr,
+            },
+            {
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+                .module = shader,
+                .pName = "fragmentMain",
+                .pSpecializationInfo = nullptr,
+            },
+        };
+```
+
+**One** module, appearing twice with a different `pName` each time. A SPIR-V module can hold as
+many entry points as you like — that has always been true of the format, and `pName` has always
+been how you select one. It is just that glslang never emitted more than one, and always called
+it `main`, so the field looked like boilerplate.
 
 ## The pipeline
 
 Here is the idea that defines Vulkan's approach to state.
 
 In OpenGL you set state one call at a time — bind a shader, enable blending, set a depth
-function — and the driver works out what that combination means at draw time, every
-draw. Vulkan makes you declare the whole configuration up front and compiles it into an
-immutable `VkPipeline`.
+function — and the driver works out what that combination means at draw time, **every draw**.
+Vulkan makes you declare the whole configuration up front and compiles it into an immutable
+`VkPipeline`:
 
-That is why pipeline creation is a large function and why it is a one-off cost:
-expensive at creation, nearly free to bind.
-
-The pieces, briefly:
-
-| Struct | Decides |
-|---|---|
-| `pStages` | Which shaders, and their entry points |
-| `pVertexInputState` | Vertex buffer layout — empty here |
-| `pInputAssemblyState` | How vertices form primitives |
-| `pViewportState` | How many viewports and scissors |
-| `pRasterizationState` | Fill mode, culling, winding order |
-| `pMultisampleState` | Anti-aliasing sample count |
-| `pColorBlendState` | How output combines with what is there |
-| `pDynamicState` | Which state is *not* baked in |
-
-A few fields deserve comment.
-
-```cpp title="code/src/1.getting_started/hello_triangle/main.cpp"
-.cullMode = VK_CULL_MODE_NONE,
-.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
+```
+   OpenGL                          Vulkan
+   glUseProgram()                  ┌──────────────────────┐
+   glEnable(GL_BLEND)              │ shaders, blending,   │  compiled once
+   glDepthFunc()                   │ depth, topology,     │  ──────────────▶ VkPipeline
+   glDrawArrays()  ← driver works  │ vertex layout        │
+                     it out, now   └──────────────────────┘  vkCmdBindPipeline: nearly free
 ```
 
-No culling yet. Face culling gets its own chapter; turning it on now would silently
-discard the triangle if its winding happened to be the other way, and "nothing is drawn
-and nothing is wrong" is a poor place to start debugging.
+That is why pipeline creation is a large function and why it is a one-off cost.
 
 ```cpp title="code/src/1.getting_started/hello_triangle/main.cpp"
-.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                  VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+        const VkPipelineVertexInputStateCreateInfo vertex_input{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .vertexBindingDescriptionCount = 0,
+            .pVertexBindingDescriptions = nullptr,
+            .vertexAttributeDescriptionCount = 0,
+            .pVertexAttributeDescriptions = nullptr,
+        };
+
+        const VkPipelineInputAssemblyStateCreateInfo input_assembly{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+            .primitiveRestartEnable = VK_FALSE,
+        };
 ```
 
-Even with blending disabled, the write mask still has to list the channels to write.
-Leave it at zero — which is what value-initialising the struct gives you — and you get a
-black screen with no error at all.
-
-## Dynamic state
+Vertex input is empty, because the vertex shader generates its own positions from the vertex
+index. Chapter 1.8 fills it in properly. `primitiveRestartEnable` is for strips and fans, where
+a sentinel index starts a new primitive.
 
 ```cpp title="code/src/1.getting_started/hello_triangle/main.cpp"
-const VkDynamicState dynamic_states[2]{
-    VK_DYNAMIC_STATE_VIEWPORT,
-    VK_DYNAMIC_STATE_SCISSOR,
-};
+        const VkPipelineViewportStateCreateInfo viewport_state{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .viewportCount = 1,
+            .pViewports = nullptr,
+            .scissorCount = 1,
+            .pScissors = nullptr,
+        };
 ```
 
-Almost everything is baked in, which would mean rebuilding the pipeline every time the
-window resized. Declaring the viewport and scissor dynamic means supplying them per
-frame instead:
+The **counts matter even though the pointers are null**. The pipeline needs to know there is
+one of each; the values arrive per-frame, because of the dynamic state below.
 
 ```cpp title="code/src/1.getting_started/hello_triangle/main.cpp"
-vkCmdSetViewport(frame.cmd, 0, 1, &viewport);
-vkCmdSetScissor(frame.cmd, 0, 1, &scissor);
+        const VkPipelineRasterizationStateCreateInfo rasterisation{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .depthClampEnable = VK_FALSE,
+            .rasterizerDiscardEnable = VK_FALSE,
+            .polygonMode = VK_POLYGON_MODE_FILL,
+            .cullMode = VK_CULL_MODE_NONE,
+            .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
+            .depthBiasEnable = VK_FALSE,
+            .depthBiasConstantFactor = 0.0F,
+            .depthBiasClamp = 0.0F,
+            .depthBiasSlopeFactor = 0.0F,
+            .lineWidth = 1.0F,
+        };
 ```
 
-The counts in `pViewportState` still matter even though the pointers are null: the
-pipeline needs to know there is one of each.
+**Rasterisation** is the fixed-function step that turns a triangle into the set of pixels it
+covers, deciding which fragment shader invocations happen at all.
 
-The viewport's `minDepth` and `maxDepth` of 0 to 1 are Vulkan's depth range again.
+No culling yet. Face culling gets its own chapter; turning it on now would silently discard the
+triangle if its winding happened to be the other way, and "nothing is drawn and nothing is
+wrong" is a poor place to start debugging.
 
-## The pipeline layout
+`lineWidth` must be `1.0` unless the `wideLines` feature is enabled, even when `polygonMode` is
+`FILL` and the field does nothing.
 
 ```cpp title="code/src/1.getting_started/hello_triangle/main.cpp"
-const VkPipelineLayoutCreateInfo layout_info{
-    .setLayoutCount = 0,
-    .pushConstantRangeCount = 0,
-};
+        const VkPipelineMultisampleStateCreateInfo multisample{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+            .sampleShadingEnable = VK_FALSE,
+            .minSampleShading = 1.0F,
+            .pSampleMask = nullptr,
+            .alphaToCoverageEnable = VK_FALSE,
+            .alphaToOneEnable = VK_FALSE,
+        };
+
+        const VkPipelineColorBlendAttachmentState blend_attachment{
+            .blendEnable = VK_FALSE,
+            .srcColorBlendFactor = VK_BLEND_FACTOR_ONE,
+            .dstColorBlendFactor = VK_BLEND_FACTOR_ZERO,
+            .colorBlendOp = VK_BLEND_OP_ADD,
+            .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+            .dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
+            .alphaBlendOp = VK_BLEND_OP_ADD,
+            .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                              VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+        };
 ```
 
-The layout declares what external data the shaders can see — descriptor sets and push
-constants. This shader reads nothing at all, so the layout is empty. It still has to
-exist, and it comes into its own in chapter 1.10.
+`blendEnable = VK_FALSE` means the fragment shader's output replaces whatever is in the
+attachment, and the six factor and op fields are then ignored.
 
-## No render pass
+**`colorWriteMask` is not ignored.** Even with blending disabled it still has to list the
+channels to write. Leave it at zero — which is what value-initialising the struct gives you —
+and you get a black screen with no error at all.
 
 ```cpp title="code/src/1.getting_started/hello_triangle/main.cpp"
-const VkPipelineRenderingCreateInfo rendering_info{
-    .colorAttachmentCount = 1,
-    .pColorAttachmentFormats = &format_,
-    .depthAttachmentFormat = VK_FORMAT_UNDEFINED,
-};
+        const VkPipelineColorBlendStateCreateInfo blend{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .logicOpEnable = VK_FALSE,
+            .logicOp = VK_LOGIC_OP_COPY,
+            .attachmentCount = 1,
+            .pAttachments = &blend_attachment,
+            .blendConstants = {0.0F, 0.0F, 0.0F, 0.0F},
+        };
 
-const VkGraphicsPipelineCreateInfo pipeline_info{
-    .pNext = &rendering_info,
-    // ...
-    .renderPass = VK_NULL_HANDLE,
-};
+        const VkDynamicState dynamic_states[2]{
+            VK_DYNAMIC_STATE_VIEWPORT,
+            VK_DYNAMIC_STATE_SCISSOR,
+        };
+        const VkPipelineDynamicStateCreateInfo dynamic_state{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .dynamicStateCount = 2,
+            .pDynamicStates = dynamic_states,
+        };
 ```
 
-With dynamic rendering there is no `VkRenderPass` for the pipeline to be compatible
-with, so it is told the attachment formats directly.
+Almost everything is baked in, which would mean rebuilding the pipeline every time the window
+resized. Declaring the viewport and scissor **dynamic** means supplying them per frame instead
+— and those two are dynamic in every sample in this series for exactly that reason.
+
+```cpp title="code/src/1.getting_started/hello_triangle/main.cpp"
+        const VkPipelineLayoutCreateInfo layout_info{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .setLayoutCount = 0,
+            .pSetLayouts = nullptr,
+            .pushConstantRangeCount = 0,
+            .pPushConstantRanges = nullptr,
+        };
+        VK_CHECK(vkCreatePipelineLayout(device, &layout_info, nullptr,
+                                        &pipeline_layout_));
+```
+
+The **layout** declares what external data the shaders can see — descriptor sets and push
+constants. This shader reads nothing at all, so it is empty. It still has to exist, and it comes
+into its own in chapter 1.10.
+
+```cpp title="code/src/1.getting_started/hello_triangle/main.cpp"
+        const VkFormat colour_format = swapchain_.format();
+        const VkPipelineRenderingCreateInfo rendering_info{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+            .pNext = nullptr,
+            .viewMask = 0,
+            .colorAttachmentCount = 1,
+            .pColorAttachmentFormats = &colour_format,
+            .depthAttachmentFormat = VK_FORMAT_UNDEFINED,
+            .stencilAttachmentFormat = VK_FORMAT_UNDEFINED,
+        };
+```
+
+With dynamic rendering there is no `VkRenderPass` for the pipeline to be compatible with, so it
+is told the attachment formats directly. `colour_format` is a named local because the struct
+stores a pointer to it.
 
 :::caution[These must match]
-The formats here must match the `VkRenderingInfo` used at draw time. A mismatch means
-nothing is drawn, and validation's complaint about render pass compatibility is not
-obvious the first time you read it.
+The formats here must match the `VkRenderingInfo` used at draw time. A mismatch means nothing
+is drawn, and validation's complaint about render pass compatibility is not obvious the first
+time you read it.
 :::
 
-Once the pipeline exists, the shader module has been consumed and can be destroyed
-immediately.
-
-## The draw
-
 ```cpp title="code/src/1.getting_started/hello_triangle/main.cpp"
-vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
-vkCmdSetViewport(frame.cmd, 0, 1, &viewport);
-vkCmdSetScissor(frame.cmd, 0, 1, &scissor);
-vkCmdDraw(frame.cmd, 3, 1, 0, 0);
+        const VkGraphicsPipelineCreateInfo pipeline_info{
+            .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+            .pNext = &rendering_info,
+            .flags = 0,
+            .stageCount = 2,
+            .pStages = stages,
+            .pVertexInputState = &vertex_input,
+            .pInputAssemblyState = &input_assembly,
+            .pTessellationState = nullptr,
+            .pViewportState = &viewport_state,
+            .pRasterizationState = &rasterisation,
+            .pMultisampleState = &multisample,
+            .pDepthStencilState = nullptr,  // no depth attachment in this chapter
+            .pColorBlendState = &blend,
+            .pDynamicState = &dynamic_state,
+            .layout = pipeline_layout_,
+            // Null, because dynamic rendering replaced them.
+            .renderPass = VK_NULL_HANDLE,
+            .subpass = 0,
+            .basePipelineHandle = VK_NULL_HANDLE,
+            .basePipelineIndex = -1,
+        };
+
+        VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeline_info,
+                                           nullptr, &pipeline_));
+
+        // The module has been compiled into the pipeline and is no longer needed.
+        vkDestroyShaderModule(device, shader, nullptr);
+    }
 ```
 
-Three vertices, one instance, starting at vertex 0 and instance 0. The vertex shader
-runs three times, the triangle is rasterised, and the fragment shader runs once per
-covered pixel.
+Everything above, in one struct. The second argument to `vkCreateGraphicsPipelines` is a
+`VkPipelineCache`, null here — it is what lets a driver reuse compilation work between runs, and
+it gets its own chapter in Part 4.
+
+Once the pipeline exists the module has been consumed, so it is destroyed immediately.
+
+## The class
+
+```cpp title="code/src/1.getting_started/hello_triangle/main.cpp"
+namespace {
+
+class TriangleApp {
+public:
+    explicit TriangleApp(const vkc::Args& args)
+        : args_(args),
+          window_("LearnVulkan - Hello Triangle", args.width, args.height,
+                  /*resizable=*/args.screenshot.empty()),
+          context_(vkc::Context::Config{
+                       .app_name = "LearnVulkan",
+                       .enable_validation = args.validation,
+                   },
+                   window_),
+          swapchain_(context_, window_),
+          frames_(context_, swapchain_) {
+        create_pipeline();
+        capture_.init(context_.device(), context_.allocator());
+    }
+
+    ~TriangleApp() {
+        context_.wait_idle();
+
+        capture_.destroy();
+        vkDestroyPipeline(context_.device(), pipeline_, nullptr);
+        vkDestroyPipelineLayout(context_.device(), pipeline_layout_, nullptr);
+    }
+
+    TriangleApp(const TriangleApp&) = delete;
+    TriangleApp& operator=(const TriangleApp&) = delete;
+    TriangleApp(TriangleApp&&) = delete;
+    TriangleApp& operator=(TriangleApp&&) = delete;
+```
+
+Four members in dependency order, each built from the ones before it. The destructor is down to
+three lines because `FrameContext` waits for the device and destroys its own fences, semaphores
+and pools.
+
+## The loop
+
+```cpp title="code/src/1.getting_started/hello_triangle/main.cpp"
+    int run() {
+        spdlog::info("Drawing a triangle. Escape or close to quit.");
+
+        uint64_t frames_rendered = 0;
+        bool running = true;
+        bool swapchain_dirty = false;
+
+        while (running) {
+            SDL_Event event;
+            while (SDL_PollEvent(&event)) {
+                if (event.type == SDL_EVENT_QUIT ||
+                    event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED ||
+                    (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_ESCAPE)) {
+                    running = false;
+                } else if (event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) {
+                    swapchain_dirty = true;
+                }
+            }
+
+            if (window_.is_minimised()) {
+                SDL_WaitEvent(nullptr);
+                continue;
+            }
+
+            if (swapchain_dirty) {
+                swapchain_.recreate();
+                frames_.on_swapchain_recreated();
+                swapchain_dirty = false;
+            }
+```
+
+The resize is now deferred with a flag rather than handled inside the event loop. That matters
+once a frame can be *in progress*: rebuilding the swapchain from the middle of the event pump
+would destroy images a queued frame is still using. Marking it dirty and rebuilding at a known
+safe point is the pattern every later chapter uses.
+
+`frames_.on_swapchain_recreated()` is the per-image semaphore rebuild from chapter 1.6, now
+behind one call.
+
+```cpp title="code/src/1.getting_started/hello_triangle/main.cpp"
+            // begin() waits for this frame's slot, acquires an image and opens a
+            // command buffer. It returns nothing when the swapchain went out of
+            // date, in which case the frame is skipped rather than drawn wrong.
+            std::optional<vkc::FrameInfo> frame = frames_.begin();
+            if (!frame.has_value()) {
+                swapchain_dirty = true;
+                continue;
+            }
+
+            const bool capture_this_frame =
+                !args_.screenshot.empty() && args_.frame_limit != 0 &&
+                frames_rendered + 1 == args_.frame_limit;
+
+            record(*frame, capture_this_frame);
+
+            if (!frames_.end(*frame)) {
+                swapchain_dirty = true;
+            }
+
+            ++frames_rendered;
+            if (args_.frame_limit != 0 && frames_rendered >= args_.frame_limit) {
+                running = false;
+            }
+        }
+
+        context_.wait_idle();
+        if (capture_.has_pending_capture()) {
+            capture_.write(args_.screenshot, swapchain_.format());
+        }
+        return 0;
+    }
+```
+
+Chapter 1.6's forty-line `draw_frame` is now `begin()`, `record()`, `end()` — and the only part
+that belongs to this chapter is the middle one.
+
+## Recording the frame
+
+```cpp title="code/src/1.getting_started/hello_triangle/main.cpp"
+private:
+    void record(const vkc::FrameInfo& frame, bool capture_this_frame) {
+        // Swapchain images come back in UNDEFINED layout and must reach
+        // COLOR_ATTACHMENT_OPTIMAL before anything renders into them. Chapter 1.5
+        // wrote this barrier out in full; it is vkc::transition_image now.
+        vkc::transition_image(frame.cmd, frame.image, VK_IMAGE_LAYOUT_UNDEFINED,
+                              VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
+        // A flat dark background now, rather than the cycling colour of 1.5 and 1.6.
+        // The triangle is the subject of this chapter and a moving background would
+        // only fight with it.
+        const VkClearValue clear{.color = {{0.02F, 0.02F, 0.04F, 1.0F}}};
+
+        const VkRenderingAttachmentInfo colour_attachment{
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .pNext = nullptr,
+            .imageView = frame.view,
+            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .resolveMode = VK_RESOLVE_MODE_NONE,
+            .resolveImageView = VK_NULL_HANDLE,
+            .resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .clearValue = clear,
+        };
+
+        const VkRenderingInfo rendering{
+            .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .renderArea = {{0, 0}, frame.extent},
+            .layerCount = 1,
+            .viewMask = 0,
+            .colorAttachmentCount = 1,
+            .pColorAttachments = &colour_attachment,
+            .pDepthAttachment = nullptr,
+            .pStencilAttachment = nullptr,
+        };
+
+        vkCmdBeginRendering(frame.cmd, &rendering);
+```
+
+Chapter 1.5's attachment description, reading `frame.view` and `frame.extent` instead of
+querying the swapchain directly.
+
+```cpp title="code/src/1.getting_started/hello_triangle/main.cpp"
+        vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
+
+        const VkViewport viewport{
+            .x = 0.0F,
+            .y = 0.0F,
+            .width = static_cast<float>(frame.extent.width),
+            .height = static_cast<float>(frame.extent.height),
+            .minDepth = 0.0F,
+            .maxDepth = 1.0F,
+        };
+        vkCmdSetViewport(frame.cmd, 0, 1, &viewport);
+
+        const VkRect2D scissor{.offset = {0, 0}, .extent = frame.extent};
+        vkCmdSetScissor(frame.cmd, 0, 1, &scissor);
+
+        // Three vertices, one instance. The vertex shader runs three times, with
+        // SV_VulkanVertexID counting 0, 1, 2.
+        vkCmdDraw(frame.cmd, 3, 1, 0, 0);
+
+        vkCmdEndRendering(frame.cmd);
+```
+
+The **viewport** maps clip space onto the image; the **scissor** throws away anything outside a
+rectangle. `minDepth` and `maxDepth` of 0 to 1 are Vulkan's depth range — the thing
+`GLM_FORCE_DEPTH_ZERO_TO_ONE` exists to match.
+
+`vkCmdDraw(cmd, 3, 1, 0, 0)` is three vertices, one instance, starting at vertex 0 and instance
+0. The vertex shader runs three times, the triangle is rasterised, and the fragment shader runs
+once per covered pixel.
 
 After six chapters of setup, that is the draw call.
+
+```cpp title="code/src/1.getting_started/hello_triangle/main.cpp"
+        // The presentation engine will only accept an image in PRESENT_SRC_KHR. The
+        // capture helper records its copy and performs that transition itself, so the
+        // image still gets presented either way.
+        if (capture_this_frame) {
+            capture_.record(frame.cmd, frame.image, frame.extent);
+        } else {
+            vkc::transition_image(frame.cmd, frame.image,
+                                  VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                  VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+        }
+    }
+```
+
+Note there is no `vkEndCommandBuffer` here — `frames_.end()` does it, because it is the half
+that submits.
+
+```cpp title="code/src/1.getting_started/hello_triangle/main.cpp"
+    vkc::Args args_;
+    vkc::Window window_;
+    vkc::Context context_;
+    vkc::Swapchain swapchain_;
+    vkc::FrameContext frames_;
+
+    VkPipelineLayout pipeline_layout_ = VK_NULL_HANDLE;
+    VkPipeline pipeline_ = VK_NULL_HANDLE;
+
+    vkc::Capture capture_;
+};
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    try {
+        TriangleApp app(vkc::parse_args(argc, argv));
+        return app.run();
+    } catch (const std::exception& error) {
+        spdlog::error("{}", error.what());
+        return EXIT_FAILURE;
+    }
+}
+```
+
+## The frame loop in full
+
+Chapters 1.5 and 1.6 wrote every line of the frame loop and this chapter has been using
+it through three calls. Here is the file those calls land in.
+
+```cpp title="code/common/scaffold/include/vkc/frame.hpp"
+#include <volk.h>
+
+#include <cstdint>
+#include <optional>
+#include <vector>
+
+namespace vkc {
+
+class Context;
+class Swapchain;
+
+// Number of frames the CPU is allowed to run ahead of the GPU.
+//
+// One would mean the CPU waits for the GPU every single frame and half the machine
+// idles. Three or more adds latency for no throughput gain on a v-synced target.
+// Two is the usual answer, and the reason every sample needs per-frame copies of
+// its command buffer and its synchronisation objects rather than one of each.
+inline constexpr uint32_t kFramesInFlight = 2;
+```
+
+`inline constexpr` at namespace scope is what lets a constant live in a header without
+every translation unit that includes it getting its own copy — `inline` here means "one
+entity, however many times this is seen", which is the same guarantee it gives functions.
+
+```cpp title="code/common/scaffold/include/vkc/frame.hpp"
+void transition_image(VkCommandBuffer cmd, VkImage image, VkImageLayout from,
+                      VkImageLayout to);
+
+void image_barrier(VkCommandBuffer cmd, VkImage image, VkImageLayout from,
+                   VkImageLayout to, VkPipelineStageFlags2 src_stage,
+                   VkAccessFlags2 src_access, VkPipelineStageFlags2 dst_stage,
+                   VkAccessFlags2 dst_access,
+                   VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT);
+
+void begin_rendering(VkCommandBuffer cmd, VkImageView colour_view, VkImageView depth_view,
+                     VkExtent2D extent, const VkClearColorValue& clear_colour);
+```
+
+Three free functions rather than methods, because none of them needs any state beyond
+their arguments.
+
+`transition_image` is the one this chapter calls, and it is chapter 1.5's helper verbatim.
+
+**`image_barrier` is the same barrier said precisely.** `transition_image` names
+`ALL_COMMANDS` on both sides, which forbids overlap that was never a problem — a fine
+trade at the top and bottom of a frame, where there is nothing to overlap with, and the
+wrong trade between two passes that share an image. This version takes the four masks as
+parameters so a caller can say which stage produced the data and which is about to consume
+it. Chapter 4.3 is where that first matters and works through both of its calls mask by
+mask.
+
+`begin_rendering` takes a **depth view** as well as a colour one. This chapter has no depth
+buffer and does not call it; chapter 1.13 adds one and switches to this function. It is
+declared here because it lives in this file, not because you need it yet.
+
+```cpp title="code/common/scaffold/include/vkc/frame.hpp"
+// What a sample gets handed for the duration of one frame.
+struct FrameInfo {
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    uint32_t image_index = 0;
+    VkImage image = VK_NULL_HANDLE;      // the swapchain image being drawn into
+    VkImageView view = VK_NULL_HANDLE;   // its view, for dynamic rendering
+    VkExtent2D extent{};
+    uint64_t frame_number = 0;           // monotonic, never resets
+};
+
+// Owns the per-frame command buffers and synchronisation primitives, and drives the
+// acquire -> record -> submit -> present cycle.
+class FrameContext {
+public:
+    FrameContext(Context& context, Swapchain& swapchain);
+    ~FrameContext();
+
+    FrameContext(const FrameContext&) = delete;
+    FrameContext& operator=(const FrameContext&) = delete;
+    FrameContext(FrameContext&&) = delete;
+    FrameContext& operator=(FrameContext&&) = delete;
+```
+
+`FrameInfo` gathers everything a sample needs for one frame, so `record()` takes one
+argument instead of five. `frame_number` is **monotonic** — it never wraps back to zero
+with the slot index — which is what later chapters animate from.
+
+```cpp title="code/common/scaffold/include/vkc/frame.hpp"
+    [[nodiscard]] std::optional<FrameInfo> begin();
+
+    [[nodiscard]] bool end(const FrameInfo& frame);
+
+    void on_swapchain_recreated();
+
+private:
+    void create_per_frame_objects();
+    void create_per_image_objects();
+    void destroy_per_image_objects() noexcept;
+
+    struct PerFrame {
+        VkCommandPool pool = VK_NULL_HANDLE;
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        // Signalled by the presentation engine when the acquired image is actually
+        // ready to be written to.
+        VkSemaphore image_available = VK_NULL_HANDLE;
+        // Signalled by the GPU when this frame's work is done, so the CPU knows the
+        // command buffer can be reset and reused.
+        VkFence in_flight = VK_NULL_HANDLE;
+    };
+
+    Context& context_;
+    Swapchain& swapchain_;
+
+    std::vector<PerFrame> frames_;
+    // One per swapchain image, not per frame in flight: the semaphore a present
+    // operation waits on must not be reused while that image is still queued for
+    // display, and the image count and the in-flight count are different numbers.
+    std::vector<VkSemaphore> render_finished_;
+
+    uint64_t frame_number_ = 0;
+};
+
+}  // namespace vkc
+```
+
+`PerFrame` is chapter 1.6's struct, now private to the class. The split into **per-frame**
+and **per-image** objects, and the comment explaining why `render_finished_` is sized to
+the image count, are 1.6's one-semaphore-per-image rule preserved where it is easiest to
+get wrong.
+
+Both `begin` and `end` are `[[nodiscard]]` because ignoring either return value means
+silently drawing into an expired swapchain.
+
+```cpp title="code/common/scaffold/src/frame.cpp"
+#include "vkc/frame.hpp"
+
+#include "vkc/check.hpp"
+#include "vkc/context.hpp"
+#include "vkc/swapchain.hpp"
+
+#include <format>
+
+namespace vkc {
+
+void transition_image(VkCommandBuffer cmd, VkImage image, VkImageLayout from,
+                      VkImageLayout to) {
+    const VkImageMemoryBarrier2 barrier{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+        .pNext = nullptr,
+        // ALL_COMMANDS is the sledgehammer: it says "everything before this point,
+        // everywhere in the pipeline". Correct, and slower than it needs to be.
+        .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        .dstAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT,
+        .oldLayout = from,
+        .newLayout = to,
+        // No queue-family ownership transfer: one queue does everything here.
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = image,
+        .subresourceRange =
+            {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0,
+                .levelCount = VK_REMAINING_MIP_LEVELS,
+                .baseArrayLayer = 0,
+                .layerCount = VK_REMAINING_ARRAY_LAYERS,
+            },
+    };
+
+    const VkDependencyInfo dependency{
+        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .pNext = nullptr,
+        .dependencyFlags = 0,
+        .memoryBarrierCount = 0,
+        .pMemoryBarriers = nullptr,
+        .bufferMemoryBarrierCount = 0,
+        .pBufferMemoryBarriers = nullptr,
+        .imageMemoryBarrierCount = 1,
+        .pImageMemoryBarriers = &barrier,
+    };
+
+    vkCmdPipelineBarrier2(cmd, &dependency);
+}
+```
+
+Chapter 1.5's function, unchanged.
+
+```cpp title="code/common/scaffold/src/frame.cpp"
+void image_barrier(VkCommandBuffer cmd, VkImage image, VkImageLayout from,
+                   VkImageLayout to, VkPipelineStageFlags2 src_stage,
+                   VkAccessFlags2 src_access, VkPipelineStageFlags2 dst_stage,
+                   VkAccessFlags2 dst_access, VkImageAspectFlags aspect) {
+    const VkImageMemoryBarrier2 barrier{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+        .pNext = nullptr,
+        .srcStageMask = src_stage,
+        .srcAccessMask = src_access,
+        .dstStageMask = dst_stage,
+        .dstAccessMask = dst_access,
+        .oldLayout = from,
+        .newLayout = to,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = image,
+        .subresourceRange =
+            {
+                .aspectMask = aspect,
+                .baseMipLevel = 0,
+                .levelCount = VK_REMAINING_MIP_LEVELS,
+                .baseArrayLayer = 0,
+                .layerCount = VK_REMAINING_ARRAY_LAYERS,
+            },
+    };
+
+    const VkDependencyInfo dependency{
+        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .pNext = nullptr,
+        .dependencyFlags = 0,
+        .memoryBarrierCount = 0,
+        .pMemoryBarriers = nullptr,
+        .bufferMemoryBarrierCount = 0,
+        .pBufferMemoryBarriers = nullptr,
+        .imageMemoryBarrierCount = 1,
+        .pImageMemoryBarriers = &barrier,
+    };
+    vkCmdPipelineBarrier2(cmd, &dependency);
+}
+```
+
+The same structure with the four masks and the aspect taken as parameters. The **aspect**
+is which part of an image the barrier applies to: `COLOR` for an ordinary image, `DEPTH`
+for a depth buffer. That is the parameter chapter 1.13 needs, since a depth image's
+barrier must name the depth aspect rather than the colour one.
+
+```cpp title="code/common/scaffold/src/frame.cpp"
+void begin_rendering(VkCommandBuffer cmd, VkImageView colour_view, VkImageView depth_view,
+                     VkExtent2D extent, const VkClearColorValue& clear_colour) {
+    const VkRenderingAttachmentInfo colour_attachment{
+        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .pNext = nullptr,
+        .imageView = colour_view,
+        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .resolveMode = VK_RESOLVE_MODE_NONE,
+        .resolveImageView = VK_NULL_HANDLE,
+        .resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+        .clearValue = VkClearValue{.color = clear_colour},
+    };
+
+    // 1.0 is the far plane: clearing to it means every fragment is closer than what is
+    // already there, which is what makes VK_COMPARE_OP_LESS work on the first draw.
+    const VkClearValue depth_clear{.depthStencil = {1.0F, 0}};
+    const VkRenderingAttachmentInfo depth_attachment{
+        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .pNext = nullptr,
+        .imageView = depth_view,
+        .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+        .resolveMode = VK_RESOLVE_MODE_NONE,
+        .resolveImageView = VK_NULL_HANDLE,
+        .resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+        .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+        .clearValue = depth_clear,
+    };
+
+    const VkRenderingInfo rendering{
+        .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .renderArea = {{0, 0}, extent},
+        .layerCount = 1,
+        .viewMask = 0,
+        .colorAttachmentCount = 1,
+        .pColorAttachments = &colour_attachment,
+        .pDepthAttachment = &depth_attachment,
+        .pStencilAttachment = nullptr,
+    };
+    vkCmdBeginRendering(cmd, &rendering);
+}
+```
+
+The colour half is exactly what this chapter's `record()` writes out. The depth half is
+chapter 1.13's, and two of its fields are worth noting in advance since they are here:
+the depth attachment clears to **1.0**, the far plane, so that every fragment in the first
+draw is nearer than what is already there; and its `storeOp` is `DONT_CARE`, because
+nothing reads the depth buffer once the frame is over, which saves writing it back to
+memory.
+
+```cpp title="code/common/scaffold/src/frame.cpp"
+FrameContext::FrameContext(Context& context, Swapchain& swapchain)
+    : context_(context), swapchain_(swapchain) {
+    create_per_frame_objects();
+    create_per_image_objects();
+}
+
+FrameContext::~FrameContext() {
+    // Nothing may be destroyed while the GPU might still be reading it.
+    context_.wait_idle();
+
+    destroy_per_image_objects();
+
+    for (PerFrame& frame : frames_) {
+        vkDestroyFence(context_.device(), frame.in_flight, nullptr);
+        vkDestroySemaphore(context_.device(), frame.image_available, nullptr);
+        // Destroying the pool frees the command buffers allocated from it.
+        vkDestroyCommandPool(context_.device(), frame.pool, nullptr);
+    }
+    frames_.clear();
+}
+```
+
+Chapter 1.6's destructor, moved. This is why `TriangleApp`'s own destructor is three lines:
+the `wait_idle` that every earlier chapter had to remember now happens here.
+
+```cpp title="code/common/scaffold/src/frame.cpp"
+void FrameContext::create_per_frame_objects() {
+    frames_.resize(kFramesInFlight);
+
+    for (uint32_t i = 0; i < kFramesInFlight; ++i) {
+        PerFrame& frame = frames_[i];
+
+        const VkCommandPoolCreateInfo pool_info{
+            .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+            .pNext = nullptr,
+            // We reset and re-record the whole buffer every frame, so let the pool
+            // reuse its memory instead of reallocating.
+            .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+            .queueFamilyIndex = context_.queue_family(),
+        };
+        VK_CHECK(vkCreateCommandPool(context_.device(), &pool_info, nullptr,
+                                     &frame.pool));
+
+        const VkCommandBufferAllocateInfo alloc_info{
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .pNext = nullptr,
+            .commandPool = frame.pool,
+            .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            .commandBufferCount = 1,
+        };
+        VK_CHECK(vkAllocateCommandBuffers(context_.device(), &alloc_info, &frame.cmd));
+
+        const VkSemaphoreCreateInfo semaphore_info{
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+        };
+        VK_CHECK(vkCreateSemaphore(context_.device(), &semaphore_info, nullptr,
+                                   &frame.image_available));
+
+        const VkFenceCreateInfo fence_info{
+            .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+            .pNext = nullptr,
+            // Created already signalled, so the very first frame does not deadlock
+            // waiting for work that was never submitted.
+            .flags = VK_FENCE_CREATE_SIGNALED_BIT,
+        };
+        VK_CHECK(vkCreateFence(context_.device(), &fence_info, nullptr,
+                               &frame.in_flight));
+
+        const std::string label = std::format("frame[{}]", i);
+        context_.name(frame.pool, VK_OBJECT_TYPE_COMMAND_POOL, label.c_str());
+        context_.name(frame.cmd, VK_OBJECT_TYPE_COMMAND_BUFFER, label.c_str());
+    }
+}
+```
+
+Chapter 1.6's `create_frames`, including the signalled-fence flag and the reason for it.
+
+The two `context_.name` calls at the end are new, and they are `vkc::Context::name` from
+chapter 1.5 doing its job: a validation message about the second frame's command buffer now
+says `frame[1]` rather than a hex handle. `label` is a named local because `c_str()` points
+into it and the call reads through that pointer.
+
+```cpp title="code/common/scaffold/src/frame.cpp"
+void FrameContext::create_per_image_objects() {
+    render_finished_.resize(swapchain_.image_count());
+    for (VkSemaphore& semaphore : render_finished_) {
+        const VkSemaphoreCreateInfo info{
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+        };
+        VK_CHECK(vkCreateSemaphore(context_.device(), &info, nullptr, &semaphore));
+    }
+}
+
+void FrameContext::destroy_per_image_objects() noexcept {
+    for (VkSemaphore semaphore : render_finished_) {
+        vkDestroySemaphore(context_.device(), semaphore, nullptr);
+    }
+    render_finished_.clear();
+}
+
+void FrameContext::on_swapchain_recreated() {
+    context_.wait_idle();
+    destroy_per_image_objects();
+    create_per_image_objects();
+}
+```
+
+Chapter 1.6's `rebuild_swapchain`, minus the swapchain itself — the caller does that part,
+which is why this chapter's loop calls `swapchain_.recreate()` and then
+`frames_.on_swapchain_recreated()`.
+
+The `wait_idle` at the top is new and necessary: the semaphores about to be destroyed may
+still be referenced by a present that has not completed.
+
+```cpp title="code/common/scaffold/src/frame.cpp"
+std::optional<FrameInfo> FrameContext::begin() {
+    PerFrame& frame = frames_[frame_number_ % kFramesInFlight];
+
+    // Wait until the GPU has finished the last frame that used this slot. This is
+    // the only CPU/GPU sync point in a well-behaved frame loop.
+    VK_CHECK(vkWaitForFences(context_.device(), 1, &frame.in_flight, VK_TRUE,
+                             UINT64_MAX));
+
+    uint32_t image_index = 0;
+    const VkResult acquired =
+        vkAcquireNextImageKHR(context_.device(), swapchain_.handle(), UINT64_MAX,
+                              frame.image_available, VK_NULL_HANDLE, &image_index);
+
+    if (acquired == VK_ERROR_OUT_OF_DATE_KHR) {
+        // The window changed size under us. Nothing was acquired and the semaphore
+        // was not signalled, so we can simply bail out and rebuild.
+        return std::nullopt;
+    }
+    if (acquired != VK_SUCCESS && acquired != VK_SUBOPTIMAL_KHR) {
+        throw_vulkan_error(acquired, "vkAcquireNextImageKHR", __FILE__, __LINE__);
+    }
+
+    // Reset only now that we know we are definitely going to submit: an early reset
+    // followed by an early return would leave the fence unsignalled forever.
+    VK_CHECK(vkResetFences(context_.device(), 1, &frame.in_flight));
+    VK_CHECK(vkResetCommandBuffer(frame.cmd, 0));
+
+    const VkCommandBufferBeginInfo begin_info{
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .pNext = nullptr,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        .pInheritanceInfo = nullptr,
+    };
+    VK_CHECK(vkBeginCommandBuffer(frame.cmd, &begin_info));
+
+    return FrameInfo{
+        .cmd = frame.cmd,
+        .image_index = image_index,
+        .image = swapchain_.image(image_index),
+        .view = swapchain_.view(image_index),
+        .extent = swapchain_.extent(),
+        .frame_number = frame_number_,
+    };
+}
+```
+
+The first half of chapter 1.6's `draw_frame`, ending where your own recording begins. The
+reset-after-the-early-return ordering that 1.6 called load-bearing is preserved exactly.
+
+```cpp title="code/common/scaffold/src/frame.cpp"
+bool FrameContext::end(const FrameInfo& info) {
+    PerFrame& frame = frames_[frame_number_ % kFramesInFlight];
+
+    VK_CHECK(vkEndCommandBuffer(info.cmd));
+
+    const VkSemaphoreSubmitInfo wait{
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+        .pNext = nullptr,
+        .semaphore = frame.image_available,
+        .value = 0,  // ignored for binary semaphores
+        // Wait only at the point where we actually write colour. Vertex processing
+        // can start before the image is ready.
+        .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+        .deviceIndex = 0,
+    };
+
+    const VkSemaphoreSubmitInfo signal{
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+        .pNext = nullptr,
+        .semaphore = render_finished_[info.image_index],
+        .value = 0,
+        .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        .deviceIndex = 0,
+    };
+
+    const VkCommandBufferSubmitInfo cmd_info{
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+        .pNext = nullptr,
+        .commandBuffer = info.cmd,
+        .deviceMask = 0,
+    };
+
+    const VkSubmitInfo2 submit{
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+        .pNext = nullptr,
+        .flags = 0,
+        .waitSemaphoreInfoCount = 1,
+        .pWaitSemaphoreInfos = &wait,
+        .commandBufferInfoCount = 1,
+        .pCommandBufferInfos = &cmd_info,
+        .signalSemaphoreInfoCount = 1,
+        .pSignalSemaphoreInfos = &signal,
+    };
+
+    VK_CHECK(vkQueueSubmit2(context_.queue(), 1, &submit, frame.in_flight));
+
+    const VkSwapchainKHR swapchain = swapchain_.handle();
+    const VkPresentInfoKHR present{
+        .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+        .pNext = nullptr,
+        .waitSemaphoreCount = 1,
+        .pWaitSemaphores = &render_finished_[info.image_index],
+        .swapchainCount = 1,
+        .pSwapchains = &swapchain,
+        .pImageIndices = &info.image_index,
+        .pResults = nullptr,
+    };
+
+    const VkResult presented = vkQueuePresentKHR(context_.queue(), &present);
+
+    ++frame_number_;
+
+    if (presented == VK_ERROR_OUT_OF_DATE_KHR || presented == VK_SUBOPTIMAL_KHR) {
+        return false;
+    }
+    if (presented != VK_SUCCESS) {
+        throw_vulkan_error(presented, "vkQueuePresentKHR", __FILE__, __LINE__);
+    }
+    return true;
+}
+
+}  // namespace vkc
+```
+
+The second half, ending with the two present results turned into a `bool` instead of being
+handled here — which is what lets the caller decide when it is safe to rebuild, rather than
+having a swapchain destroyed underneath it mid-frame.
+
+## What moves into `vkcommon`
+
+The shader compiler and the eleven pipeline structs become `vkc::load_shader` and
+`vkc::PipelineBuilder`. Chapter 1.8 uses both on its first page.
+
+### Finding the files
+
+```cpp title="code/common/base/include/vkc/paths.hpp"
+#include <filesystem>
+#include <string_view>
+
+namespace vkc {
+
+// Where the build staged this chapter's shader sources, and where bootstrap.py put the
+// shared textures and models. Both are baked in at configure time so a sample runs
+// correctly from any working directory, including from inside a debugger.
+//
+// The shader directory holds .slang source, not SPIR-V: nothing compiles shaders at
+// build time. The samples link libslang and compile them when they start.
+[[nodiscard]] std::filesystem::path shader_dir(std::string_view chapter_id);
+
+[[nodiscard]] std::filesystem::path asset_path(std::string_view relative);
+
+}  // namespace vkc
+```
+
+```cpp title="code/common/base/src/paths.cpp"
+#include "vkc/paths.hpp"
+
+namespace vkc {
+
+std::filesystem::path shader_dir(std::string_view chapter_id) {
+    return std::filesystem::path(LVK_SHADER_DIR) / chapter_id;
+}
+
+std::filesystem::path asset_path(std::string_view relative) {
+    return std::filesystem::path(LVK_ASSET_DIR) / relative;
+}
+
+}  // namespace vkc
+```
+
+Two lines of real code, and the interesting part is what is *not* here. `LVK_SHADER_DIR`
+and `LVK_ASSET_DIR` are absolute paths baked in by CMake at configure time, so a sample
+finds its shader whether you run it from the build directory, from the repository root, or
+from inside a debugger that chose its own working directory. Resolving paths relative to
+the current directory is the usual approach and it breaks the first time something runs the
+binary from somewhere else.
+
+`operator/` on `std::filesystem::path` joins with whatever separator the platform uses.
+
+`asset_path` is for the textures and models `bootstrap.py` downloads; chapter 1.11 is the
+first to call it.
+
+### The pipeline builder's interface
+
+```cpp title="code/common/scaffold/include/vkc/pipeline.hpp"
+#include <volk.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <span>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace vkc {
+
+[[nodiscard]] VkShaderModule load_shader(VkDevice device, std::string_view chapter_id,
+                                         std::string_view shader_name);
+
+class PipelineBuilder {
+public:
+    explicit PipelineBuilder(VkDevice device) noexcept : device_(device) {}
+
+    PipelineBuilder& shaders(VkShaderModule module,
+                             std::string vertex_entry = "vertexMain",
+                             std::string fragment_entry = "fragmentMain");
+
+    PipelineBuilder& vertex_input(
+        std::span<const VkVertexInputBindingDescription> bindings,
+        std::span<const VkVertexInputAttributeDescription> attributes);
+
+    PipelineBuilder& topology(VkPrimitiveTopology topology);
+    PipelineBuilder& polygon_mode(VkPolygonMode mode);
+    PipelineBuilder& cull(VkCullModeFlags mode, VkFrontFace front_face);
+```
+
+Every setter returns `PipelineBuilder&` — a reference to the same object — which is what
+makes them **chainable**:
+
+```cpp
+VkPipeline pipeline = vkc::PipelineBuilder(device)
+                          .shaders(module)
+                          .colour_attachment(swapchain_.format())
+                          .layout(pipeline_layout_)
+                          .build();
+```
+
+That is the **builder** pattern, and it exists here for a specific reason. Creating a
+pipeline needs eleven structs, of which a given chapter cares about one or two. Writing all
+eleven out every time buries the one line that differs. The builder holds the same structs
+with the defaults chapter 1.7 used, and a chapter overrides only what it is teaching.
+
+The entry-point names default to `"vertexMain"` and `"fragmentMain"`, this project's
+convention, so the common case needs no arguments.
+
+`std::span` parameters take any contiguous range — a `std::array`, a `std::vector`, a C
+array — without committing the caller to a container.
+
+```cpp title="code/common/scaffold/include/vkc/pipeline.hpp"
+    PipelineBuilder& depth(VkFormat format, bool test, bool write,
+                           VkCompareOp compare = VK_COMPARE_OP_LESS);
+
+    PipelineBuilder& depth_bias(float constant_factor, float slope_factor);
+
+    PipelineBuilder& stencil_attachment(VkFormat format);
+
+    PipelineBuilder& stencil_test(VkStencilOpState front, VkStencilOpState back);
+
+    PipelineBuilder& colour_attachment(VkFormat format);
+
+    PipelineBuilder& alpha_blending(bool enabled);
+
+    PipelineBuilder& colour_blend(const VkPipelineColorBlendAttachmentState& state);
+
+    PipelineBuilder& fragment_specialisation(
+        std::span<const VkSpecializationMapEntry> entries,
+        std::span<const std::byte> data);
+
+    PipelineBuilder& layout(VkPipelineLayout layout);
+
+    [[nodiscard]] VkPipeline build() const;
+```
+
+Most of these belong to chapters you have not reached, and each is written out in full and
+explained where it is first used: `depth` in 1.13, `fragment_specialisation` in 1.9,
+`colour_blend` and `alpha_blending` in 4.2, `depth_bias` and the two stencil methods in
+4.1. They are listed here because this is the file, not because they are yours yet.
+
+`colour_attachment` is the one this chapter's pipeline needs beyond the shaders and the
+layout — it is the `VkPipelineRenderingCreateInfo` format that dynamic rendering requires.
+
+```cpp title="code/common/scaffold/include/vkc/pipeline.hpp"
+private:
+    VkDevice device_ = VK_NULL_HANDLE;
+
+    VkShaderModule module_ = VK_NULL_HANDLE;
+    std::string vertex_entry_ = "vertexMain";
+    std::string fragment_entry_ = "fragmentMain";
+
+    std::vector<VkVertexInputBindingDescription> bindings_;
+    std::vector<VkVertexInputAttributeDescription> attributes_;
+
+    VkPrimitiveTopology topology_ = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPolygonMode polygon_mode_ = VK_POLYGON_MODE_FILL;
+    VkCullModeFlags cull_mode_ = VK_CULL_MODE_NONE;
+    VkFrontFace front_face_ = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+
+    VkFormat colour_format_ = VK_FORMAT_UNDEFINED;
+    VkFormat depth_format_ = VK_FORMAT_UNDEFINED;
+    bool depth_test_ = false;
+    bool depth_write_ = false;
+    VkCompareOp depth_compare_ = VK_COMPARE_OP_LESS;
+
+    bool depth_bias_ = false;
+    float depth_bias_constant_ = 0.0F;
+    float depth_bias_slope_ = 0.0F;
+
+    VkFormat stencil_format_ = VK_FORMAT_UNDEFINED;
+    bool stencil_test_ = false;
+    VkStencilOpState stencil_front_{};
+    VkStencilOpState stencil_back_{};
+
+    bool blending_ = false;
+    bool custom_blend_ = false;
+    VkPipelineColorBlendAttachmentState blend_state_{};
+
+    std::vector<VkSpecializationMapEntry> specialisation_entries_;
+    std::vector<std::byte> specialisation_data_;
+
+    VkPipelineLayout layout_ = VK_NULL_HANDLE;
+};
+
+}  // namespace vkc
+```
+
+**Every default here is the value this chapter used**: triangle list, filled polygons, no
+culling, counter-clockwise front faces, no depth test, no blending. A builder with nothing
+set but shaders, colour format and layout produces precisely the pipeline you wrote above.
+
+The `bindings_` and `attributes_` are `std::vector`s rather than the `std::span`s the
+setter takes, because the builder must own a copy — the reason is in the implementation
+below.
+
+### The shader compiler
+
+```cpp title="code/common/scaffold/src/pipeline.cpp"
+#include "vkc/pipeline.hpp"
+
+#include "vkc/check.hpp"
+#include "vkc/paths.hpp"
+
+#include <slang-com-ptr.h>
+#include <slang.h>
+
+#include <cstddef>
+#include <format>
+#include <iterator>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace vkc {
+namespace {
+
+// SPIR-V 1.6 is the version Vulkan 1.3 consumes, and 1.3 is this project's baseline.
+constexpr const char* kSpirvProfile = "spirv_1_6";
+
+// Slang reports errors and warnings through a blob rather than a return code, so every
+// call that can produce diagnostics gets checked through here.
+[[nodiscard]] std::string blob_text(slang::IBlob* blob) {
+    if (blob == nullptr || blob->getBufferSize() == 0) {
+        return {};
+    }
+    return std::string(static_cast<const char*>(blob->getBufferPointer()),
+                       blob->getBufferSize());
+}
+```
+
+`blob_text` is your helper, with a null check added — a call that succeeds may leave the
+diagnostics blob null rather than empty.
+
+```cpp title="code/common/scaffold/src/pipeline.cpp"
+// One global session for the life of the process.
+//
+// Creating it is the expensive part of using Slang -- it loads the standard module and
+// sets up the compiler -- and it is designed to be created once and shared. Everything
+// after it is cheap enough to do per shader.
+[[nodiscard]] slang::IGlobalSession& global_session() {
+    static Slang::ComPtr<slang::IGlobalSession> session = [] {
+        Slang::ComPtr<slang::IGlobalSession> created;
+        if (SLANG_FAILED(slang::createGlobalSession(created.writeRef()))) {
+            throw std::runtime_error("slang::createGlobalSession failed");
+        }
+        return created;
+    }();
+    return *session;
+}
+
+}  // namespace
+```
+
+This is the one real change from your version, and the article said it was coming: your
+`load_shader` created a global session on **every call**, which is fine for one shader and
+wasteful once a chapter loads three.
+
+The fix is the **function-local static** from chapter 1.1, with a twist: the initialiser is
+an immediately-invoked lambda — a function defined and called on the spot, which is the
+`[] { ... }()` shape. It exists because the construction needs several statements and a
+static's initialiser is a single expression.
+
+The same guarantee applies as before: constructed on first call, exactly once, even across
+threads. If it throws, the exception propagates out of `global_session()` and the next call
+tries again.
+
+```cpp title="code/common/scaffold/src/pipeline.cpp"
+VkShaderModule load_shader(VkDevice device, std::string_view chapter_id,
+                           std::string_view shader_name) {
+    // Chapter 1.7 wrote all of this out by hand and explained it line by line; this is
+    // that code with the error handling filled in and the global session cached.
+    slang::IGlobalSession& global = global_session();
+
+    slang::TargetDesc target{};
+    target.format = SLANG_SPIRV;
+    target.profile = global.findProfile(kSpirvProfile);
+    if (target.profile == SLANG_PROFILE_UNKNOWN) {
+        throw std::runtime_error(
+            std::format("Slang does not know the profile '{}'", kSpirvProfile));
+    }
+
+    const slang::CompilerOptionEntry options[]{
+        // Use Slang's own SPIR-V backend rather than routing through generated GLSL.
+        {slang::CompilerOptionName::EmitSpirvDirectly,
+         {slang::CompilerOptionValueKind::Int, 1, 0, nullptr, nullptr}},
+        // Keep the SPIR-V entry points named after the Slang functions. Without
+        // this, a module with one entry point gets it renamed to "main" and the
+        // names stop matching what pName asks for.
+        {slang::CompilerOptionName::VulkanUseEntryPointName,
+         {slang::CompilerOptionValueKind::Int, 1, 0, nullptr, nullptr}},
+        // Debug info, so RenderDoc can show the original Slang beside the disassembly.
+        {slang::CompilerOptionName::DebugInformation,
+         {slang::CompilerOptionValueKind::Int, SLANG_DEBUG_INFO_LEVEL_STANDARD, 0,
+          nullptr, nullptr}},
+    };
+
+    const std::string search_path = shader_dir(chapter_id).string();
+    const char* search_paths[]{search_path.c_str()};
+
+    slang::SessionDesc session_desc{};
+    session_desc.targets = &target;
+    session_desc.targetCount = 1;
+    session_desc.searchPaths = search_paths;
+    session_desc.searchPathCount = 1;
+    session_desc.compilerOptionEntries = options;
+    session_desc.compilerOptionEntryCount =
+        static_cast<uint32_t>(std::size(options));
+```
+
+Your three options, with two small hardenings. `findProfile` is checked against
+`SLANG_PROFILE_UNKNOWN`, which is what it returns for a name it does not recognise — a
+silent zero that would otherwise surface much later as a confusing compile failure. And
+`std::size(options)` replaces the literal `3`, so adding a fourth option cannot leave the
+count behind.
+
+```cpp title="code/common/scaffold/src/pipeline.cpp"
+    // Matrix layout, and this is the one that will bite you.
+    //
+    // The session default is SLANG_MATRIX_LAYOUT_ROW_MAJOR, which does not match glm --
+    // a glm::mat4 is sixteen floats stored column by column, and it is memcpy'd into a
+    // uniform buffer or a push constant with no transpose on the way. Leave the default
+    // and every transform comes out transposed: the image still draws, so nothing
+    // errors, it is just wrong.
+    //
+    // Setting COLUMN_MAJOR makes Slang emit a RowMajor decoration in the SPIR-V, which
+    // looks like the opposite of what was asked for and is not. Slang pairs that
+    // decoration with OpVectorTimesMatrix, and storing transposed while multiplying on
+    // the other side is the same arithmetic as storing plainly and multiplying
+    // normally. The two conventions cancel. What matters is that this line makes mul(M,
+    // v) mean "apply M to v" for a matrix whose bytes came from glm.
+    //
+    // slangc's command line defaults to this; the API does not.
+    session_desc.defaultMatrixLayoutMode = SLANG_MATRIX_LAYOUT_COLUMN_MAJOR;
+
+    Slang::ComPtr<slang::ISession> session;
+    if (SLANG_FAILED(global.createSession(session_desc, session.writeRef()))) {
+        throw std::runtime_error("slang::IGlobalSession::createSession failed");
+    }
+
+    // Slang addresses a file by module name, without the extension: "quad.slang" on
+    // disk is the module "quad", found by walking the search paths above.
+    std::string module_name(shader_name);
+    if (module_name.ends_with(".slang")) {
+        module_name.resize(module_name.size() - 6);
+    }
+
+    Slang::ComPtr<slang::IBlob> diagnostics;
+    slang::IModule* module =
+        session->loadModule(module_name.c_str(), diagnostics.writeRef());
+    if (module == nullptr) {
+        throw std::runtime_error(std::format(
+            "Could not compile shader module '{}' from '{}'.\n{}", module_name,
+            search_path, blob_text(diagnostics)));
+    }
+```
+
+The matrix-layout line and the whole of its comment are the caution box from earlier in
+this chapter, kept next to the code it is about because it is the single easiest thing in
+this project to lose.
+
+```cpp title="code/common/scaffold/src/pipeline.cpp"
+    // Every [shader("...")] function in the file becomes an entry point of the SPIR-V
+    // module. Composing them with the module itself and linking is what produces one
+    // binary holding the whole pipeline.
+    std::vector<slang::IComponentType*> components{module};
+    const SlangInt entry_point_count = module->getDefinedEntryPointCount();
+    std::vector<Slang::ComPtr<slang::IEntryPoint>> entry_points(
+        static_cast<size_t>(entry_point_count));
+    for (SlangInt i = 0; i < entry_point_count; ++i) {
+        const size_t index = static_cast<size_t>(i);
+        if (SLANG_FAILED(
+                module->getDefinedEntryPoint(i, entry_points[index].writeRef()))) {
+            throw std::runtime_error(
+                std::format("Could not read entry point {} of '{}'", i, module_name));
+        }
+        components.push_back(entry_points[index]);
+    }
+    if (entry_point_count == 0) {
+        throw std::runtime_error(std::format(
+            "'{}' declares no entry points. Mark one with [shader(\"vertex\")] or "
+            "[shader(\"fragment\")].",
+            module_name));
+    }
+```
+
+The zero-entry-point check is new, and it exists because the failure without it is
+particularly unhelpful: a file that compiles cleanly but has no `[shader("...")]`
+attribute produces a module, links, generates valid SPIR-V containing nothing, and fails
+much later at pipeline creation with a complaint about a missing stage. Forgetting the
+attribute is an easy mistake, so the error names it.
+
+```cpp title="code/common/scaffold/src/pipeline.cpp"
+    Slang::ComPtr<slang::IComponentType> composed;
+    diagnostics = nullptr;
+    if (SLANG_FAILED(session->createCompositeComponentType(
+            components.data(), static_cast<SlangInt>(components.size()),
+            composed.writeRef(), diagnostics.writeRef()))) {
+        throw std::runtime_error(std::format("Composing '{}' failed.\n{}", module_name,
+                                             blob_text(diagnostics)));
+    }
+
+    Slang::ComPtr<slang::IComponentType> linked;
+    diagnostics = nullptr;
+    if (SLANG_FAILED(composed->link(linked.writeRef(), diagnostics.writeRef()))) {
+        throw std::runtime_error(std::format("Linking '{}' failed.\n{}", module_name,
+                                             blob_text(diagnostics)));
+    }
+
+    Slang::ComPtr<slang::IBlob> spirv;
+    diagnostics = nullptr;
+    if (SLANG_FAILED(
+            linked->getTargetCode(0, spirv.writeRef(), diagnostics.writeRef()))) {
+        throw std::runtime_error(std::format("Generating SPIR-V for '{}' failed.\n{}",
+                                             module_name, blob_text(diagnostics)));
+    }
+
+    // codeSize is in bytes; pCode is a uint32_t*. Slang's blob is already aligned for
+    // it, which is the one thing worth checking if you ever swap the source of the
+    // bytes.
+    const VkShaderModuleCreateInfo info{
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .codeSize = spirv->getBufferSize(),
+        .pCode = static_cast<const uint32_t*>(spirv->getBufferPointer()),
+    };
+
+    VkShaderModule shader_module = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateShaderModule(device, &info, nullptr, &shader_module));
+    return shader_module;
+}
+```
+
+Compose, link, take the bytes, wrap them — your code, with each failure now carrying
+Slang's own diagnostics in the message.
+
+### The setters
+
+```cpp title="code/common/scaffold/src/pipeline.cpp"
+PipelineBuilder& PipelineBuilder::shaders(VkShaderModule module,
+                                          std::string vertex_entry,
+                                          std::string fragment_entry) {
+    module_ = module;
+    vertex_entry_ = std::move(vertex_entry);
+    fragment_entry_ = std::move(fragment_entry);
+    return *this;
+}
+
+PipelineBuilder& PipelineBuilder::vertex_input(
+    std::span<const VkVertexInputBindingDescription> bindings,
+    std::span<const VkVertexInputAttributeDescription> attributes) {
+    // Copied rather than referenced: a builder is usually filled in from temporaries
+    // and then built a few lines later, and dangling pointers into a dead array are
+    // exactly the kind of bug that shows up as a driver crash with no message.
+    bindings_.assign(bindings.begin(), bindings.end());
+    attributes_.assign(attributes.begin(), attributes.end());
+    return *this;
+}
+```
+
+That comment is the reason the members are vectors. A `std::span` does not own anything,
+and the natural way to call this is with a temporary array built on the spot. Storing the
+span would leave the builder pointing at memory that died at the end of the statement, and
+`build()` would read it. Copying costs a few dozen bytes and removes the whole class of
+bug.
+
+`std::move` on the two strings hands over their buffers rather than copying, which is why
+the parameters are taken by value.
+
+```cpp title="code/common/scaffold/src/pipeline.cpp"
+PipelineBuilder& PipelineBuilder::topology(VkPrimitiveTopology topology) {
+    topology_ = topology;
+    return *this;
+}
+
+PipelineBuilder& PipelineBuilder::polygon_mode(VkPolygonMode mode) {
+    polygon_mode_ = mode;
+    return *this;
+}
+
+PipelineBuilder& PipelineBuilder::cull(VkCullModeFlags mode, VkFrontFace front_face) {
+    cull_mode_ = mode;
+    front_face_ = front_face;
+    return *this;
+}
+
+PipelineBuilder& PipelineBuilder::depth(VkFormat format, bool test, bool write,
+                                        VkCompareOp compare) {
+    depth_format_ = format;
+    depth_test_ = test;
+    depth_write_ = write;
+    depth_compare_ = compare;
+    return *this;
+}
+
+PipelineBuilder& PipelineBuilder::depth_bias(float constant_factor, float slope_factor) {
+    depth_bias_ = true;
+    depth_bias_constant_ = constant_factor;
+    depth_bias_slope_ = slope_factor;
+    return *this;
+}
+
+PipelineBuilder& PipelineBuilder::stencil_attachment(VkFormat format) {
+    stencil_format_ = format;
+    return *this;
+}
+
+PipelineBuilder& PipelineBuilder::stencil_test(VkStencilOpState front,
+                                               VkStencilOpState back) {
+    stencil_test_ = true;
+    stencil_front_ = front;
+    stencil_back_ = back;
+    return *this;
+}
+
+PipelineBuilder& PipelineBuilder::colour_attachment(VkFormat format) {
+    colour_format_ = format;
+    return *this;
+}
+
+PipelineBuilder& PipelineBuilder::alpha_blending(bool enabled) {
+    blending_ = enabled;
+    return *this;
+}
+
+PipelineBuilder& PipelineBuilder::colour_blend(
+    const VkPipelineColorBlendAttachmentState& state) {
+    blend_state_ = state;
+    custom_blend_ = true;
+    return *this;
+}
+
+PipelineBuilder& PipelineBuilder::fragment_specialisation(
+    std::span<const VkSpecializationMapEntry> entries,
+    std::span<const std::byte> data) {
+    specialisation_entries_.assign(entries.begin(), entries.end());
+    specialisation_data_.assign(data.begin(), data.end());
+    return *this;
+}
+
+PipelineBuilder& PipelineBuilder::layout(VkPipelineLayout layout) {
+    layout_ = layout;
+    return *this;
+}
+```
+
+Fourteen setters that each store a value and return `*this`. There is no cleverness here
+and that is the point — all the behaviour is in `build()`.
+
+Note `colour_blend` sets a second flag, `custom_blend_`, rather than just storing the
+struct. `build()` needs to distinguish "no blend state was given" from "a blend state that
+happens to be all zeroes", and a separate bool is the honest way to say so.
+
+### Building
+
+```cpp title="code/common/scaffold/src/pipeline.cpp"
+VkPipeline PipelineBuilder::build() const {
+    if (module_ == VK_NULL_HANDLE) {
+        throw std::runtime_error("PipelineBuilder::build: shaders() was never called");
+    }
+    if (layout_ == VK_NULL_HANDLE) {
+        throw std::runtime_error("PipelineBuilder::build: layout() was never called");
+    }
+    if (colour_format_ == VK_FORMAT_UNDEFINED) {
+        throw std::runtime_error(
+            "PipelineBuilder::build: colour_attachment() was never called");
+    }
+```
+
+Three things have no sensible default, so forgetting one is a mistake worth naming. Without
+these checks the failure arrives from the driver as a validation message about a null
+handle, several layers away from the line that forgot to set it.
+
+```cpp title="code/common/scaffold/src/pipeline.cpp"
+    const VkSpecializationInfo specialisation{
+        .mapEntryCount = static_cast<uint32_t>(specialisation_entries_.size()),
+        .pMapEntries = specialisation_entries_.data(),
+        .dataSize = specialisation_data_.size(),
+        .pData = specialisation_data_.data(),
+    };
+    const VkSpecializationInfo* fragment_specialisation =
+        specialisation_entries_.empty() ? nullptr : &specialisation;
+
+    const VkPipelineShaderStageCreateInfo stages[2]{
+        {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .stage = VK_SHADER_STAGE_VERTEX_BIT,
+            // Both stages come from the same module; pName is what picks one of the
+            // two entry points out of it.
+            .module = module_,
+            .pName = vertex_entry_.c_str(),
+            .pSpecializationInfo = nullptr,
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+            .module = module_,
+            .pName = fragment_entry_.c_str(),
+            .pSpecializationInfo = fragment_specialisation,
+        },
+    };
+```
+
+The two `VkPipelineShaderStageCreateInfo` entries are yours: one module, named twice.
+`pSpecializationInfo` is null unless a chapter supplied entries, which is chapter 1.9's
+subject — a way of baking constants into a shader at pipeline-creation time.
+
+```cpp title="code/common/scaffold/src/pipeline.cpp"
+    const VkPipelineVertexInputStateCreateInfo vertex_input{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .vertexBindingDescriptionCount = static_cast<uint32_t>(bindings_.size()),
+        .pVertexBindingDescriptions = bindings_.data(),
+        .vertexAttributeDescriptionCount = static_cast<uint32_t>(attributes_.size()),
+        .pVertexAttributeDescriptions = attributes_.data(),
+    };
+
+    const VkPipelineInputAssemblyStateCreateInfo input_assembly{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .topology = topology_,
+        .primitiveRestartEnable = VK_FALSE,
+    };
+```
+
+Empty vectors give the counts of `0` and the null pointers this chapter passed by hand, so
+the default is 1.7's behaviour: a shader that invents its own vertices.
+
+**Input assembly** is the fixed-function step between fetching vertices and rasterising
+them: it groups the stream of vertices into primitives according to the topology. With
+`TRIANGLE_LIST`, every three vertices form one triangle; with `TRIANGLE_STRIP`, each new
+vertex forms a triangle with the previous two.
+
+```cpp title="code/common/scaffold/src/pipeline.cpp"
+    // The counts matter even though the pointers are null: the pipeline needs to know
+    // there is one viewport and one scissor, and the values arrive at record time.
+    const VkPipelineViewportStateCreateInfo viewport_state{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .viewportCount = 1,
+        .pViewports = nullptr,
+        .scissorCount = 1,
+        .pScissors = nullptr,
+    };
+
+    const VkPipelineRasterizationStateCreateInfo rasterisation{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .depthClampEnable = VK_FALSE,
+        .rasterizerDiscardEnable = VK_FALSE,
+        .polygonMode = polygon_mode_,
+        .cullMode = cull_mode_,
+        .frontFace = front_face_,
+        .depthBiasEnable = depth_bias_ ? VK_TRUE : VK_FALSE,
+        .depthBiasConstantFactor = depth_bias_constant_,
+        // No clamp: 0 means "do not limit the bias", which is what you want until a
+        // steeply-angled polygon produces a slope-scaled offset large enough to push
+        // geometry through something else.
+        .depthBiasClamp = 0.0F,
+        .depthBiasSlopeFactor = depth_bias_slope_,
+        .lineWidth = 1.0F,
+    };
+```
+
+The `VkPipelineRasterizationStateCreateInfo` from earlier with the three settable fields
+substituted in. `rasterizerDiscardEnable` — throwing away every primitive before it is
+rasterised, for a pipeline run purely for its side effects — stays false everywhere in this
+series.
+
+```cpp title="code/common/scaffold/src/pipeline.cpp"
+    const VkPipelineMultisampleStateCreateInfo multisample{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+        .sampleShadingEnable = VK_FALSE,
+        .minSampleShading = 1.0F,
+        .pSampleMask = nullptr,
+        .alphaToCoverageEnable = VK_FALSE,
+        .alphaToOneEnable = VK_FALSE,
+    };
+```
+
+**Multisampling** is anti-aliasing done in the rasteriser: instead of asking "is the centre
+of this pixel inside the triangle?", the hardware tests several sample positions per pixel
+and blends the results, so an edge becomes a gradient instead of a staircase. The fragment
+shader still usually runs once per pixel, which is what makes it cheaper than rendering at
+a higher resolution.
+
+`VK_SAMPLE_COUNT_1_BIT` is one sample per pixel — multisampling off — throughout Part 1.
+Chapter 4.9 turns it on, and the `VkPipelineMultisampleStateCreateInfo` is where.
+
+```cpp title="code/common/scaffold/src/pipeline.cpp"
+    const VkPipelineDepthStencilStateCreateInfo depth_stencil{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .depthTestEnable = depth_test_ ? VK_TRUE : VK_FALSE,
+        .depthWriteEnable = depth_write_ ? VK_TRUE : VK_FALSE,
+        .depthCompareOp = depth_compare_,
+        .depthBoundsTestEnable = VK_FALSE,
+        .stencilTestEnable = stencil_test_ ? VK_TRUE : VK_FALSE,
+        .front = stencil_front_,
+        .back = stencil_back_,
+        .minDepthBounds = 0.0F,
+        .maxDepthBounds = 1.0F,
+    };
+```
+
+This chapter passed `nullptr` for the whole struct, because there was no depth attachment.
+The builder always provides one with the test disabled, which is equivalent and means a
+chapter that calls `.depth(...)` needs no special case. Chapter 1.13 is where it matters.
+
+```cpp title="code/common/scaffold/src/pipeline.cpp"
+    // alpha_blending() picks between these two; colour_blend() replaces the choice with
+    // a struct the chapter filled in itself. Chapter 4.2 explains what every field here
+    // does and why source-over is the arrangement almost everything uses.
+    const VkPipelineColorBlendAttachmentState blend_attachment =
+        custom_blend_ ? blend_state_
+                      : VkPipelineColorBlendAttachmentState{
+                            .blendEnable = blending_ ? VK_TRUE : VK_FALSE,
+                            .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA,
+                            .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+                            .colorBlendOp = VK_BLEND_OP_ADD,
+                            // Keep the attachment's own alpha rather than storing the
+                            // fragment's. Chapter 4.2 explains what goes wrong the other
+                            // way round: the rendered image itself ends up transparent
+                            // wherever a blended fragment happened to be.
+                            .srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
+                            .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+                            .alphaBlendOp = VK_BLEND_OP_ADD,
+                            .colorWriteMask =
+                                VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+                        };
+
+    const VkPipelineColorBlendStateCreateInfo blend{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .logicOpEnable = VK_FALSE,
+        .logicOp = VK_LOGIC_OP_COPY,
+        .attachmentCount = 1,
+        .pAttachments = &blend_attachment,
+        .blendConstants = {0.0F, 0.0F, 0.0F, 0.0F},
+    };
+```
+
+Two structs with confusingly similar names, and the distinction is worth fixing now.
+
+A **`VkPipelineColorBlendAttachmentState`** describes blending for **one attachment** — the
+factors, the operation, and the write mask. A **`VkPipelineColorBlendStateCreateInfo`**
+describes blending for the **whole pipeline** and holds an array of the first, one per
+colour attachment. A pipeline rendering into three targets has one of the outer struct and
+three of the inner.
+
+The factors here differ from the ones you wrote. Yours used `ONE` and `ZERO` with blending
+disabled, which means "take the source, ignore the destination". The builder's default is
+**source-over alpha blending** — `SRC_ALPHA` and `ONE_MINUS_SRC_ALPHA` — which is only
+*used* when `alpha_blending(true)` is called, since `blendEnable` still decides whether any
+of it happens. Chapter 4.2 works through why that pair is the arrangement almost everything
+uses, and why the alpha channel is handled differently from the colour ones.
+
+`colorWriteMask` names all four channels, for the reason this chapter already gave: it is
+consulted whether or not blending is enabled, and a zero mask is a black screen with no
+error.
+
+```cpp title="code/common/scaffold/src/pipeline.cpp"
+    const VkDynamicState dynamic_states[]{VK_DYNAMIC_STATE_VIEWPORT,
+                                          VK_DYNAMIC_STATE_SCISSOR};
+    const VkPipelineDynamicStateCreateInfo dynamic_state{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .dynamicStateCount = 2,
+        .pDynamicStates = dynamic_states,
+    };
+
+    const VkPipelineRenderingCreateInfo rendering_info{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+        .pNext = nullptr,
+        .viewMask = 0,
+        .colorAttachmentCount = 1,
+        .pColorAttachmentFormats = &colour_format_,
+        .depthAttachmentFormat = depth_format_,
+        .stencilAttachmentFormat = stencil_format_,
+    };
+```
+
+Viewport and scissor are dynamic in every pipeline this series builds, so the builder does
+not make it optional. The scissor is a `VkRect2D` — an offset and an extent — supplied at
+record time with `vkCmdSetScissor`, and fragments outside it are discarded.
+
+`pColorAttachmentFormats` points at the **member**, `colour_format_`, which is why `build()`
+being `const` is safe but taking the address of a local copy would not be.
+
+```cpp title="code/common/scaffold/src/pipeline.cpp"
+    const VkGraphicsPipelineCreateInfo pipeline_info{
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+        .pNext = &rendering_info,
+        .flags = 0,
+        .stageCount = 2,
+        .pStages = stages,
+        .pVertexInputState = &vertex_input,
+        .pInputAssemblyState = &input_assembly,
+        .pTessellationState = nullptr,
+        .pViewportState = &viewport_state,
+        .pRasterizationState = &rasterisation,
+        .pMultisampleState = &multisample,
+        .pDepthStencilState = &depth_stencil,
+        .pColorBlendState = &blend,
+        .pDynamicState = &dynamic_state,
+        .layout = layout_,
+        // No render pass: that is what VkPipelineRenderingCreateInfo replaces.
+        .renderPass = VK_NULL_HANDLE,
+        .subpass = 0,
+        .basePipelineHandle = VK_NULL_HANDLE,
+        .basePipelineIndex = -1,
+    };
+
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipeline_info,
+                                       nullptr, &pipeline));
+    return pipeline;
+}
+
+}  // namespace vkc
+```
+
+The same final struct you wrote, assembled from members instead of literals.
+
+That is the whole of `vkc_pipeline`. From chapter 1.8, building a pipeline is five chained
+calls — and every one of the eleven structs behind them is a struct you have now written
+once by hand and read once in its final form.
 
 ## Running it
 
@@ -397,9 +2337,9 @@ After six chapters of setup, that is the draw call.
 ./code/out/build/linux-debug/bin/1.7.hello_triangle
 ```
 
-A triangle with a red apex, green bottom-right and blue bottom-left, blending smoothly
-between them. Resize the window — the triangle scales with it, because the viewport is
-dynamic and no pipeline rebuild is needed.
+A triangle with a red apex, green bottom-right and blue bottom-left, blending smoothly between
+them. Resize the window — the triangle scales with it, because the viewport is dynamic and no
+pipeline rebuild is needed.
 
 ## What you have built
 
@@ -413,33 +2353,46 @@ Worth taking stock. The program now:
 - keeps the CPU and GPU working simultaneously with correct synchronisation
 - compiles shaders, builds a pipeline, and draws
 
-That is the foundation. Everything from here — textures, lighting, shadows, PBR — is
-built on exactly this.
+Chapters 1.1 to 1.7 wrote every one of those by hand. From 1.8 the last piece — the pipeline
+builder — joins the scaffold, and there is nothing left to withhold.
 
-:::note[From the next chapter, `vkcommon`]
-Chapters 1.1 to 1.7 each built all of this by hand. From 1.8 onward the samples use a
-shared library, `vkcommon`, which contains precisely the code you have just read:
-`Window`, `Context`, `Swapchain` and `FrameContext`.
+## Words introduced in this chapter
 
-Nothing new is hidden in it. Each chapter states exactly which helper replaced the code
-it taught, and you can read any of it at `code/common/scaffold/`.
-:::
+| | |
+|---|---|
+| **SPIR-V** | the binary shader format Vulkan accepts; source is never passed to a driver |
+| **shader module** | a SPIR-V blob handed to the driver, not yet machine code |
+| **entry point** | one `[shader("...")]` function, selected by name in `pName` |
+| **pipeline** | the whole draw configuration compiled into one immutable object |
+| **pipeline layout** | the declaration of what external data the shaders may see |
+| **dynamic state** | the few pieces deliberately left out of the pipeline, set per frame |
+| **rasterisation** | turning a triangle into the pixels it covers |
+| **interpolation** | the free per-pixel blend of the three vertex outputs |
+| **input assembly** | the stage that groups incoming vertices into primitives, per the topology |
+| **multisampling** | taking several coverage samples per pixel to smooth edges; off here |
+| **scissor** | a `VkRect2D` outside which fragments are discarded, separate from the viewport |
+| **builder** | an object collecting settings through chained calls before producing the result |
+| **global session** | Slang's compiler instance, expensive to create and shared for the process |
 
 ## Exercises
 
-1. Change the vertex positions so the triangle is upside down. Convince yourself which
-   way y points.
-2. Make all three vertices the same colour and watch the gradient disappear — the
-   interpolation is still happening, between three identical values.
-3. Set `cullMode` to `VK_CULL_MODE_BACK_BIT`. The triangle vanishes or does not,
-   depending on its winding. Then reverse the vertex order and watch it flip.
-4. Add a second `vkCmdDraw` after the first. Nothing changes, because it draws the same
-   three vertices in the same place. Making the second one useful is what push
-   constants are for, in 1.10.
-5. Set `polygonMode` to `VK_POLYGON_MODE_LINE` for a wireframe. Note this needs the
-   `fillModeNonSolid` feature enabled at device creation — validation will tell you so
-   if you forget, which is a good demonstration of why features are opt-in.
-6. Rename `fragmentMain` in the shader to something else, rebuild, and read the error.
-   Then fix it by changing `pName` rather than the shader. Two different places to say
-   the same name is the cost of one module holding both stages, and it is worth feeling
-   once.
+1. Change the vertex positions so the triangle is upside down. Convince yourself which way y
+   points.
+2. Make all three vertices the same colour and watch the gradient disappear — the interpolation
+   is still happening, between three identical values.
+3. Set `cullMode` to `VK_CULL_MODE_BACK_BIT`. The triangle vanishes or does not, depending on
+   its winding. Then reverse the vertex order and watch it flip.
+4. Add a second `vkCmdDraw` after the first. Nothing changes, because it draws the same three
+   vertices in the same place. Making the second one useful is what push constants are for, in
+   1.10.
+5. Set `polygonMode` to `VK_POLYGON_MODE_LINE` for a wireframe. This needs the `fillModeNonSolid`
+   feature enabled at device creation — validation will tell you so if you forget, which is a
+   good demonstration of why features are opt-in.
+6. Rename `fragmentMain` in the shader, rebuild, and read the error. Then fix it by changing
+   `pName` rather than the shader. Two places to say the same name is the cost of one module
+   holding both stages.
+7. Set `colorWriteMask` to `0`. The screen goes to the clear colour with no validation message
+   whatsoever — proof that "no error" and "correct" are different things.
+
+Next: [memory and buffers](/getting-started/memory-and-buffers/) — moving the vertices out of
+the shader and into GPU memory.

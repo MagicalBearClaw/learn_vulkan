@@ -11,9 +11,17 @@
 //                     are not "executed"; they are submitted to a queue.
 //   VkDevice          your connection to one physical device, with exactly the
 //                     features you asked for switched on and nothing else.
+//
+// The window and the instance are no longer built here. Chapter 1.1 wrote the window
+// and 1.2 wrote the instance, the layers and the debug messenger, each explaining
+// every line; both now come from the scaffold as vkc::Window and vkc::Instance. This
+// chapter's CMakeLists names exactly those two, so a slip into vkc::Device -- the very
+// thing this chapter teaches -- would fail to link.
 
 #include <vkc/capture.hpp>
 #include <vkc/check.hpp>
+#include <vkc/instance.hpp>
+#include <vkc/window.hpp>
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
@@ -32,63 +40,12 @@
 
 namespace {
 
-constexpr const char* kValidationLayer = "VK_LAYER_KHRONOS_validation";
-
 // The one device extension this series needs. Dynamic rendering and synchronization2
 // were folded into core in Vulkan 1.3, so unlike a 1.0-era tutorial there is nothing
 // else to ask for here.
 constexpr std::array kRequiredDeviceExtensions = {
     VK_KHR_SWAPCHAIN_EXTENSION_NAME,
 };
-
-bool layer_available(std::string_view name) {
-    uint32_t count = 0;
-    VK_CHECK(vkEnumerateInstanceLayerProperties(&count, nullptr));
-    std::vector<VkLayerProperties> layers(count);
-    VK_CHECK(vkEnumerateInstanceLayerProperties(&count, layers.data()));
-    return std::ranges::any_of(layers, [name](const VkLayerProperties& layer) {
-        return name == layer.layerName;
-    });
-}
-
-bool instance_extension_available(std::string_view name) {
-    uint32_t count = 0;
-    VK_CHECK(vkEnumerateInstanceExtensionProperties(nullptr, &count, nullptr));
-    std::vector<VkExtensionProperties> extensions(count);
-    VK_CHECK(vkEnumerateInstanceExtensionProperties(nullptr, &count, extensions.data()));
-    return std::ranges::any_of(extensions, [name](const VkExtensionProperties& ext) {
-        return name == ext.extensionName;
-    });
-}
-
-VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(
-    VkDebugUtilsMessageSeverityFlagBitsEXT severity,
-    VkDebugUtilsMessageTypeFlagsEXT /*types*/,
-    const VkDebugUtilsMessengerCallbackDataEXT* data, void* /*user_data*/) {
-    if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
-        spdlog::error("[vulkan] {}", data->pMessage);
-    } else if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
-        spdlog::warn("[vulkan] {}", data->pMessage);
-    } else {
-        spdlog::info("[vulkan] {}", data->pMessage);
-    }
-    return VK_FALSE;
-}
-
-VkDebugUtilsMessengerCreateInfoEXT debug_messenger_info() {
-    return VkDebugUtilsMessengerCreateInfoEXT{
-        .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
-        .pNext = nullptr,
-        .flags = 0,
-        .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
-                           VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
-        .messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
-                       VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
-                       VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
-        .pfnUserCallback = debug_callback,
-        .pUserData = nullptr,
-    };
-}
 
 const char* device_type_name(VkPhysicalDeviceType type) {
     switch (type) {
@@ -154,9 +111,17 @@ int score_device(const VkPhysicalDeviceProperties& props) {
 
 class DeviceApp {
 public:
-    explicit DeviceApp(const vkc::Args& args) : args_(args) {
-        init_window();
-        init_instance();
+    explicit DeviceApp(const vkc::Args& args)
+        : args_(args),
+          // 1.1's window and 1.2's instance, from the scaffold. Declared in this
+          // order so that the instance outlives nothing it should not: members are
+          // destroyed in reverse, so the instance goes before the window.
+          window_("LearnVulkan - Devices and Queues", args.width, args.height,
+                  /*resizable=*/args.screenshot.empty()),
+          instance_(vkc::Instance::Config{
+              .app_name = "LearnVulkan",
+              .enable_validation = args.validation,
+          }) {
         create_surface();
         select_physical_device();
         create_device();
@@ -164,8 +129,9 @@ public:
     }
 
     ~DeviceApp() {
-        // Strict reverse order. Vulkan will not warn you at run time if you get this
-        // wrong, but the validation layers will, loudly.
+        // Strict reverse order, and only for what this chapter created. Vulkan will
+        // not warn you at run time if you get this wrong, but the validation layers
+        // will, loudly.
         if (allocator_ != VK_NULL_HANDLE) {
             vmaDestroyAllocator(allocator_);
         }
@@ -173,18 +139,9 @@ public:
             vkDestroyDevice(device_, nullptr);
         }
         if (surface_ != VK_NULL_HANDLE) {
-            SDL_Vulkan_DestroySurface(instance_, surface_, nullptr);
+            SDL_Vulkan_DestroySurface(instance_.handle(), surface_, nullptr);
         }
-        if (debug_messenger_ != VK_NULL_HANDLE) {
-            vkDestroyDebugUtilsMessengerEXT(instance_, debug_messenger_, nullptr);
-        }
-        if (instance_ != VK_NULL_HANDLE) {
-            vkDestroyInstance(instance_, nullptr);
-        }
-        if (window_ != nullptr) {
-            SDL_DestroyWindow(window_);
-        }
-        SDL_Quit();
+        // instance_ and window_ destroy themselves, in that order, after this runs.
     }
 
     DeviceApp(const DeviceApp&) = delete;
@@ -215,86 +172,15 @@ public:
     }
 
 private:
-    void init_window() {
-        if (!SDL_Init(SDL_INIT_VIDEO)) {
-            throw std::runtime_error(std::format("SDL_Init failed: {}", SDL_GetError()));
-        }
-        // Resizable, except on a --screenshot run: tiling window managers choose the size
-        // of a resizable window themselves, which would make the book's reference images
-        // depend on whatever else is open. A fixed-size window gets the size asked for.
-        window_ = SDL_CreateWindow("LearnVulkan - Devices and Queues",
-                                   static_cast<int>(args_.width),
-                                   static_cast<int>(args_.height),
-                                   SDL_WINDOW_VULKAN |
-                                   (args_.screenshot.empty() ? SDL_WINDOW_RESIZABLE : 0));
-        if (window_ == nullptr) {
-            throw std::runtime_error(
-                std::format("SDL_CreateWindow failed: {}", SDL_GetError()));
-        }
-    }
-
-    void init_instance() {
-        VK_CHECK(volkInitialize());
-
-        const VkApplicationInfo app_info{
-            .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
-            .pNext = nullptr,
-            .pApplicationName = "LearnVulkan",
-            .applicationVersion = VK_MAKE_VERSION(0, 1, 0),
-            .pEngineName = "LearnVulkan",
-            .engineVersion = VK_MAKE_VERSION(0, 1, 0),
-            .apiVersion = VK_API_VERSION_1_3,
-        };
-
-        uint32_t sdl_extension_count = 0;
-        const char* const* sdl_extensions =
-            SDL_Vulkan_GetInstanceExtensions(&sdl_extension_count);
-        if (sdl_extensions == nullptr) {
-            throw std::runtime_error(std::format(
-                "SDL_Vulkan_GetInstanceExtensions failed: {}", SDL_GetError()));
-        }
-        std::vector<const char*> extensions(sdl_extensions,
-                                            sdl_extensions + sdl_extension_count);
-
-        validation_enabled_ = args_.validation && layer_available(kValidationLayer);
-        debug_utils_enabled_ =
-            instance_extension_available(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
-        if (debug_utils_enabled_) {
-            extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
-        }
-
-        std::vector<const char*> layers;
-        if (validation_enabled_) {
-            layers.push_back(kValidationLayer);
-        }
-
-        const VkDebugUtilsMessengerCreateInfoEXT messenger_info = debug_messenger_info();
-        const bool debug_at_creation = validation_enabled_ && debug_utils_enabled_;
-
-        const VkInstanceCreateInfo create_info{
-            .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-            .pNext = debug_at_creation ? &messenger_info : nullptr,
-            .flags = 0,
-            .pApplicationInfo = &app_info,
-            .enabledLayerCount = static_cast<uint32_t>(layers.size()),
-            .ppEnabledLayerNames = layers.data(),
-            .enabledExtensionCount = static_cast<uint32_t>(extensions.size()),
-            .ppEnabledExtensionNames = extensions.data(),
-        };
-        VK_CHECK(vkCreateInstance(&create_info, nullptr, &instance_));
-        volkLoadInstanceOnly(instance_);
-
-        if (debug_at_creation) {
-            VK_CHECK(vkCreateDebugUtilsMessengerEXT(instance_, &messenger_info, nullptr,
-                                                    &debug_messenger_));
-        }
-    }
-
     void create_surface() {
         // The surface is the bridge between Vulkan and the window system. It belongs
         // to the instance, not the device, because which GPUs can present to it is
         // one of the things we are about to ask.
-        if (!SDL_Vulkan_CreateSurface(window_, instance_, nullptr, &surface_)) {
+        //
+        // vkc::Window wraps this same pair of calls for later chapters; it is written
+        // out here because the surface is part of what this chapter teaches.
+        if (!SDL_Vulkan_CreateSurface(window_.handle(), instance_.handle(), nullptr,
+                                      &surface_)) {
             throw std::runtime_error(
                 std::format("SDL_Vulkan_CreateSurface failed: {}", SDL_GetError()));
         }
@@ -302,13 +188,13 @@ private:
 
     void select_physical_device() {
         uint32_t count = 0;
-        VK_CHECK(vkEnumeratePhysicalDevices(instance_, &count, nullptr));
+        VK_CHECK(vkEnumeratePhysicalDevices(instance_.handle(), &count, nullptr));
         if (count == 0) {
             throw std::runtime_error(
                 "No Vulkan-capable GPU found. Check your graphics driver.");
         }
         std::vector<VkPhysicalDevice> devices(count);
-        VK_CHECK(vkEnumeratePhysicalDevices(instance_, &count, devices.data()));
+        VK_CHECK(vkEnumeratePhysicalDevices(instance_.handle(), &count, devices.data()));
 
         spdlog::info("Found {} physical device(s):", count);
 
@@ -433,7 +319,7 @@ private:
             .pDeviceMemoryCallbacks = nullptr,
             .pHeapSizeLimit = nullptr,
             .pVulkanFunctions = &functions,
-            .instance = instance_,
+            .instance = instance_.handle(),
             .vulkanApiVersion = VK_API_VERSION_1_3,
             .pTypeExternalMemoryHandleTypes = nullptr,
         };
@@ -463,9 +349,9 @@ private:
     }
 
     vkc::Args args_;
-    SDL_Window* window_ = nullptr;
-    VkInstance instance_ = VK_NULL_HANDLE;
-    VkDebugUtilsMessengerEXT debug_messenger_ = VK_NULL_HANDLE;
+    vkc::Window window_;
+    vkc::Instance instance_;
+
     VkSurfaceKHR surface_ = VK_NULL_HANDLE;
     VkPhysicalDevice gpu_ = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties gpu_properties_{};
@@ -473,8 +359,6 @@ private:
     VkQueue queue_ = VK_NULL_HANDLE;
     uint32_t queue_family_ = UINT32_MAX;
     VmaAllocator allocator_ = VK_NULL_HANDLE;
-    bool validation_enabled_ = false;
-    bool debug_utils_enabled_ = false;
 };
 
 }  // namespace

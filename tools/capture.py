@@ -132,12 +132,29 @@ def main() -> int:
     parser.add_argument("--chapter", help="capture only chapters whose name contains this")
     parser.add_argument("--update", action="store_true", help="overwrite the reference images instead of comparing")
     parser.add_argument("--out", type=Path, help="write captures here instead of a temporary directory")
+    parser.add_argument("--no-build", action="store_true",
+                        help="skip the build step and capture whatever binaries are there")
     args = parser.parse_args()
 
     if not args.all and not args.chapter:
         parser.error("pass --all or --chapter NAME")
 
     build_dir = BIN_DIR / args.preset
+
+    # Build first, and refuse to run if that fails.
+    #
+    # Without this the tool happily captures whatever binaries happen to be on disk, so a
+    # sample that no longer compiles is reported as "ok" on the strength of its last
+    # successful build. That is exactly backwards for a regression check, and it bit this
+    # project once already.
+    if not args.no_build:
+        build = subprocess.run(["cmake", "--build", str(build_dir)],
+                               capture_output=True, text=True)
+        if build.returncode != 0:
+            print("build failed; refusing to capture stale binaries", file=sys.stderr)
+            print(build.stdout[-3000:] or build.stderr[-3000:], file=sys.stderr)
+            return 1
+
     binaries = find_binaries(build_dir, args.chapter)
     if not binaries:
         print("nothing to capture", file=sys.stderr)

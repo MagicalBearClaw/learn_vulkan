@@ -41,14 +41,33 @@ function(_lvk_stage_shaders target chapter_id)
     add_dependencies(${target} ${target}_shaders)
 endfunction()
 
-# NO_SCAFFOLD marks a chapter that builds Vulkan by hand rather than using vkcommon.
-# Chapters 1.1 to 1.7 all pass it: they are the chapters that write the scaffold, so
-# linking it would be circular and would hide the very code the article is about.
+# How much of the scaffold a chapter is allowed to see. Exactly one of these applies:
+#
+#   NO_SCAFFOLD          Links vkbase only. Chapter 1.1 passes this: it is the first
+#                        chapter and has nothing to stand on yet.
+#
+#   SCAFFOLD <targets>   Links only those pieces of vkcommon. This is how the rule
+#                        "a reader never meets a helper they have not built" is
+#                        enforced mechanically: a chapter that names
+#                        `vkc_window vkc_instance` and then calls into vkc::Swapchain
+#                        fails to link with an undefined reference. The headers share
+#                        one include tree, so this bites at link time rather than at
+#                        compile time -- which is still a build that does not pass.
+#                        Chapters 1.2 to 1.7 each name what earlier chapters taught.
+#
+#   neither              Links the whole scaffold. Correct from 1.8 onward, by which
+#                        point every piece has been written out and explained.
 function(add_chapter chapter_id)
-    cmake_parse_arguments(ARG "NO_SCAFFOLD" "" "SOURCES;SHADERS;LIBS" ${ARGN})
+    cmake_parse_arguments(ARG "NO_SCAFFOLD" "" "SOURCES;SHADERS;LIBS;SCAFFOLD" ${ARGN})
 
     if(NOT ARG_SOURCES)
         message(FATAL_ERROR "add_chapter(${chapter_id}) requires SOURCES")
+    endif()
+
+    if(ARG_NO_SCAFFOLD AND ARG_SCAFFOLD)
+        message(FATAL_ERROR
+            "add_chapter(${chapter_id}): NO_SCAFFOLD and SCAFFOLD are mutually "
+            "exclusive -- a chapter either stands on nothing or names what it stands on.")
     endif()
 
     string(REPLACE "." "_" target_suffix "${chapter_id}")
@@ -61,6 +80,8 @@ function(add_chapter chapter_id)
 
     if(ARG_NO_SCAFFOLD)
         target_link_libraries(${target} PRIVATE vkbase ${ARG_LIBS})
+    elseif(ARG_SCAFFOLD)
+        target_link_libraries(${target} PRIVATE ${ARG_SCAFFOLD} ${ARG_LIBS})
     else()
         target_link_libraries(${target} PRIVATE vkcommon ${ARG_LIBS})
     endif()

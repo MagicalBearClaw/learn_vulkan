@@ -128,20 +128,33 @@ That last row is the one to tattoo somewhere.
 Everything Part 1 taught, and nothing else:
 
 ```
-window.cpp     1.1        SDL3 window and surface
-context.cpp    1.2, 1.3   instance, debug messenger, device, queue, allocator
-swapchain.cpp  1.4        swapchain and recreation
-frame.cpp      1.5, 1.6   command buffers, sync, frames in flight
-pipeline.cpp   1.7        shader modules and the pipeline builder
-buffer.cpp     1.8        VMA buffers, staging, immediate submit
-image.cpp      1.11       images, views, mip generation, samplers
-camera.cpp     1.14       a first-person camera
-app.cpp        —          the loop the chapters share, plus screenshot support
+base/check.cpp      1.2         VK_CHECK, and VkResult turned into an exception
+base/capture.cpp    1.1, 1.5    the --frames/--screenshot parser, and the screenshot harness
+base/paths.cpp      1.7         where the build staged this chapter's shaders and assets
+base/vma_impl.cpp   1.3         VMA's implementation, compiled in exactly one place
+base/stb_impl.cpp   1.11        stb_image_write's implementation, likewise
+
+window.cpp          1.1         SDL3 window and surface
+instance.cpp        1.2         instance, validation layers, debug messenger
+device.cpp          1.3         physical device, logical device, queue, allocator
+swapchain.cpp       1.4         swapchain and recreation
+context.cpp         1.5         those three held together in the right order
+frame.cpp           1.5, 1.6    command buffers, sync, frames in flight
+pipeline.cpp        1.7         the Slang compiler and the pipeline builder
+app.cpp             1.8         the loop every sample from here on inherits
+buffer.cpp          1.8         VMA buffers, staging, immediate submit
+image.cpp           1.11, 1.13  images, views, mip generation, samplers, depth buffers
+camera.cpp          1.14        a first-person camera
 ```
 
 The rule has not been broken once: nothing entered that library before the chapter that
-wrote it out in full and explained every line. Any of it can be read at
-`code/common/scaffold/`, and the table above says which chapter to go back to.
+wrote it out in full and explained every line — and each of those chapters ends by
+showing the finished file, header and implementation, so the version in the library is
+one you have read rather than one you have inferred.
+
+That claim is checked rather than asserted. `tools/attribution.py --strict` measures
+every line of `code/common/` against the article of the chapter that owns it, and the
+number it prints is 100%.
 
 ## Things Part 1 deliberately did badly
 
@@ -182,9 +195,10 @@ not.
 
 Before moving on, it is worth doing two things.
 
-**Read `code/common/scaffold/` end to end.** It is about 1 500 lines and you have written
-every one of them. It will not take long, and Part 2 gets much easier if `vkcommon` feels
-like your code rather than a library.
+**Read `code/common/` end to end.** It is 3 827 lines across `base/` and `scaffold/`,
+comments included, and every one of them has appeared in an article you have read. It
+will not take long, and Part 2 gets much easier if `vkcommon` feels like your code rather
+than a library.
 
 **Diff two consecutive chapters.** It is the quickest way to see the shape of what each
 one actually added:

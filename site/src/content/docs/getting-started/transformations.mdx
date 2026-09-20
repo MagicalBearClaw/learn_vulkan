@@ -10,204 +10,409 @@ sidebar:
   <figcaption>Chapter 1.12: two quads, the same two matrices, multiplied in opposite orders.</figcaption>
 </figure>
 
-There is almost no new Vulkan in this chapter — a matrix in a push constant, and nothing
-else. It is about the mathematics, because everything from here to the end of the series
-rests on it. A camera is a matrix. A bone in a skeleton is a matrix. A shadow map's light
-is a matrix.
+```cmake title="code/src/1.getting_started/transformations/CMakeLists.txt"
+add_chapter(1.12.transformations
+    SOURCES main.cpp
+    SHADERS transform.slang
+)
+```
 
-The quad's own vertices never change again:
+There is almost no new Vulkan in this chapter — a matrix in a push constant, and nothing else.
+It is about the mathematics, because everything from here to the end of the series rests on it.
+A camera is a matrix. A bone in a skeleton is a matrix. A shadow map's light is a matrix.
+
+## What chapter 1.11 left behind
+
+```cpp title="code/src/1.getting_started/transformations/main.cpp"
+#include <vkc/image.hpp>
+```
+
+```cpp title="code/src/1.getting_started/transformations/main.cpp"
+        texture_ = vkc::load_texture(context(), vkc::asset_path("textures/lvk_grid.png"));
+        sampler_ = vkc::Sampler(context(), vkc::SamplerDesc{
+                                               .address_mode =
+                                                   VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                           });
+```
+
+Chapter 1.11's entire texture path — the staging copy, the `vkCmdBlitImage` mip ladder, the final
+transition to `SHADER_READ_ONLY_OPTIMAL`, the view — is those two lines now. The mip ladder in
+the scaffold is 1.11's loop, unchanged:
+
+```cpp title="code/common/scaffold/src/image.cpp"
+// Chapter 1.11's mip ladder: blit level n-1 into level n, halved, then park level n-1
+// in the layout the shader wants.
+void generate_mipmaps(VkCommandBuffer cmd, const Image& image) {
+    int mip_width = static_cast<int>(image.extent().width);
+    int mip_height = static_cast<int>(image.extent().height);
+
+    for (uint32_t level = 1; level < image.mip_levels(); ++level) {
+        image.transition(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, level - 1, 1);
+```
+
+`vkc::Image` bundles the image, its allocation and one view covering all of it, because those
+three always travel together. **The sampler stays a separate object**, because in Vulkan it is
+one — bundling it would be convenient right up to the moment you want two filters on one texture.
+
+```cpp title="code/common/scaffold/include/vkc/image.hpp"
+struct SamplerDesc {
+    VkFilter mag_filter = VK_FILTER_LINEAR;
+    VkFilter min_filter = VK_FILTER_LINEAR;
+    VkSamplerMipmapMode mipmap_mode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    VkSamplerAddressMode address_mode = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    bool anisotropy = true;
+};
+```
+
+The defaults are 1.11's choices; this chapter overrides one, because nothing here tiles.
+
+```cpp title="code/src/1.getting_started/transformations/main.cpp"
+    vkc::Image texture_;
+    vkc::Sampler sampler_;
+```
+
+```cpp title="code/src/1.getting_started/transformations/main.cpp"
+        sampler_.destroy();
+        texture_.destroy();
+```
+
+```cpp title="code/src/1.getting_started/transformations/main.cpp"
+            .sampler = sampler_.handle(),
+            .imageView = texture_.view(),
+```
+
+Five members and four destroy calls in 1.11 became two and two. The descriptor write is otherwise
+1.11's, reading the handles out of the two wrappers.
+
+```cpp title="code/src/1.getting_started/transformations/main.cpp"
+class TransformApp : public vkc::App {
+```
+
+```cpp title="code/src/1.getting_started/transformations/main.cpp"
+        const VkShaderModule shader =
+            vkc::load_shader(device, LVK_CHAPTER_ID, "transform.slang");
+```
+
+```cpp title="code/src/1.getting_started/transformations/main.cpp"
+        options.title = "LearnVulkan 1.12 - Transformations";
+        TransformApp app(vkc::App::parse_args(argc, argv, options));
+```
+
+## The mesh stops moving
+
+```cpp title="code/src/1.getting_started/transformations/main.cpp"
+#include <glm/gtc/matrix_transform.hpp>
+```
 
 ```cpp title="code/src/1.getting_started/transformations/main.cpp"
 constexpr std::array<Vertex, 4> kVertices{{
     {{-0.5F, -0.5F}, {0.0F, 0.0F}},
-    ...
+    {{0.5F, -0.5F}, {1.0F, 0.0F}},
+    {{0.5F, 0.5F}, {1.0F, 1.0F}},
+    {{-0.5F, 0.5F}, {0.0F, 1.0F}},
 }};
 ```
 
-A unit square at the origin. Where it *appears* is entirely the matrix's business from
-here on.
+`matrix_transform.hpp` is where `translate`, `rotate`, `scale` and `perspective` live — glm keeps
+its core types and its transform helpers in separate headers.
+
+A unit square at the origin. **Its own coordinates never change again**: where it *appears* is
+entirely the matrix's business from here on. That separation — a mesh in its own space, placed by
+a matrix — is what makes it possible to draw the same mesh in twenty places.
+
+## What a matrix actually is
+
+Before using one, it is worth knowing what the sixteen numbers mean. There is one idea here, and
+it makes everything that follows readable instead of memorisable:
+
+> **The columns of a matrix are where the basis vectors land.**
+
+The basis vectors are the unit arrows along the axes: `x = (1,0,0)`, `y = (0,1,0)`,
+`z = (0,0,1)`. Every position is built from them — `(2, 1, -4)` means `2x + 1y - 4z`. So a
+transform is completely pinned down the moment you say where those three arrows end up, and a
+matrix is nothing more than that answer written down, one column each.
+
+Transforming a vector is then exactly what the sentence above implies: scale each column by the
+matching component, and add them up.
+
+```
+   M · v  =  vx·(column x)  +  vy·(column y)  +  vz·(column z)  +  vw·(column t)
+```
+
+A matrix that leaves everything where it was must therefore have its basis vectors in their
+original places:
+
+```
+   the IDENTITY matrix
+
+     x    y    z    t
+   ┌                   ┐
+   │  1    0    0    0 │
+   │  0    1    0    0 │
+   │  0    0    1    0 │
+   │  0    0    0    1 │
+   └                   ┘
+```
+
+Which explains a piece of glm that otherwise looks arbitrary: `glm::mat4(1.0F)` fills the diagonal
+with `1.0F`, and the diagonal is where the basis vectors sit. The argument is not a size and not a
+count. `glm::mat4(0.0F)` is all zeroes, which sends every basis vector to the origin and collapses
+the world to a point.
 
 ## Homogeneous coordinates
 
 A 3D position needs three numbers, so why is `SV_Position` a `float4`?
 
-Because translation is not a linear operation on three components. Scaling and rotation
-can both be written as a 3×3 matrix; moving something cannot, since a matrix always maps
-the origin to the origin. Adding a fourth component fixes it — and having fixed it,
-everything becomes one matrix multiply.
+Because translation cannot be written as a 3×3 matrix, and the column rule shows why in one line.
+Ask a 3×3 matrix to move the origin:
 
-The fourth component, `w`, has a meaning:
-
-- **`w = 1` means a point.** It has a position, and translation moves it.
-- **`w = 0` means a direction.** It has no position, and translation must *not* affect
-  it.
-
-That second case matters more than it first appears. A surface normal is a direction: if
-you translate a model ten metres sideways, its normals must not move with it. Setting
-`w = 0` makes that happen automatically, with no special case — chapter 2.2 leans on this
-directly.
-
-```slang title="code/src/1.getting_started/transformations/transform.slang"
-output.position = mul(push.model, float4(input.position, 0.0, 1.0));
+```
+   M · (0, 0, 0)  =  0·(column x) + 0·(column y) + 0·(column z)  =  (0, 0, 0)
 ```
 
-`w` also does one more job, later: a perspective projection puts the distance to the
-camera into `w`, and the hardware's divide-by-`w` is exactly what makes distant things
-small. That is the next chapter.
+Every column is multiplied by zero, so the result is zero whatever the matrix contains. **A 3×3
+matrix always maps the origin to the origin**, and no choice of the nine numbers changes that.
+Scaling and rotation are fine — they leave the origin alone anyway — but moving something is
+simply not a 3×3 transform.
 
-## The three transforms
+The fix is to add a fourth column holding the offset, and a fourth component on the vector whose
+job is to switch that column on:
 
-Everything you will build is a combination of three operations.
-
-**Scale** multiplies each axis independently. A non-uniform scale — different factors per
-axis — is the one that causes trouble later, because it does not preserve angles, and
-normals transformed by it come out wrong. The fix is the *normal matrix*, and it arrives
-in chapter 2.2 where it is needed.
-
-**Rotation** turns about an axis through the origin. `glm::rotate` takes an angle and an
-axis; in 2D the axis is always z, pointing into the screen.
-
-**Translation** moves. In a 4×4 matrix it lives in the last column, which is the part
-that needs the fourth component to exist.
-
-```cpp title="code/src/1.getting_started/transformations/main.cpp"
-glm::translate(glm::mat4(1.0F), glm::vec3(-0.5F, 0.0F, 0.0F))
-glm::rotate(glm::mat4(1.0F), angle, glm::vec3(0.0F, 0.0F, 1.0F))
-glm::scale(glm::mat4(1.0F), glm::vec3(0.6F, 0.6F, 1.0F))
+```
+   ┌                    ┐   ┌   ┐     ┌         ┐
+   │  1    0    0    tx │   │ x │     │ x + tx  │
+   │  0    1    0    ty │ · │ y │  =  │ y + ty  │
+   │  0    0    1    tz │   │ z │     │ z + tz  │
+   │  0    0    0    1  │   │ 1 │     │    1    │
+   └                    ┘   └   ┘     └         ┘
 ```
 
-Each takes a matrix to build on, which is why `glm::mat4(1.0F)` — the identity — appears
-so often. That argument is *not* a size: a `glm::mat4(1.0F)` is the identity matrix, and
-`glm::mat4(0.0F)` is all zeroes, which silently collapses everything to a point.
+Having added it, the fourth component turns out to carry the point/direction distinction for free.
+Put a zero there and work the same multiplication through:
+
+```
+   w = 1   a POINT.      The t column is added.               Translation moves it.
+   w = 0   a DIRECTION.  The t column is multiplied by zero.  Translation ignores it.
+```
+
+Nobody wrote that as a special case — it falls out of the arithmetic, and you can check it against
+the matrix above in a few seconds. It matters more than it first appears. A surface normal is a
+direction: translate a model ten metres sideways and its normals must not move with it. Setting
+`w = 0` makes that happen with no code at all, and chapter 2.2 leans on it directly.
+
+`w` also does one more job later: a perspective projection arranges for `w` to hold the distance
+to the camera, and the hardware's divide-by-`w` is exactly what makes distant things small. That
+is the next chapter.
+
+## The three transforms, written out
+
+Everything you will build is a combination of three operations, and with the column rule each one
+can be read rather than recalled.
+
+**Scale** stretches each basis vector along its own axis, so each column is a lengthened version of
+where it started:
+
+```
+   ┌                    ┐
+   │  sx   0    0    0  │
+   │  0    sy   0    0  │
+   │  0    0    sz   0  │
+   │  0    0    0    1  │
+   └                    ┘
+```
+
+A non-uniform scale — the `sx`, `sy`, `sz` not all equal — is the one that causes trouble later,
+because it does not preserve angles, and normals transformed by it come out wrong. The fix is the
+*normal matrix*, in chapter 2.2.
+
+**Rotation** turns about an axis through the origin. In 2D the axis is always z, pointing into the
+screen, and the matrix can be derived instead of looked up. Where does `x = (1, 0)` go when the
+plane turns by θ? Onto the unit circle at angle θ — which is `(cos θ, sin θ)`, by the definition of
+sine and cosine. And `y = (0, 1)`, a quarter turn ahead of it, lands at `(-sin θ, cos θ)`. Those
+two answers are the two columns:
+
+```
+   ┌                              ┐
+   │  cos θ   -sin θ    0     0   │
+   │  sin θ    cos θ    0     0   │
+   │    0        0      1     0   │
+   │    0        0      0     1   │
+   └                              ┘
+        ↑         ↑
+      x lands   y lands
+      here      here
+```
+
+Nothing was memorised there; the columns were read off a unit circle. That is the whole content of
+`glm::rotate` for the z axis, and it is worth deriving once rather than looking up forever.
+
+**Translation** moves, and lives in the fourth column — the one the previous section had to invent.
+
+:::note[A rotation is cheaper to undo than it looks]
+The three columns of a rotation matrix are unit length and mutually perpendicular — they are the
+basis vectors, turned, and turning preserves lengths and angles. A matrix like that is called
+**orthonormal**, and its inverse is simply its transpose: flip it across the diagonal and you have
+undone it, with no division and no determinant.
+
+That fact is what makes a camera cheap in chapter 1.14, and the
+[mathematics appendix](/appendices/mathematics/) works through it.
+:::
+
+Each glm helper takes a matrix to build on, which is why `glm::mat4(1.0F)` appears so often. That
+argument is *not* a size: `glm::mat4(1.0F)` is the identity matrix, and `glm::mat4(0.0F)` is all
+zeroes, which silently collapses everything to a point.
 
 :::note[Radians, always]
-The project defines `GLM_FORCE_RADIANS`, and modern glm has no degree-based overloads
-anyway. Use `glm::radians(45.0F)` when you have an angle in degrees and want to keep
-reading it as degrees.
+The project defines `GLM_FORCE_RADIANS`, and modern glm has no degree-based overloads anyway. Use
+`glm::radians(45.0F)` when you have an angle in degrees.
 :::
 
 ## Order is the whole lesson
 
-Matrix multiplication does not commute. `A * B` and `B * A` are different transforms, and
-this is the single most common source of "why is my object over there".
+Combining two transforms into one matrix is the reason matrices are used at all: rather than
+transforming a hundred thousand vertices twice, you multiply the two matrices once and transform
+each vertex once. That works because the product is defined to make this true —
 
-The two quads in the screenshot differ *only* in that:
+```
+   (A · B) · v  =  A · (B · v)
+```
+
+— which says that `A · B` is precisely "do `B`, then do `A`". Multiplication **does not commute**,
+though: `A * B` and `B * A` are different transforms, and this is the single most common source of
+"why is my object over there".
 
 ```cpp title="code/src/1.getting_started/transformations/main.cpp"
-// Rotate, then translate: spins about its own centre, in place.
-const glm::mat4 spin_in_place =
-    aspect_fix *
-    glm::translate(glm::mat4(1.0F), glm::vec3(-0.5F, 0.0F, 0.0F)) *
-    glm::rotate(glm::mat4(1.0F), angle, glm::vec3(0.0F, 0.0F, 1.0F)) *
-    glm::scale(glm::mat4(1.0F), glm::vec3(0.6F, 0.6F, 1.0F));
-
-// Translate, then rotate: orbits the origin.
-const glm::mat4 orbit =
-    aspect_fix *
-    glm::rotate(glm::mat4(1.0F), angle, glm::vec3(0.0F, 0.0F, 1.0F)) *
-    glm::translate(glm::mat4(1.0F), glm::vec3(0.5F, 0.0F, 0.0F)) *
-    glm::scale(glm::mat4(1.0F), glm::vec3(0.35F, 0.35F, 1.0F));
+        const float angle = static_cast<float>(frame.frame_number) * 0.015F;
 ```
 
-**Read a chain right to left.** The rightmost matrix touches the vertex first.
+```cpp title="code/src/1.getting_started/transformations/main.cpp"
+        const glm::mat4 spin_in_place =
+            aspect_fix *
+            glm::translate(glm::mat4(1.0F), glm::vec3(-0.5F, 0.0F, 0.0F)) *
+            glm::rotate(glm::mat4(1.0F), angle, glm::vec3(0.0F, 0.0F, 1.0F)) *
+            glm::scale(glm::mat4(1.0F), glm::vec3(0.6F, 0.6F, 1.0F));
+```
 
-That is not a convention someone chose to be awkward. The vertex is a column vector on
-the right of the product:
+```cpp title="code/src/1.getting_started/transformations/main.cpp"
+        const glm::mat4 orbit =
+            aspect_fix *
+            glm::rotate(glm::mat4(1.0F), angle, glm::vec3(0.0F, 0.0F, 1.0F)) *
+            glm::translate(glm::mat4(1.0F), glm::vec3(0.5F, 0.0F, 0.0F)) *
+            glm::scale(glm::mat4(1.0F), glm::vec3(0.35F, 0.35F, 1.0F));
+```
+
+The two quads differ *only* in the order of the middle two matrices.
+
+**Read a chain right to left.** The rightmost matrix touches the vertex first. That is not an
+awkward convention someone chose: the vertex is a column vector on the right of the product,
 
 ```
-position = M₁ · M₂ · M₃ · v
+   position = M₁ · M₂ · M₃ · v
+                          └── meets v first
 ```
 
-so `M₃` meets `v` first, then `M₂`, then `M₁`. Nothing more mysterious than that.
+so `M₃` meets `v` first, then `M₂`, then `M₁`.
 
 Applied to the two chains:
 
-**Spin in place** — scale, then rotate about the origin (the quad is *at* the origin, so
-it turns about its own centre), then translate the already-turned quad to the left. It
-spins where it sits.
-
-**Orbit** — scale, then translate 0.5 to the right, then rotate about the origin. The
-quad is no longer at the origin when the rotation happens, so the rotation sweeps it
-around in a circle.
+```
+   SPIN IN PLACE                         ORBIT
+   scale                                 scale
+   rotate  ← quad is AT the origin,      translate  ← quad moves off the origin
+             so it turns about itself    rotate     ← rotation sweeps the displaced
+   translate ← carries the turned quad                quad around in a circle
+```
 
 Same two operations. Opposite order. Completely different motion.
 
 :::tip[The rule of thumb]
-**Scale, then rotate, then translate** — written left to right as `T * R * S` — is what
-you want almost every time. Object gets its size, is turned to face the right way, is
-then put where it goes.
+**Scale, then rotate, then translate** — written left to right as `T * R * S` — is what you want
+almost every time. Object gets its size, is turned to face the right way, is then put where it
+goes.
 
-When something rotates around a point it should not, or grows in the wrong direction,
-check the order before you check anything else.
+When something rotates around a point it should not, check the order before anything else.
 :::
+
+```cpp title="code/src/1.getting_started/transformations/main.cpp"
+        for (const glm::mat4& model : {spin_in_place, orbit}) {
+            const PushConstants push{.model = model};
+            vkCmdPushConstants(frame.cmd, pipeline_layout_, VK_SHADER_STAGE_VERTEX_BIT,
+                               0, sizeof(push), &push);
+            vkCmdDrawIndexed(frame.cmd, static_cast<uint32_t>(kIndices.size()), 1, 0, 0,
+                             0);
+        }
+```
+
+Two draws of the same four vertices, differing only in 64 bytes of push constant. That is the
+shape every later chapter uses for every object it draws.
 
 ## `mul()`, and the transpose trap
 
-Slang's spelling of a matrix product is `mul()`, not `*`:
-
 ```slang title="code/src/1.getting_started/transformations/transform.slang"
-output.position = mul(push.model, float4(input.position, 0.0, 1.0));
+    output.position = mul(push.model, float4(input.position, 0.0, 1.0));
+
+    output.uv = input.uv;
 ```
 
-Read `mul(model, position)` as "model times position" — the same order and the same
-meaning as GLSL's `model * position`, and the same order as `model * position` in glm on
-the C++ side. The vertex is a column vector on the right, transforms compose right to
-left, and that stays true for the rest of the series.
+Slang's spelling of a matrix product is `mul()`, not `*`.
 
-`*` is not an alternative spelling. Slang inherits HLSL's operators, where `*` on two
-matrices multiplies them **element by element** — which compiles without complaint and is
-almost never what you meant. Matrix times vector with `*` at least fails outright:
+Read `mul(model, position)` as "model times position" — the same order and meaning as GLSL's
+`model * position`, and the same order as `model * position` in glm on the C++ side.
+
+`*` is not an alternative spelling. Slang inherits HLSL's operators, where `*` on two matrices
+multiplies them **element by element** — which compiles without complaint and is almost never
+what you meant. Matrix times vector with `*` at least fails outright:
 
 ```
 error: no overload for '*' applicable to arguments of type (matrix<float,4,4>,
 vector<float,4>)
 ```
 
-Use `mul()` for anything that is a transform, and be suspicious of a `*` between two
-matrices.
+The position is promoted to four components: `z = 0` puts the quad on the near plane, and `w = 1`
+marks it as a point rather than a direction.
 
-The other half of the convention is memory layout, and here the good news is that there
-is nothing to do:
+The other half of the convention is memory layout, and here there is nothing to do. A `glm::mat4`
+is 16 floats, **column by column** — all four numbers of column 0, then column 1, and so on — and
+it goes into a push constant with no transpose on the way.
 
-1. **`memcpy` works.** A `glm::mat4` is 16 floats, column by column, and it goes into a
-   push constant or a uniform buffer with no transpose on the way. Slang stores matrices
-   row-major *and* implements `mul(M, v)` against that layout, so the two conventions
-   cancel and the arithmetic comes out the same as GLSL's. If you go looking in the
-   SPIR-V you will find a `RowMajor` decoration and an `OpVectorTimesMatrix`, which is
-   the same product written the other way round.
-2. **`mat[3]` is the translation** on the C++ side, because glm puts translation in the
-   last column.
+Indexing follows that storage rather than the usual mathematical convention, which produces code
+that looks wrong until you know:
 
-The trap is that Slang also accepts `mul(position, model)`, with the arguments the other
-way round, and it means the *other* convention — as if the matrix were transposed. It
-compiles, it renders, and the result looks nearly right at small angles and is never
-actually right. If a transform looks subtly skewed, check the argument order first.
+```cpp
+m[i]       // column i, a glm::vec4
+m[i][j]    // column i, row j    <-- column FIRST
+```
 
-That argument order is exactly what HLSL code written for DirectX uses, since DirectX
-convention puts row vectors on the left. Porting a shader across means swapping the
-arguments to every `mul()`, not just the chain order.
+So `m[1][1]` is column 1, row 1: the entry that scales `y`. Chapter 1.13 negates exactly that
+entry, and the line is unreadable without this paragraph.
+Slang stores matrices row-major *and* implements `mul(M, v)` against that layout, so the two
+conventions cancel and the arithmetic comes out the same as GLSL's.
+
+The trap is that Slang also accepts `mul(position, model)`, arguments the other way round, and it
+means the *other* convention — as if the matrix were transposed. It compiles, it renders, and the
+result looks nearly right at small angles and is never actually right. That argument order is
+exactly what HLSL code written for DirectX uses, so porting a shader across means swapping the
+arguments to every `mul()`.
 
 ## The aspect ratio stopgap
 
-There is a line in the sample that deserves to be called out rather than glossed over:
-
 ```cpp title="code/src/1.getting_started/transformations/main.cpp"
-const glm::mat4 aspect_fix =
-    glm::scale(glm::mat4(1.0F), glm::vec3(1.0F / aspect, 1.0F, 1.0F));
+        const float aspect = static_cast<float>(frame.extent.width) /
+                             static_cast<float>(frame.extent.height);
+        const glm::mat4 aspect_fix =
+            glm::scale(glm::mat4(1.0F), glm::vec3(1.0F / aspect, 1.0F, 1.0F));
 ```
 
-Clip space runs −1 to 1 in both axes regardless of the window's shape, so it is stretched
-to whatever rectangle the window happens to be. A square comes out as a rectangle, and —
-much more obviously — a *rotating* square comes out sheared, changing shape as it turns.
-Squeezing x by the aspect ratio cancels it.
+Clip space runs −1 to 1 in both axes regardless of the window's shape, so it is stretched to
+whatever rectangle the window happens to be. A square comes out as a rectangle, and — much more
+obviously — a *rotating* square comes out sheared, changing shape as it turns. Squeezing x by the
+aspect ratio cancels it.
 
-This is a two-by-two orthographic projection wearing a disguise, and chapter 1.13
-replaces it with a real projection matrix that does the same job properly and in three
-dimensions. It is here so that this chapter's rotations look like rotations.
+This is a two-by-two orthographic projection wearing a disguise, and chapter 1.13 replaces it with
+a real projection matrix that does the same job properly and in three dimensions.
 
 ## Getting the matrix to the shader
-
-64 bytes, straight into the push constant block:
 
 ```cpp title="code/src/1.getting_started/transformations/main.cpp"
 struct PushConstants {
@@ -216,10 +421,15 @@ struct PushConstants {
 static_assert(sizeof(PushConstants) == 64);
 ```
 
-That is half the guaranteed 128-byte budget for one matrix, and it is the reason to be
-careful about what else goes in there. A model matrix in push constants with the camera
-in a uniform buffer is the standard arrangement, and it is exactly what chapter 1.14
-ends up with.
+```slang title="code/src/1.getting_started/transformations/transform.slang"
+struct PushConstants {
+    float4x4 model;
+};
+```
+
+64 bytes — half the guaranteed 128-byte budget, for one matrix. That is the reason to be careful
+about what else goes in there. A model matrix in push constants with the camera in a uniform
+buffer is the standard arrangement, and it is exactly what chapter 1.13 ends up with.
 
 std140 alignment is not a problem here: a 4×4 matrix is four four-component columns, all naturally
 16-byte aligned, and push constant blocks follow the same rules as uniform blocks.
@@ -230,44 +440,42 @@ std140 alignment is not a problem here: a 4×4 matrix is four four-component col
 ./code/out/build/linux-debug/bin/1.12.transformations
 ```
 
-The left quad spins in place. The right quad orbits the centre of the screen. Watch them
-for a few seconds before reading on — the difference between the two is worth seeing
-rather than being told.
+The left quad spins in place. The right quad orbits the centre of the screen. Watch them for a few
+seconds before reading on — the difference is worth seeing rather than being told.
 
-## What changed
+The screenshot for this chapter is pixel-for-pixel what it was before the texture code moved into
+`vkcommon`, which is what `tools/capture.py` is for.
 
-- the vertex buffer is now a plain unit square that never changes
-- the push constant block holds a `float4x4` instead of loose floats
-- the vertex shader is one multiplication
-- `glm/gtc/matrix_transform.hpp` is included for `translate`, `rotate` and `scale`
-- `main.cpp` lost about 250 lines: chapter 1.11's texture loading is now
-  `vkc::load_texture` and `vkc::Sampler`
+## Words introduced in this chapter
 
-```cpp title="code/src/1.getting_started/transformations/main.cpp"
-texture_ = vkc::load_texture(context(), vkc::asset_path("textures/lvk_grid.png"));
-sampler_ = vkc::Sampler(context(), vkc::SamplerDesc{
-                                       .address_mode = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-                                   });
-```
-
-The screenshot for this chapter is pixel-for-pixel what it was before that move, which is
-what `tools/capture.py` is for.
+| | |
+|---|---|
+| **basis vectors** | the unit arrows along the axes; every position is a combination of them |
+| **columns of a matrix** | where the basis vectors land — the one idea that makes a matrix readable |
+| **homogeneous coordinates** | the fourth component that makes translation a matrix operation |
+| **point vs direction** | `w = 1` is moved by translation; `w = 0` is not |
+| **model matrix** | the transform placing a mesh's own coordinates into the world |
+| **identity matrix** | `glm::mat4(1.0F)` — the transform that changes nothing |
+| **orthonormal** | columns that are unit length and mutually perpendicular, so the inverse is the transpose |
+| **column-major** | glm's storage and indexing: `m[column][row]`, not `m[row][column]` |
+| **`mul()`** | Slang's matrix product; `*` is element-wise and almost never what you want |
 
 ## Exercises
 
-1. Swap `translate` and `rotate` in `spin_in_place` so it reads exactly like `orbit`'s
-   order. Predict what happens before you run it.
-2. Change the rotation axis from `(0, 0, 1)` to `(0, 1, 0)`. The quad appears to squash
-   and stretch horizontally — it is rotating about the vertical axis, edge-on, and
-   without a perspective projection that is what it looks like. Chapter 1.13 makes this
-   look like a turning object rather than a squashing one.
-3. Add a non-uniform scale — `glm::vec3(1.2F, 0.4F, 1.0F)` — before the rotation, then
-   after it. Two different shapes, because scale and rotation do not commute either.
-4. Delete `aspect_fix` from both chains and resize the window into a tall thin shape.
-   This is the problem the next chapter solves; it is worth seeing it clearly once.
-5. Swap the arguments: `mul(float4(...), push.model)` instead of
-   `mul(push.model, float4(...))`. It compiles. Work out what transform you are actually
-   applying, and at what angle the difference becomes obvious. Then try `push.model *
-   float4(...)` and note that *that* one the compiler catches.
-6. Make a third quad that orbits *and* spins: an orbit chain with a second rotation
-   after the translation. That is a moon, and it is the whole idea behind a scene graph.
+1. Swap `translate` and `rotate` in `spin_in_place` so it reads exactly like `orbit`'s order.
+   Predict what happens before you run it.
+2. Change the rotation axis from `(0, 0, 1)` to `(0, 1, 0)`. The quad appears to squash and stretch
+   horizontally — it is rotating about the vertical axis, edge-on, and without a perspective
+   projection that is what it looks like.
+3. Add a non-uniform scale — `glm::vec3(1.2F, 0.4F, 1.0F)` — before the rotation, then after it.
+   Two different shapes, because scale and rotation do not commute either.
+4. Delete `aspect_fix` from both chains and resize the window into a tall thin shape. This is the
+   problem the next chapter solves.
+5. Swap the arguments: `mul(float4(...), push.model)`. It compiles. Work out what transform you
+   are actually applying, and at what angle the difference becomes obvious. Then try
+   `push.model * float4(...)` and note that *that* one the compiler catches.
+6. Make a third quad that orbits *and* spins: an orbit chain with a second rotation after the
+   translation. That is a moon, and it is the whole idea behind a scene graph.
+
+Next: [coordinate systems](/getting-started/coordinate-systems/) — the third dimension, and the two
+Vulkan conventions that catch everyone.

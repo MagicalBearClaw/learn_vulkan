@@ -1,0 +1,370 @@
+---
+title: Vectors and Matrices
+description: The mathematics the series actually uses - vectors, dot and cross products, matrices as transformed basis vectors, and homogeneous coordinates - derived from the beginning.
+sidebar:
+  order: 70
+---
+
+This appendix assumes no graphics background and no mathematics beyond school algebra
+and trigonometry. It covers exactly what the series uses and stops there: there is no
+linear algebra here for its own sake.
+
+Chapters 1.12 to 1.14 derive what they need as they go. This page is the same material
+gathered in one place, to read first if you want the ground under you, or to come back
+to when a chapter assumes something you would rather see spelled out.
+
+## Vectors
+
+A vector is an ordered list of numbers. `glm::vec3{2.0F, 1.0F, -4.0F}` is three of them,
+and what those three numbers *mean* depends entirely on what you are using them for:
+
+```
+   as a POSITION     "2 right, 1 up, 4 away"        a place
+   as a DIRECTION    "pointing right, up and away"  no place, just an arrow
+   as a COLOUR       r=2.0, g=1.0, b=-4.0           no geometry at all
+```
+
+The arithmetic does not care. This is why `glm::vec3` is used for positions, normals and
+colours alike, and why chapter 1.12's distinction between a point and a direction has to
+be carried in a *fourth* component rather than inferred.
+
+**Adding** two vectors adds them component by component, which geometrically means
+following one arrow and then the other:
+
+```
+   a = (3, 1)
+   b = (1, 2)
+   a + b = (4, 3)
+
+         ^
+       3 |          • a+b
+       2 |      ╱b ╱
+       1 |  ╱a╱   ╱
+       0 +--------------->
+         0  1  2  3  4
+```
+
+**Scaling** by a number multiplies every component: `2 * (3, 1)` is `(6, 2)` — the same
+direction, twice as long. Multiplying by a negative number reverses it, which is all that
+`position -= front * distance` is doing when you press S in chapter 1.14.
+
+### Length and unit vectors
+
+The length of a vector — written `|v|` — comes straight from Pythagoras, extended to
+three dimensions:
+
+```
+   |v| = sqrt(vx² + vy² + vz²)
+```
+
+A vector with length exactly 1 is a **unit vector**, and making one is called
+**normalising**: divide every component by the length.
+
+```
+   normalise(v) = v / |v|
+
+   (3, 4, 0)   has length sqrt(9 + 16) = 5
+   normalised  (0.6, 0.8, 0)
+```
+
+Unit vectors matter more than they look. A direction is *only* a direction — it should
+carry no magnitude — and a great deal of graphics mathematics is only correct for unit
+vectors. The dot product below gives an angle if and only if both inputs are unit length;
+`glm::rotate` silently scales the rotation if its axis is not, which is why chapter 1.13
+writes `glm::normalize(cube.axis)`.
+
+:::caution[Normalising the zero vector]
+`(0, 0, 0)` has length 0, and normalising it divides by zero. The result is `NaN` in every
+component, and `NaN` spreads: any arithmetic involving it produces `NaN`, so one bad
+normalise silently poisons an entire matrix and the screen goes blank rather than wrong.
+
+This is the exact failure chapter 1.14 clamps the pitch to avoid.
+:::
+
+## The dot product
+
+The dot product takes two vectors and returns a single number:
+
+```
+   a · b = ax·bx + ay·by + az·bz
+```
+
+That definition is easy to compute and tells you nothing. This is the one that matters:
+
+```
+   a · b = |a| · |b| · cos θ        θ is the angle between them
+```
+
+The two are provably the same thing; take it on trust here. The consequence is that **for
+two unit vectors, the dot product is the cosine of the angle between them**, which turns
+a question about geometry into one multiply-and-add:
+
+```
+   a · b =  1     same direction        θ = 0°
+   a · b =  0     perpendicular         θ = 90°
+   a · b = -1     opposite directions   θ = 180°
+   a · b >  0     less than 90° apart   "roughly the same way"
+   a · b <  0     more than 90° apart   "roughly opposite"
+```
+
+The sign alone answers "is this facing me?", and that is the whole basis of diffuse
+lighting in chapter 2.2: a surface is lit in proportion to the dot product of its normal
+with the direction to the light, clamped at zero because a surface facing away is not
+lit negatively, it is simply unlit.
+
+The dot product also **projects**: `a · b` with `b` a unit vector is the length of `a`'s
+shadow along `b`. Chapter 1.14's view matrix uses exactly this to work out where the
+camera's position sits along each of its own axes.
+
+## The cross product
+
+The cross product takes two vectors and returns a third, **perpendicular to both**:
+
+```
+   a × b = ( ay·bz - az·by,
+             az·bx - ax·bz,
+             ax·by - ay·bx )
+```
+
+Nobody remembers that by shape; remember what it is *for*. Given two directions that
+span a plane, the cross product is the direction out of that plane. It is how you obtain
+an axis you do not already have.
+
+Two properties do real work in this series.
+
+**It is anti-commutative.** `b × a = -(a × b)`. Swapping the arguments flips the result to
+point the opposite way. Which of the two perpendiculars you get is given by the
+right-hand rule: point your right hand's fingers along `a`, curl them toward `b`, and your
+thumb points along `a × b`.
+
+This is not trivia. Chapter 1.14 computes the camera's sideways axis as
+`cross(front, worldUp)`, and writing `cross(worldUp, front)` instead is a program that
+builds, runs, and has A and D reversed.
+
+```
+   facing down -z, world up is +y
+
+   cross(front, up) = cross((0,0,-1), (0,1,0)) = ( 1, 0, 0)   +x, to the right
+   cross(up, front) = cross((0,1,0), (0,0,-1)) = (-1, 0, 0)   -x, to the left
+```
+
+**Its length is `|a| · |b| · sin θ`.** So it shrinks to zero as the two inputs become
+parallel, and is exactly zero when they are. A zero vector has no direction, normalising
+it gives `NaN`, and this is the second half of why chapter 1.14 will not let you look
+straight up: at ±90° of pitch the facing direction is parallel to world up, and the cross
+product that produces the sideways axis collapses.
+
+| | dot | cross |
+|---|---|---|
+| gives | a number | a vector |
+| answers | "how aligned?" | "what is perpendicular to both?" |
+| when parallel | ±\|a\|\|b\| — largest | zero — degenerate |
+| when perpendicular | zero | \|a\|\|b\| — largest |
+| swap the arguments | unchanged | negated |
+
+## Matrices
+
+A matrix is a grid of numbers, and a 4×4 one is sixteen of them. That description is
+accurate and useless. Here is the one to actually hold on to:
+
+> **The columns of a matrix are where the basis vectors land.**
+
+The basis vectors are the three unit vectors along the axes: `x = (1,0,0)`,
+`y = (0,1,0)`, `z = (0,0,1)`. Every position is a combination of them —
+`(2,1,-4)` is `2x + 1y - 4z`. A transform is completely determined once you say where
+those three arrows end up, and a matrix is just that answer, written down one column each.
+
+So a matrix that leaves everything alone has its basis vectors where they started:
+
+```
+   the IDENTITY matrix
+
+     x    y    z    t
+   ┌                   ┐
+   │  1    0    0    0 │
+   │  0    1    0    0 │
+   │  0    0    1    0 │
+   │  0    0    0    1 │
+   └                   ┘
+```
+
+`glm::mat4(1.0F)` is that matrix — the `1.0F` fills the diagonal, which is why it is not a
+size or a count. `glm::mat4(0.0F)` is all zeroes, which sends every basis vector to the
+origin and collapses the world to a point.
+
+### Multiplying a matrix by a vector
+
+To transform a vector, take the matrix's columns, scale each by the matching component of
+the vector, and add them up:
+
+```
+   M · v  =  vx·(column x) + vy·(column y) + vz·(column z) + vw·(column t)
+```
+
+Which is the same arithmetic as the row-by-row version you may have been taught — each
+component of the result is the dot product of one row of `M` with `v`:
+
+```
+   result.x = row 0 · v
+   result.y = row 1 · v
+   result.z = row 2 · v
+   result.w = row 3 · v
+```
+
+Both views are worth having. The row view is how you compute it; the column view is how
+you *understand* it, and it makes the three transform matrices below readable at a glance.
+
+### Multiplying two matrices
+
+`A · B` is the matrix that does `B` first and then `A`. That is not a convention someone
+chose — it follows from wanting this to be true:
+
+```
+   (A · B) · v  =  A · (B · v)
+```
+
+which is what makes combining transforms useful at all: rather than transforming a
+hundred thousand vertices twice, combine the two matrices once and transform each vertex
+once. The vertex sits at the right-hand end of the product, so **the rightmost matrix
+reaches it first**, and a chain reads right to left.
+
+```
+   position = Projection · View · Model · v
+                                       └── meets v first
+```
+
+Matrix multiplication does **not** commute: `A · B` and `B · A` are different transforms.
+Chapter 1.12 is built around that fact.
+
+## The three transforms, written out
+
+**Scale.** Stretch each basis vector along its own axis, so each column is a lengthened
+version of where it started:
+
+```
+   ┌                    ┐
+   │  sx   0    0    0  │
+   │  0    sy   0    0  │
+   │  0    0    sz   0  │
+   │  0    0    0    1  │
+   └                    ┘
+```
+
+**Rotation about z.** Where does `x = (1,0)` go when the plane turns by θ? Onto the unit
+circle at angle θ, which is `(cos θ, sin θ)` by the definition of sine and cosine. And
+`y = (0,1)`, a quarter turn ahead of it, lands at `(-sin θ, cos θ)`. Those are the two
+columns:
+
+```
+   ┌                              ┐
+   │  cos θ   -sin θ    0     0   │
+   │  sin θ    cos θ    0     0   │
+   │    0        0      1     0   │
+   │    0        0      0     1   │
+   └                              ┘
+        ↑         ↑
+      x lands   y lands
+      here      here
+```
+
+Nothing was memorised there. The columns were read off a unit circle, which is why the
+rotation matrix is worth deriving once rather than looking up forever.
+
+**Translation.** Here the 3×3 world runs out. A 3×3 matrix always maps the origin to the
+origin, and the reason is visible in the column rule: `M · (0,0,0)` scales every column by
+zero and adds them up, which is zero whatever the matrix contains. Moving something is
+therefore *not* a 3×3 transform, and no amount of cleverness makes it one.
+
+The fix is a fourth component. Add a fourth column holding the offset, and a fourth
+component on the vector to select it:
+
+```
+   ┌                    ┐   ┌   ┐     ┌         ┐
+   │  1    0    0    tx │   │ x │     │ x + tx  │
+   │  0    1    0    ty │ · │ y │  =  │ y + ty  │
+   │  0    0    1    tz │   │ z │     │ z + tz  │
+   │  0    0    0    1  │   │ 1 │     │    1    │
+   └                    ┘   └   ┘     └         ┘
+```
+
+## Homogeneous coordinates, and what `w` is for
+
+That fourth component is called `w`, and having introduced it to make translation work,
+it turns out to carry the point/direction distinction for free:
+
+```
+   w = 1   a POINT.      The t column is added. Translation moves it.
+   w = 0   a DIRECTION.  The t column is multiplied by zero. Translation ignores it.
+```
+
+Look back at the translation matrix and check it: with `w = 0` the fourth column
+contributes nothing, and the result is the same vector. This is not a special case anyone
+wrote — it falls out of the arithmetic. A surface normal is a direction, so it is
+transformed with `w = 0` and stays put when the model moves ten metres sideways.
+
+`w` has one more job. A perspective projection arranges for `w` to come out holding the
+distance from the camera, and the hardware then divides all four components by it. Things
+far away get divided by a larger number and land closer to the centre of the screen —
+which is the whole of perspective, and is derived properly in chapter 1.13.
+
+## The inverse of a rigid transform
+
+A camera is defined by where it is and which way it faces, but the matrix a shader needs
+is the *opposite* of that — see chapter 1.14. Inverting a general 4×4 matrix is genuinely
+expensive. Inverting a rotation-plus-translation is not, and the reason is worth knowing.
+
+A rotation matrix has **orthonormal** columns: each is unit length, and each is
+perpendicular to the others — they are the basis vectors, rotated, and rotation preserves
+lengths and angles. For such a matrix the inverse is simply the transpose, `R⁻¹ = Rᵀ`
+(flip it across its diagonal). No division, no determinant.
+
+So for a matrix that is a rotation `R` followed by a translation `t`:
+
+```
+   ┌         ┐ -1      ┌              ┐
+   │  R    t │     =   │  Rᵀ   -Rᵀ·t  │
+   │  0    1 │         │  0      1    │
+   └         ┘         └              ┘
+```
+
+The rotation part is transposed, and the translation is rotated by that transpose and
+negated. A handful of multiplies, and it is why a view matrix can be rebuilt from scratch
+every frame without anyone noticing the cost.
+
+## How glm stores a matrix
+
+One practical detail, because it produces code that looks wrong.
+
+A `glm::mat4` is sixteen floats in memory, **column by column** — the four numbers of
+column 0, then column 1, and so on. Indexing follows the storage, not the usual
+mathematical convention:
+
+```cpp
+   m[i]       // column i, a glm::vec4
+   m[i][j]    // column i, row j     <-- column FIRST
+```
+
+So `projection[1][1]` is column 1, row 1: the entry that scales `y`. That is the one
+chapter 1.13 negates to flip Vulkan's clip space the right way up.
+
+The upside of column-major storage is that there is nothing to do at the boundary: a
+`glm::mat4` is memcpy'd straight into a uniform buffer or a push constant, and Slang's
+`float4x4` reads the same sixteen floats with the same meaning, provided the session is
+configured for column-major — which is one of the three load-bearing Slang settings in
+chapter 1.9.
+
+## Where each of these is used
+
+| Idea | First needed | For |
+|---|---|---|
+| unit vectors, normalising | 1.13 | rotation axes |
+| matrix × vector, identity | 1.12 | the model matrix |
+| non-commuting products | 1.12 | spin-in-place versus orbit |
+| homogeneous `w` | 1.12 | translation at all |
+| the perspective divide | 1.13 | making distant things small |
+| cross product | 1.14 | the camera's sideways axis |
+| inverse of a rigid transform | 1.14 | the view matrix |
+| dot product | 2.2 | diffuse lighting, and most of Part 2 |
+
+The dot product is the odd one out: Part 1 never needs it, and Part 2 needs almost
+nothing else.

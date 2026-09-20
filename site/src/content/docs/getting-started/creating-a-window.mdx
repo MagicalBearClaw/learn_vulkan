@@ -1,64 +1,434 @@
 ---
 title: Creating a Window
-description: Opening a window with SDL3 and running an event loop - the foundation every later chapter sits on.
+description: Opening a window with SDL3 and running an event loop - the foundation every later chapter sits on, written out line by line.
 sidebar:
   order: 1
 ---
 
 No Vulkan in this chapter. Before anything can be drawn there has to be somewhere to
-draw it and a way to know when the user wants to stop, and it is worth getting that
-out of the way on its own rather than tangled up with the API we are here to learn.
+draw it and a way to know when the user wants to stop, and it is worth getting that out
+of the way on its own rather than tangled up with the API we are here to learn.
+
+This chapter writes one file, `main.cpp`, from the first include to the last brace. It
+is a hundred and twenty-six lines and every one of them is below.
+
+## What a window actually is
+
+Worth being concrete, because it is easy to picture a window as "a thing my program
+owns" and that is not what it is.
+
+Your screen is a single grid of pixels, scanned out to the display sixty or more times a
+second by the graphics hardware. Nothing in that picture belongs to your program. What
+you get is an agreement with a piece of system software — the **compositor** on Linux,
+the Desktop Window Manager on Windows — that a certain rectangle of that grid will show
+*your* pixels, and that it will tell you when things happen inside it.
+
+```
+   your program          the compositor              the display
+  ┌──────────────┐      ┌────────────────┐         ┌───────────┐
+  │  pixels  ────┼─────▶│  arranges every │────────▶│  scanned  │
+  │              │      │  window's pixels│         │  out 60x  │
+  │  events  ◀───┼──────┤  into one image │         │  a second │
+  └──────────────┘      └────────────────┘         └───────────┘
+```
+
+Two consequences shape this chapter and the next thirteen:
+
+**The window is a conversation, not an object you control.** The compositor may resize
+you, hide you, move you to a different monitor with a different pixel density, or ask
+you to close. Your program finds out by reading **events**, and a program that stops
+reading them stops responding.
+
+**Your pixels are handed over, not written directly.** You will never write to the
+screen. You will fill an image and hand it to the window system, which is the entire
+reason chapter 1.4 exists and is called "the swapchain".
 
 ## Why a library at all
 
-Creating a window is an operating system job, and every operating system disagrees
-about how. Win32 wants a registered window class and a message pump. X11 wants a
-display connection and an event mask. Wayland wants a compositor handshake. None of
-this is graphics, and all of it is tedious.
+Creating a window is an operating system job, and every operating system disagrees about
+how. Win32 wants a registered window class and a message pump. X11 wants a display
+connection and an event mask. Wayland wants a compositor handshake. None of this is
+graphics, and all of it is tedious.
 
-We use **SDL3**, which covers all three behind one interface and knows how to hand
-Vulkan a surface later. The alternative in most Vulkan material is GLFW, which would
-work equally well; SDL3 is chosen here because the later chapters want its audio and
-gamepad support for the 2D game, and one dependency is better than two.
+We use **SDL3**, which covers all three behind one interface and knows how to hand Vulkan
+a surface later. The alternative in most Vulkan material is GLFW, which would work
+equally well; SDL3 is chosen here because the later chapters want its audio and gamepad
+support for the 2D game, and one dependency is better than two.
 
-## Starting SDL
+## The includes
 
 ```cpp title="code/src/1.getting_started/creating_a_window/main.cpp"
-if (!SDL_Init(SDL_INIT_VIDEO)) {
-    throw std::runtime_error(std::format("SDL_Init failed: {}", SDL_GetError()));
+#include <vkc/capture.hpp>
+
+#include <SDL3/SDL.h>
+#include <spdlog/spdlog.h>
+
+#include <cstdlib>
+#include <exception>
+#include <format>
+#include <stdexcept>
+```
+
+`SDL3/SDL.h` and `spdlog/spdlog.h` are the window library and the logger. The standard
+headers are for `EXIT_FAILURE`, `std::exception`, `std::format` and `std::runtime_error`
+— all four are used before the file ends.
+
+`vkc/capture.hpp` is the odd one out, and it is worth being straight about what it is. It
+is not Vulkan and it is not part of what this chapter teaches: it is this book's own
+harness, and it supplies exactly two things here.
+
+```cpp title="code/common/scaffold/include/vkc/capture.hpp"
+struct Args {
+    uint32_t width = 1280;
+    uint32_t height = 720;
+    bool validation = true;
+    uint64_t frame_limit = 0;  // 0 means "run until the window is closed"
+    std::filesystem::path screenshot;
+};
+
+[[nodiscard]] Args parse_args(int argc, char** argv, Args defaults = {});
+```
+
+Every sample in the series accepts `--width`, `--height`, `--frames` and `--screenshot`
+so that `tools/capture.py` can run it and diff the result against a reference image. That
+is how the book checks that a change in chapter 1.9 did not quietly alter what chapter
+1.7 draws. If you are typing these samples in yourself, you can replace `vkc::Args` with
+two hard-coded integers and never think about it again.
+
+It is still your code rather than a black box, so here is the parser behind that
+declaration.
+
+```cpp title="code/common/base/src/capture.cpp"
+uint32_t parse_uint(std::string_view text, const char* flag) {
+    uint32_t value = 0;
+    const auto [ptr, error] =
+        std::from_chars(text.data(), text.data() + text.size(), value);
+    if (error != std::errc{} || ptr != text.data() + text.size()) {
+        throw std::runtime_error(
+            std::format("{} expects a number, got '{}'", flag, text));
+    }
+    return value;
 }
 ```
 
-We ask only for video. SDL3 returns `true` on success — note that this is the opposite
-of SDL2, which returned `0`, and it is an easy thing to get backwards when adapting
-older examples.
+`std::from_chars` is the strict way to turn text into a number. Unlike `std::atoi` it
+cannot silently return `0` for nonsense, and unlike `std::stoi` it does not allocate or
+throw on its own. It reports two things: an error code, and `ptr`, which points at the
+first character it could not consume.
+
+Both are checked. `error != std::errc{}` catches "not a number at all" and "too big to
+fit"; `ptr != text.data() + text.size()` catches a **partial** parse, which is the
+interesting one — without it, `--width 100abc` would quietly become 100.
+
+The structured binding `const auto [ptr, error]` unpacks the struct `from_chars` returns
+into two named variables in one line.
+
+```cpp title="code/common/base/src/capture.cpp"
+Args parse_args(int argc, char** argv, Args defaults) {
+    const std::span<char*> args(argv, static_cast<size_t>(argc));
+
+    for (size_t i = 1; i < args.size(); ++i) {
+        const std::string_view flag = args[i];
+        const auto next = [&](const char* name) -> std::string_view {
+            if (i + 1 >= args.size()) {
+                throw std::runtime_error(std::format("{} needs a value", name));
+            }
+            return args[++i];
+        };
+```
+
+`argc` and `argv` are wrapped in a `std::span` immediately, which turns a pointer and a
+length into one object that knows its own size — so the loop can say `args.size()` and
+indexing is checkable.
+
+The loop starts at **1** because `argv[0]` is the program's own name.
+
+`next` is a **lambda** capturing by reference. It fetches the value belonging to a flag and
+advances the loop counter with `++i`, so that a `--width 800` pair is consumed in one step.
+Capturing `i` by reference is what lets it do that; the `-> std::string_view` names the
+return type explicitly because the compiler would otherwise deduce it from `args[++i]`,
+which is a `char*`.
+
+```cpp title="code/common/base/src/capture.cpp"
+        if (flag == "--frames") {
+            defaults.frame_limit = parse_uint(next("--frames"), "--frames");
+        } else if (flag == "--screenshot") {
+            defaults.screenshot = next("--screenshot");
+            // A screenshot run that never stops would never write the file.
+            if (defaults.frame_limit == 0) {
+                defaults.frame_limit = 1;
+            }
+        } else if (flag == "--width") {
+            defaults.width = parse_uint(next("--width"), "--width");
+        } else if (flag == "--height") {
+            defaults.height = parse_uint(next("--height"), "--height");
+        } else if (flag == "--no-validation") {
+            defaults.validation = false;
+        } else if (flag == "--help" || flag == "-h") {
+            spdlog::info(
+                "options: --frames N  --screenshot PATH  --width N  --height N  "
+                "--no-validation");
+            std::exit(0);
+        } else {
+            throw std::runtime_error(std::format("unknown option '{}'", flag));
+        }
+    }
+    return defaults;
+}
+```
+
+A chain of comparisons rather than a parsing library, because six flags do not justify a
+dependency.
+
+`defaults` is taken **by value** and modified in place, which is why the caller's
+`Args defaults = {}` supplies every unset field — the parameter starts as a copy of
+whatever the caller passed and only the flags present change it.
+
+The `--screenshot` case sets a frame limit if none was given. A screenshot run that never
+stopped would never reach the code that writes the file, so it would hang with an empty
+output — a small trap worth closing where it happens.
+
+An unrecognised flag throws rather than being ignored. A typo like `--frame 90` silently
+doing nothing is worse than a message saying it is not a flag.
+
+## The application class
+
+```cpp title="code/src/1.getting_started/creating_a_window/main.cpp"
+namespace {
+
+class WindowApp {
+public:
+    explicit WindowApp(const vkc::Args& args) : args_(args) {
+        if (!SDL_Init(SDL_INIT_VIDEO)) {
+            throw std::runtime_error(
+                std::format("SDL_Init failed: {}", SDL_GetError()));
+        }
+```
+
+The **anonymous namespace** gives everything in the file internal linkage — the names are
+invisible to any other translation unit. It costs one line and it means no sample can
+ever collide with another, which matters once several of them define a function called
+`score_device`.
+
+A class rather than a pile of functions in `main`, because the thing we are building has
+*state that must be released in the right order*. Right now that is one window. By
+chapter 1.6 it is nine Vulkan objects, and the destructor is the only place that knows
+the order. Starting with the structure that survives is cheaper than growing into it.
+
+This is **RAII** — Resource Acquisition Is Initialisation, the C++ idea that a resource's
+lifetime is tied to an object's lifetime. The constructor takes the resource; the
+destructor releases it; the compiler guarantees the destructor runs however the scope is
+left, including by an exception. Vulkan hands out resources that must each be destroyed
+exactly once, in a specific order, which makes RAII less of a style preference here and
+more of a survival technique.
+
+`SDL_Init` starts the subsystems we ask for, and we ask only for video. It returns `true`
+on success — the opposite of SDL2, which returned `0`, and an easy thing to get backwards
+when adapting an older example. A failure throws rather than returning a code, because a
+constructor that cannot do its job has no other honest option: there is no half-built
+`WindowApp` worth handing back.
 
 ## Creating the window
 
+Still inside the constructor:
+
 ```cpp title="code/src/1.getting_started/creating_a_window/main.cpp"
-window_ = SDL_CreateWindow("LearnVulkan - Creating a Window",
-                           static_cast<int>(args.width),
-                           static_cast<int>(args.height),
-                           SDL_WINDOW_VULKAN |
-                           (args.screenshot.empty() ? SDL_WINDOW_RESIZABLE : 0));
+        window_ = SDL_CreateWindow("LearnVulkan - Creating a Window",
+                                   static_cast<int>(args.width),
+                                   static_cast<int>(args.height),
+                                   SDL_WINDOW_VULKAN |
+                                   (args.screenshot.empty() ? SDL_WINDOW_RESIZABLE : 0));
+        if (window_ == nullptr) {
+            SDL_Quit();
+            throw std::runtime_error(
+                std::format("SDL_CreateWindow failed: {}", SDL_GetError()));
+        }
+    }
 ```
 
-Two flags matter. (The conditional is book infrastructure: when `tools/capture.py` asks
-for a screenshot, the window is made fixed-size, because a tiling window manager picks
-the size of a resizable window itself and the reference images would change with
-whatever else is on screen. Read it as `SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE`.)
+Two flags matter. Read the fourth argument as `SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE`
+— the conditional is more book infrastructure, making the window fixed-size during a
+screenshot run, because a tiling window manager picks the size of a resizable window
+itself and the reference images would then depend on whatever else is on screen.
 
-`SDL_WINDOW_VULKAN` tells SDL to load the Vulkan loader and prepare the window so a
+`SDL_WINDOW_VULKAN` tells SDL to load the Vulkan loader and prepare the window so that a
 `VkSurfaceKHR` can be created from it in chapter 1.3. Nothing Vulkan happens yet, but
-asking now saves recreating the window later — the flag cannot be added afterwards.
+asking now saves recreating the window later: **the flag cannot be added afterwards**,
+because on some platforms it changes how the window is created at the OS level.
 
 `SDL_WINDOW_RESIZABLE` is a decision with consequences. A resizable window means the
-swapchain can be invalidated at any moment, and every chapter from 1.4 onward has to
-cope with that. It would be easier to leave it out. It would also mean building a
-renderer that falls over the first time someone drags a corner, so we handle it
-properly from the start.
+swapchain can be invalidated at any moment, and every chapter from 1.4 onward has to cope
+with that. It would be easier to leave it out. It would also mean building a renderer that
+falls over the first time someone drags a corner, so we handle it properly from the start.
+
+Note the `SDL_Quit()` **before** the throw. The constructor has already succeeded at one
+thing and is now failing at the next, so it has to undo the first before it gives up —
+nothing will call the destructor of an object that never finished being constructed. That
+rule catches people out, so it is worth stating flatly:
+
+```
+  constructor completes  ──▶  destructor will run
+  constructor throws     ──▶  destructor will NOT run
+                              (members already built are destroyed; the body is not)
+```
+
+This is the smallest possible instance of a problem that gets genuinely hard in Vulkan,
+and chapter 1.2 meets it again with an instance and a debug messenger.
+
+## The destructor
+
+```cpp title="code/src/1.getting_started/creating_a_window/main.cpp"
+    ~WindowApp() {
+        if (window_ != nullptr) {
+            SDL_DestroyWindow(window_);
+        }
+        SDL_Quit();
+    }
+```
+
+Destroy in the reverse of the order things were created. SDL is forgiving about this.
+Vulkan is not even slightly forgiving: destroying a device while a buffer allocated from
+it is still alive is undefined behaviour, and the validation layers will say so in
+paragraphs. Forming the habit here costs nothing.
+
+```cpp title="code/src/1.getting_started/creating_a_window/main.cpp"
+    WindowApp(const WindowApp&) = delete;
+    WindowApp& operator=(const WindowApp&) = delete;
+    WindowApp(WindowApp&&) = delete;
+    WindowApp& operator=(WindowApp&&) = delete;
+```
+
+Four lines of boilerplate with one purpose. This object owns a raw handle that must be
+destroyed exactly once, and C++ will happily generate a copy constructor that duplicates
+the pointer — giving two objects that each destroy the same window.
+
+```
+   WindowApp a;           a.window_ ──▶ ┌────────┐
+   WindowApp b = a;       b.window_ ──▶ │ window │   both destructors run
+                                        └────────┘   → destroyed twice
+```
+
+Deleting all four special members makes that a compile error instead of a crash on exit.
+Every sample in the series carries these.
+
+## The frame loop
+
+```cpp title="code/src/1.getting_started/creating_a_window/main.cpp"
+    int run() {
+        spdlog::info("Window open. Press Escape or close it to quit.");
+
+        uint64_t frames = 0;
+        bool running = true;
+```
+
+`run()` is separate from the constructor so that failures during setup and failures
+during the main loop stay distinguishable, and so that `main` has something to return.
+
+```cpp title="code/src/1.getting_started/creating_a_window/main.cpp"
+        while (running) {
+            SDL_Event event;
+            while (SDL_PollEvent(&event)) {
+                switch (event.type) {
+                    case SDL_EVENT_QUIT:
+                    case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+                        running = false;
+                        break;
+                    case SDL_EVENT_KEY_DOWN:
+                        if (event.key.key == SDLK_ESCAPE) {
+                            running = false;
+                        }
+                        break;
+                    case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+                        spdlog::info("Window resized to {}x{} pixels", event.window.data1,
+                                     event.window.data2);
+                        break;
+                    default:
+                        break;
+                }
+            }
+```
+
+The **inner `while`** is the part that matters, and the reason is worth drawing.
+
+The window system does not interrupt your program. It appends events to a queue, and your
+program drains that queue whenever it gets round to it:
+
+```
+  compositor appends ──▶ [ resize | key | mouse | mouse | close ] ──▶ SDL_PollEvent()
+                                                                      returns one,
+                                                                      removes it
+```
+
+`SDL_PollEvent` takes **one** event off the front and returns `true`, or returns `false`
+when the queue is empty. Handling one per frame and moving on means the queue grows faster
+than you drain it under any real input; the window lags, then stops responding, and the
+compositor eventually offers to kill it. The inner loop drains the queue completely every
+frame, which is why it is a `while` and not an `if`.
+
+`SDL_EVENT_QUIT` and `SDL_EVENT_WINDOW_CLOSE_REQUESTED` are not the same event. The first
+is the application being asked to exit; the second is this particular window's close
+button. With one window they arrive together, and handling both is what makes the window
+close on the first click rather than the second.
+
+`SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED` is only logged here. From chapter 1.4 it becomes the
+signal to rebuild the swapchain, which is why it is wired up now — and note that it reports
+**pixels**, not points, which the next section explains.
+
+```cpp title="code/src/1.getting_started/creating_a_window/main.cpp"
+            ++frames;
+            if (args_.frame_limit != 0 && frames >= args_.frame_limit) {
+                running = false;
+            }
+        }
+
+        spdlog::info("Ran {} frames.", frames);
+        return 0;
+    }
+```
+
+There is nothing to draw yet, so the body of the loop is only the frame counter and the
+`--frames` limit that lets the capture tool run a sample for exactly ninety frames and then
+quit. The window keeps whatever the compositor last put in it.
+
+```cpp title="code/src/1.getting_started/creating_a_window/main.cpp"
+private:
+    vkc::Args args_;
+    SDL_Window* window_ = nullptr;
+};
+
+}  // namespace
+```
+
+Both members are initialised where they are declared. `window_ = nullptr` in particular is
+what makes the destructor's null check meaningful when the constructor threw part-way
+through.
+
+## main
+
+```cpp title="code/src/1.getting_started/creating_a_window/main.cpp"
+int main(int argc, char** argv) {
+    try {
+        WindowApp app(vkc::parse_args(argc, argv));
+        return app.run();
+    } catch (const std::exception& error) {
+        spdlog::error("{}", error.what());
+        return EXIT_FAILURE;
+    }
+}
+```
+
+One `try` around everything. `app` is a local, so the **stack unwinding** that follows a
+throw inside `run()` destroys it on the way out, releasing the window before the message is
+printed. This is the whole error-handling strategy of the series: constructors throw, `main`
+catches, destructors clean up, and no function in between has to check a return code it
+cannot do anything about.
+
+That is the complete file.
 
 ## Pixels are not points
+
+One thing this sample does not need but chapter 1.4 does, worth knowing before you get
+there:
 
 ```cpp
 int width = 0, height = 0;
@@ -66,58 +436,64 @@ SDL_GetWindowSizeInPixels(window_, &width, &height);
 ```
 
 On a display with a scale factor — a HiDPI laptop, or a Wayland compositor applying
-fractional scaling — the window's *size* and its *drawable size in pixels* are
-different numbers. A window 1280 points wide might be 1712 pixels wide.
+fractional scaling — the window's *size* and its *drawable size in pixels* are different
+numbers.
 
-The swapchain needs **pixels**. Using `SDL_GetWindowSize` instead of
-`SDL_GetWindowSizeInPixels` gives an image at the wrong resolution that the compositor
-then rescales, and the result looks slightly soft in a way that is genuinely hard to
-diagnose later. Use the pixel size, always.
+A worked example, from the machine these articles were written on. The window is asked for
+1280 × 720. The compositor is running at a fractional scale of about 1.34, and reports:
 
-## The event loop
-
-```cpp title="code/src/1.getting_started/creating_a_window/main.cpp"
-SDL_Event event;
-while (SDL_PollEvent(&event)) {
-    switch (event.type) {
-        case SDL_EVENT_QUIT:
-        case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
-            running = false;
-            break;
-        case SDL_EVENT_KEY_DOWN:
-            if (event.key.key == SDLK_ESCAPE) {
-                running = false;
-            }
-            break;
-        default:
-            break;
-    }
-}
+```
+  requested size   1280 x 720   points   (what you asked SDL for)
+  pixel size       1712 x 1389  pixels   (what the swapchain must be)
 ```
 
-The inner `while` matters. Events queue up while the program is busy, and draining the
-entire queue every frame — rather than handling one and moving on — is what keeps the
-window responsive. Leave events in the queue and the compositor eventually decides the
-application has hung.
+1712 ÷ 1280 is 1.3375. Those are not the same rectangle, and the swapchain needs the
+**pixel** one. Using `SDL_GetWindowSize` instead of `SDL_GetWindowSizeInPixels` gives an
+image at 1280 × 720 that the compositor then stretches to 1712 × 1389, and the result looks
+slightly soft in a way that is genuinely hard to diagnose later — it is not blurry enough to
+look broken, just never quite sharp.
 
-`SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED` is only logged here. From chapter 1.4 it becomes
-the signal to rebuild the swapchain, which is why it is wired up now.
+## The build file
 
-## Destruction order
+A chapter that will not build is not finished, so the `CMakeLists.txt` is part of the
+material like anything else. This one is four lines.
 
-```cpp title="code/src/1.getting_started/creating_a_window/main.cpp"
-~WindowApp() {
-    if (window_ != nullptr) {
-        SDL_DestroyWindow(window_);
-    }
-    SDL_Quit();
-}
+```cmake title="code/src/1.getting_started/creating_a_window/CMakeLists.txt"
+# NO_SCAFFOLD: this chapter builds everything by hand. See code/common/CMakeLists.txt.
+add_chapter(1.1.creating_a_window
+    SOURCES main.cpp
+    NO_SCAFFOLD
+)
 ```
 
-Destroy in the reverse of the order things were created. SDL is forgiving about this.
-Vulkan is not even slightly forgiving about it, and by chapter 1.6 the destructor has
-nine things in it that must be released in exactly the right order. Forming the habit
-here costs nothing.
+`add_chapter` is this project's own CMake function, defined in
+`code/cmake/AddChapter.cmake`, and every one of the thirty samples is declared with a
+single call to it. It takes the **chapter id** — `1.1.creating_a_window` — and derives
+everything else from it: the target is `ch_1_1_creating_a_window` (dots are not legal in
+a CMake target name, so they become underscores), the binary it produces is named after
+the id, and the id is also compiled in as `LVK_CHAPTER_ID` so a running sample can find
+its own shader files. From chapter 1.7 there is a `SHADERS` argument too.
+
+`NO_SCAFFOLD` is the interesting one, and it is how the promise in the previous section
+is kept by the build rather than by discipline. Exactly one of three cases applies to
+every chapter:
+
+```
+  NO_SCAFFOLD          links vkbase only          <- chapter 1.1, standing on nothing
+  SCAFFOLD <targets>   links only those pieces    <- chapters 1.2 to 1.7
+  neither              links the whole scaffold   <- chapter 1.8 onward
+```
+
+`vkbase` is the small library holding the `Args` parser above and the screenshot harness
+chapter 1.5 writes — the book's own tooling, none of it Vulkan. So chapter 1.1 links no
+part of the scaffold at all, which is why this sample had to call `SDL_Init` itself.
+
+Chapter 1.2 will pass `SCAFFOLD vkc_window`, granting it exactly the class shown above
+and nothing else. If its `main.cpp` then tried to call `vkc::Swapchain`, the compiler
+would be perfectly happy — all the scaffold headers share one include tree — and the
+**linker** would reject it with an undefined reference. That is a real failure at a
+slightly later stage than you might expect, and it is the mechanism that guarantees no
+chapter in this series can quietly use something you have not read.
 
 ## Running it
 
@@ -126,21 +502,363 @@ cmake --build code/out/build/linux-debug
 ./code/out/build/linux-debug/bin/1.1.creating_a_window
 ```
 
-You get a window containing garbage — whatever the compositor last had in that memory.
-That is correct. Nothing has drawn anything, so nothing has defined what should be
-there. The first chapter that puts a known colour on screen is 1.5.
+You get a window containing garbage — whatever the compositor last had in that memory. That
+is correct. Nothing has drawn anything, so nothing has defined what should be there. The
+first chapter that puts a known colour on screen is 1.5.
 
 Resize it and watch the log report the new pixel size.
 
+## What happens to this code
+
+Chapter 1.2 does not retype any of it. The window, the SDL initialisation and the
+destruction order above become `vkc::Window` in the shared scaffold, and 1.2's sample
+declares one as a member instead.
+
+That is the rule the whole series runs on: **a chapter writes its subject out in full and
+explains it; from the next chapter onward that code lives in `vkcommon` and the article
+says so.** It is enforced by the build rather than by good intentions — each chapter's
+`CMakeLists.txt` names the pieces it is allowed to link, and reaching for one it has not
+earned is a link error. Chapter 1.1 names none of them, which is why this file starts with
+`SDL_Init`.
+
+Moving code into a library is only honest if you can read it, so here is the whole of
+`vkc::Window`. It is the file you just wrote, rearranged into a class that *owns a
+window* rather than an application that happens to have one.
+
+### The header
+
+```cpp title="code/common/scaffold/include/vkc/window.hpp"
+#include <volk.h>
+
+#include <cstdint>
+#include <span>
+#include <string_view>
+
+struct SDL_Window;
+
+namespace vkc {
+```
+
+`volk` is the Vulkan loader, and chapter 1.2 explains what a loader is and why Vulkan's
+functions cannot simply be called the way `SDL_CreateWindow` is. It appears here only
+because two of the declarations below mention Vulkan types.
+
+`struct SDL_Window;` is a **forward declaration**: it tells the compiler that a type by
+that name exists, without saying what is inside it. That is enough to declare a *pointer*
+to one, and it means every file that includes `vkc/window.hpp` does not also drag in all
+of `SDL3/SDL.h`. The full definition is needed only in `window.cpp`, which does include
+it.
+
+`namespace vkc` is the scaffold's namespace. Everything the book provides lives in it, so
+a name like `Window` can never collide with one of yours.
+
+```cpp title="code/common/scaffold/include/vkc/window.hpp"
+class Window {
+public:
+    Window(std::string_view title, uint32_t width, uint32_t height,
+           bool resizable = true);
+    ~Window();
+
+    Window(const Window&) = delete;
+    Window& operator=(const Window&) = delete;
+    Window(Window&&) = delete;
+    Window& operator=(Window&&) = delete;
+```
+
+The same four deletions as `WindowApp`, for the same reason: this object owns a handle
+that must be destroyed exactly once.
+
+`std::string_view` is a non-owning view of a string — a pointer and a length. Taking one
+means a caller can pass a string literal, a `std::string`, or a slice of either without
+anything being copied. The constructor makes its own copy internally, because SDL wants a
+null-terminated `const char*` and a view is not guaranteed to have a terminator.
+
+`resizable` defaults to `true`, and is false only on a `--screenshot` run, for the tiling
+window manager reason described earlier.
+
+```cpp title="code/common/scaffold/include/vkc/window.hpp"
+    [[nodiscard]] static std::span<const char* const> required_instance_extensions();
+```
+
+This one needs unpacking, and it is the first piece of genuine Vulkan design in the
+series.
+
+Vulkan's core does not know what a window is. Presenting an image to a screen is the job
+of an **instance extension** — an optional block of functionality that has to be asked
+for by name when Vulkan is initialised. Which extensions are needed depends on the
+platform: `VK_KHR_surface` everywhere, plus `VK_KHR_wayland_surface`, `VK_KHR_xlib_surface`
+or `VK_KHR_win32_surface` depending on where the program is running. SDL knows which, so
+it is asked.
+
+The function is **`static`** — callable without a `Window` object — because of an ordering
+problem that would otherwise be circular. The list is needed to create the Vulkan
+instance; the instance is needed to create a surface; the surface comes from a window. If
+answering "which extensions?" required a window, and the window required an instance, and
+the instance required the answer, nothing could ever be built. Making it static breaks
+the cycle: it asks SDL, which only needs the video subsystem running.
+
+`std::span<const char* const>` is a view of an array that SDL owns — a pointer and a
+count, no allocation, no copy. `[[nodiscard]]` makes ignoring the return value a warning,
+which for a function whose only purpose is its return value is a free bug catch.
+
+```cpp title="code/common/scaffold/include/vkc/window.hpp"
+    [[nodiscard]] VkSurfaceKHR create_surface(VkInstance instance);
+    void destroy_surface(VkInstance instance) noexcept;
+
+    [[nodiscard]] VkSurfaceKHR surface() const noexcept { return surface_; }
+    [[nodiscard]] SDL_Window* handle() const noexcept { return window_; }
+```
+
+A **`VkSurfaceKHR`** is Vulkan's handle for "the place this window's pixels go". It is the
+bridge between the window system and the API, and it is the subject of chapter 1.3, which
+creates one and explains it properly. It is declared here because it belongs to the window
+and nowhere else; you are not expected to understand it yet.
+
+The `KHR` suffix marks it as coming from an extension rather than from core Vulkan —
+`KHR` specifically means a Khronos-ratified extension, as opposed to `EXT` for a
+multi-vendor one. Surfaces are an extension precisely because plenty of Vulkan programs
+never present anything to a screen.
+
+Note that `destroy_surface` takes the instance rather than remembering it. A surface is
+owned by the instance that created it, and storing a copy of a handle that something else
+controls the lifetime of is how dangling handles happen.
+
+```cpp title="code/common/scaffold/include/vkc/window.hpp"
+    [[nodiscard]] VkExtent2D pixel_extent() const noexcept;
+
+    [[nodiscard]] bool is_minimised() const noexcept;
+
+private:
+    SDL_Window* window_ = nullptr;
+    VkSurfaceKHR surface_ = VK_NULL_HANDLE;
+};
+
+}  // namespace vkc
+```
+
+**`VkExtent2D`** is one of Vulkan's small plain structs: a `width` and a `height`, both
+`uint32_t`. It appears constantly from chapter 1.4 onward, because almost everything with
+a size is measured in one. `pixel_extent()` returns the *drawable* size — the pixel one
+from the section above, not the point one.
+
+`is_minimised()` exists because a minimised window has a drawable area of 0 × 0. There is
+no image of that size to render into, and asking Vulkan for one is an error, so chapters
+from 1.5 onward skip the frame entirely while it returns true.
+
+**`VK_NULL_HANDLE`** is Vulkan's null for handles, and initialising every handle to it is
+what lets a destructor ask "was this ever created?" — exactly the job `nullptr` does for
+`window_`.
+
+### The implementation
+
+```cpp title="code/common/scaffold/src/window.cpp"
+#include "vkc/window.hpp"
+
+#include "vkc/check.hpp"
+
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_vulkan.h>
+
+#include <format>
+#include <stdexcept>
+
+namespace vkc {
+namespace {
+```
+
+`SDL3/SDL_vulkan.h` is a separate header holding the three SDL functions that know about
+Vulkan. `vkc/check.hpp` is the book's error-checking header, which chapter 1.2 writes.
+
+```cpp title="code/common/scaffold/src/window.cpp"
+struct SdlVideoSubsystem {
+    SdlVideoSubsystem() {
+        if (!SDL_Init(SDL_INIT_VIDEO)) {
+            throw std::runtime_error(
+                std::format("SDL_Init(SDL_INIT_VIDEO) failed: {}", SDL_GetError()));
+        }
+    }
+    ~SdlVideoSubsystem() { SDL_Quit(); }
+};
+
+void ensure_sdl_initialised() {
+    static SdlVideoSubsystem subsystem;
+    (void)subsystem;
+}
+
+}  // namespace
+```
+
+Your `WindowApp` called `SDL_Init` in its constructor and `SDL_Quit` in its destructor.
+`vkc::Window` cannot, because of `required_instance_extensions`: that function is static,
+it needs SDL running, and it is called *before* any `Window` exists.
+
+The fix is a **function-local static**. `subsystem` is constructed the first time
+`ensure_sdl_initialised()` is called and never again, and it is destroyed when the program
+exits. The C++ standard guarantees that construction happens exactly once even if several
+threads call the function at the same moment, which is a genuinely awkward thing to write
+by hand and free here.
+
+`(void)subsystem;` tells the compiler the variable is deliberately unused. Without it,
+`-Wunused-variable` fires, and this project builds with warnings as errors.
+
+This is the RAII idea from earlier applied to a *global* resource: construction starts the
+subsystem, destruction shuts it down, and no caller has to remember either.
+
+```cpp title="code/common/scaffold/src/window.cpp"
+Window::Window(std::string_view title, uint32_t width, uint32_t height,
+               bool resizable) {
+    ensure_sdl_initialised();
+
+    const std::string owned_title(title);
+    window_ = SDL_CreateWindow(owned_title.c_str(), static_cast<int>(width),
+                               static_cast<int>(height),
+                               SDL_WINDOW_VULKAN | (resizable ? SDL_WINDOW_RESIZABLE : 0));
+    if (window_ == nullptr) {
+        throw std::runtime_error(
+            std::format("SDL_CreateWindow failed: {}", SDL_GetError()));
+    }
+}
+```
+
+The same call you wrote, with two differences.
+
+`owned_title` is the copy mentioned above: `std::string_view` has a pointer and a length
+but no guaranteed null terminator, and `SDL_CreateWindow` takes a C string. Constructing a
+`std::string` from the view produces one that is terminated.
+
+There is no `SDL_Quit()` before the throw any more. The subsystem now belongs to the
+function-local static, not to this constructor, so this constructor has nothing of its own
+to undo — which is exactly the simplification that moving ownership somewhere sensible
+buys you.
+
+```cpp title="code/common/scaffold/src/window.cpp"
+Window::~Window() {
+    if (window_ != nullptr) {
+        SDL_DestroyWindow(window_);
+    }
+}
+```
+
+The destructor destroys the window and stops. It deliberately does **not** destroy the
+surface, and the comment in the source says why: the surface belongs to the `VkInstance`,
+which is destroyed by a different object at a different time. A destructor that reached
+for the instance here would be guessing about a lifetime it does not control.
+
+```cpp title="code/common/scaffold/src/window.cpp"
+std::span<const char* const> Window::required_instance_extensions() {
+    ensure_sdl_initialised();
+
+    uint32_t count = 0;
+    const char* const* extensions = SDL_Vulkan_GetInstanceExtensions(&count);
+    if (extensions == nullptr) {
+        throw std::runtime_error(std::format(
+            "SDL_Vulkan_GetInstanceExtensions failed: {}", SDL_GetError()));
+    }
+    return {extensions, count};
+}
+```
+
+SDL returns a pointer to an array it owns, and writes the length into `count`. The span is
+built from the two and copies nothing; the array outlives every use of it because SDL
+keeps it for the life of the process.
+
+Returning `{extensions, count}` constructs the `std::span` from the braced pair — the
+return type is known, so the type does not need naming again.
+
+```cpp title="code/common/scaffold/src/window.cpp"
+VkSurfaceKHR Window::create_surface(VkInstance instance) {
+    if (!SDL_Vulkan_CreateSurface(window_, instance, nullptr, &surface_)) {
+        throw std::runtime_error(
+            std::format("SDL_Vulkan_CreateSurface failed: {}", SDL_GetError()));
+    }
+    return surface_;
+}
+
+void Window::destroy_surface(VkInstance instance) noexcept {
+    if (surface_ != VK_NULL_HANDLE) {
+        SDL_Vulkan_DestroySurface(instance, surface_, nullptr);
+        surface_ = VK_NULL_HANDLE;
+    }
+}
+```
+
+Chapter 1.3 explains what these do. Two things are worth noticing now, because both are
+patterns you will see for the rest of the series.
+
+The surface is written into `surface_` **through a pointer** rather than returned. That is
+how nearly every Vulkan object is created: the handle is an out-parameter and the return
+value is a status. SDL follows the same shape here.
+
+`destroy_surface` sets `surface_` back to `VK_NULL_HANDLE` after destroying it. Vulkan
+handles are just numbers, and a destroyed handle is still a perfectly readable number that
+now refers to nothing. Clearing it turns a use-after-free into a visible null.
+
+The `nullptr` argument in both calls is the **allocation callbacks** parameter — a hook
+for supplying your own CPU allocator, which appears in every Vulkan creation function in
+the API. This series always passes `nullptr` and takes the driver's allocator.
+
+```cpp title="code/common/scaffold/src/window.cpp"
+VkExtent2D Window::pixel_extent() const noexcept {
+    int width = 0;
+    int height = 0;
+    SDL_GetWindowSizeInPixels(window_, &width, &height);
+    return VkExtent2D{static_cast<uint32_t>(width), static_cast<uint32_t>(height)};
+}
+
+bool Window::is_minimised() const noexcept {
+    return (SDL_GetWindowFlags(window_) & SDL_WINDOW_MINIMIZED) != 0;
+}
+
+}  // namespace vkc
+```
+
+`pixel_extent` is the "pixels are not points" lesson made into a function: it calls
+`SDL_GetWindowSizeInPixels`, never `SDL_GetWindowSize`. The casts are because SDL answers
+in `int` and Vulkan asks in `uint32_t`; both are non-negative here, so the conversion is
+safe, and writing it out keeps the compiler quiet about the narrowing.
+
+`is_minimised` tests a **bit flag**. `SDL_GetWindowFlags` returns every flag packed into
+one integer, one bit each, and `& SDL_WINDOW_MINIMIZED` keeps just that bit. Comparing
+against `0` turns it back into a `bool`. Vulkan uses this pattern constantly — its
+`VkFlags` values are combined with `|` and tested with `&` in exactly this way.
+
+That is the whole of `vkc::Window`: 53 lines of header and 95 of implementation, and
+nothing in it that was not either in your `main.cpp` or explained above.
+
+## Words introduced in this chapter
+
+| | |
+|---|---|
+| **compositor** | the system software that arranges every window's pixels into the one image sent to the display |
+| **event** | a message from the window system — resize, key, close — appended to a queue your program drains |
+| **event loop** | the `while` that drains that queue every frame |
+| **RAII** | tying a resource's lifetime to an object's: constructor acquires, destructor releases |
+| **stack unwinding** | the destruction of locals that happens as an exception propagates outward |
+| **point vs pixel** | the window's logical size versus its real drawable size, which differ under display scaling |
+| **translation unit** | one source file and everything it includes — the unit the compiler actually compiles |
+| **forward declaration** | naming a type without defining it, so a header can mention a pointer to it without including another header |
+| **function-local static** | a variable built on the first call and destroyed at exit, which the standard guarantees is constructed exactly once |
+| **instance extension** | optional Vulkan functionality that must be asked for by name when Vulkan is initialised |
+| **surface** | `VkSurfaceKHR`, Vulkan's handle for the place a window's pixels go — chapter 1.3 creates one |
+| **bit flag** | many booleans packed into one integer, combined with `\|` and tested with `&` |
+| **allocation callbacks** | the `nullptr` argument in every Vulkan creation call, a hook for supplying your own CPU allocator |
+
 ## Exercises
 
-1. Print the window size *and* the pixel size side by side. On a HiDPI display they
-   differ; on a 1:1 display they do not. Knowing which you have will save confusion in
-   1.4.
-2. Handle `SDL_EVENT_WINDOW_FOCUS_LOST` and `SDL_EVENT_WINDOW_FOCUS_GAINED`, logging
-   each. Later, a real application would throttle rendering while unfocused.
+1. Print the window size *and* the pixel size side by side, using `SDL_GetWindowSize` and
+   `SDL_GetWindowSizeInPixels`. On a HiDPI display they differ; on a 1:1 display they do
+   not. Knowing which you have will save confusion in 1.4.
+2. Handle `SDL_EVENT_WINDOW_FOCUS_LOST` and `SDL_EVENT_WINDOW_FOCUS_GAINED`, logging each.
+   Later, a real application would throttle rendering while unfocused.
 3. Make <kbd>F11</kbd> toggle fullscreen with `SDL_SetWindowFullscreen`. Watch how many
-   pixel-size-changed events one toggle produces — more than you would guess, which is
-   why swapchain recreation has to be cheap and idempotent.
+   pixel-size-changed events one toggle produces — more than you would guess, which is why
+   swapchain recreation has to be cheap and idempotent.
+4. Change the inner `while (SDL_PollEvent(&event))` to an `if`, then drag the window around
+   vigorously. You have just built the unresponsive-window bug on purpose, and it is worth
+   seeing once so you recognise it.
+5. Replace `WindowApp(const WindowApp&) = delete;` with `= default` and add
+   `WindowApp copy = app;` to `main`. It now compiles, and the window is destroyed twice.
+   Then work out why the deleted version is the one that ships — and note that by chapter
+   1.6 the thing being destroyed twice is a `VkDevice`.
 
 Next: [the instance](/getting-started/the-instance/), where Vulkan finally starts.

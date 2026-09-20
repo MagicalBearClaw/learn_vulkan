@@ -10,17 +10,132 @@ sidebar:
   <figcaption>Chapter 1.13: three cubes, a perspective projection and a depth buffer.</figcaption>
 </figure>
 
-Everything so far has been flat. This chapter adds the third dimension, and with it the
-two pieces that make 3D work: a **projection matrix**, which decides how a point in space
-lands on the screen, and a **depth buffer**, which decides which surface you actually see.
+Everything so far has been flat. This chapter adds the third dimension, and with it the two pieces
+that make 3D work: a **projection matrix**, which decides how a point in space lands on the screen,
+and a **depth buffer**, which decides which surface you actually see.
 
-It also contains the two most reliable ways to get Vulkan wrong, both of which produce a
-picture that is confidently, silently incorrect.
+It also contains the two most reliable ways to get Vulkan wrong, both of which produce a picture
+that is confidently, silently incorrect.
+
+```cmake title="code/src/1.getting_started/coordinate_systems/CMakeLists.txt"
+add_chapter(1.13.coordinate_systems
+    SOURCES main.cpp
+    SHADERS cube.slang
+)
+```
+
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+#include <cstring>
+#include <stdexcept>
+```
+
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+class CubeApp : public vkc::App {
+```
+
+`<cstring>` for the `memcpy` into the uniform buffer, `<stdexcept>` for the throw when no depth
+format is supported.
+
+## A cube is twenty-four vertices
+
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+struct Vertex {
+    glm::vec3 position;
+    glm::vec2 uv;
+};
+```
+
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+constexpr float kH = 0.5F;
+constexpr std::array<Vertex, 24> kVertices{{
+    // front (+z)
+    {{-kH, -kH, kH}, {0.0F, 1.0F}},
+    {{kH, -kH, kH}, {1.0F, 1.0F}},
+    {{kH, kH, kH}, {1.0F, 0.0F}},
+    {{-kH, kH, kH}, {0.0F, 0.0F}},
+    // back (-z)
+    {{kH, -kH, -kH}, {0.0F, 1.0F}},
+    {{-kH, -kH, -kH}, {1.0F, 1.0F}},
+    {{-kH, kH, -kH}, {1.0F, 0.0F}},
+    {{kH, kH, -kH}, {0.0F, 0.0F}},
+    // left (-x)
+    {{-kH, -kH, -kH}, {0.0F, 1.0F}},
+    {{-kH, -kH, kH}, {1.0F, 1.0F}},
+    {{-kH, kH, kH}, {1.0F, 0.0F}},
+    {{-kH, kH, -kH}, {0.0F, 0.0F}},
+    // right (+x)
+    {{kH, -kH, kH}, {0.0F, 1.0F}},
+    {{kH, -kH, -kH}, {1.0F, 1.0F}},
+    {{kH, kH, -kH}, {1.0F, 0.0F}},
+    {{kH, kH, kH}, {0.0F, 0.0F}},
+    // top (+y)
+    {{-kH, kH, kH}, {0.0F, 1.0F}},
+    {{kH, kH, kH}, {1.0F, 1.0F}},
+    {{kH, kH, -kH}, {1.0F, 0.0F}},
+    {{-kH, kH, -kH}, {0.0F, 0.0F}},
+    // bottom (-y)
+    {{-kH, -kH, -kH}, {0.0F, 1.0F}},
+    {{kH, -kH, -kH}, {1.0F, 1.0F}},
+    {{kH, -kH, kH}, {1.0F, 0.0F}},
+    {{-kH, -kH, kH}, {0.0F, 0.0F}},
+}};
+```
+
+Twenty-four vertices, not eight. The eight corners each need **three different texture
+coordinates** — one per face they belong to — and a vertex is the whole bundle of attributes, not
+just a position:
+
+```
+   one corner of the cube belongs to three faces
+        │
+        ├── on the front face  it is uv (0,0)
+        ├── on the top face    it is uv (0,1)
+        └── on the right face  it is uv (1,0)
+
+   three different vertices that happen to share a position
+```
+
+The same will be true of normals in chapter 2.2, which is why a cube with hard edges always has 24
+vertices in practice.
+
+Model space here is right-handed: +x right, +y up, +z toward the viewer. Each face is listed
+bottom-left, bottom-right, top-right, top-left **as seen from outside**, which makes every face
+wind counter-clockwise from outside — and that matters when culling is switched on.
+
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+constexpr std::array<uint16_t, 36> kIndices{
+    0,  1,  2,  2,  3,  0,   // front
+    4,  5,  6,  6,  7,  4,   // back
+    8,  9,  10, 10, 11, 8,   // left
+    12, 13, 14, 14, 15, 12,  // right
+    16, 17, 18, 18, 19, 16,  // top
+    20, 21, 22, 22, 23, 20,  // bottom
+};
+```
+
+Six faces, two triangles each, the same `0-1-2 2-3-0` pattern the quad used, shifted by four each
+time.
+
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+struct CubePlacement {
+    glm::vec3 position;
+    glm::vec3 axis;
+    float speed;
+};
+
+constexpr std::array<CubePlacement, 3> kCubes{{
+    {{0.0F, 0.0F, 0.0F}, {0.35F, 1.0F, 0.2F}, 1.0F},
+    {{-1.1F, 0.4F, -1.2F}, {1.0F, 0.3F, 0.0F}, -0.7F},
+    {{1.0F, -0.4F, -0.6F}, {0.2F, 0.4F, 1.0F}, 0.45F},
+}};
+```
+
+Three of them, arranged so they overlap on screen. Without a depth buffer the last one drawn would
+simply win, which is the point of having three rather than one.
 
 ## The chain of spaces
 
-A vertex passes through four coordinate systems on its way to a pixel, and each step is
-one matrix.
+A vertex passes through four coordinate systems on its way to a pixel, and each step is one matrix.
 
 | Space | Origin | What it is |
 |---|---|---|
@@ -30,62 +145,213 @@ one matrix.
 | **Clip** | — | after the projection, ready for the divide by `w` |
 
 ```slang title="code/src/1.getting_started/coordinate_systems/cube.slang"
-float4 world = mul(push.model, float4(input.position, 1.0));
-float4 view_space = mul(globals.view, world);
-output.position = mul(globals.projection, view_space);
+struct VSInput {
+    [[vk::location(0)]] float3 position;
+    [[vk::location(1)]] float2 uv;
+};
+
+struct VSOutput {
+    float4 position : SV_Position;
+    [[vk::location(0)]] float2 uv;
+};
 ```
 
-Nested `mul()` calls would be the literal translation of GLSL's
-`projection * view * model * position`, but three named steps read better and compile to
-the same thing — and the names are the coordinate spaces this chapter is about.
+```slang title="code/src/1.getting_started/coordinate_systems/cube.slang"
+struct Globals {
+    float4x4 view;
+    float4x4 projection;
+};
+[[vk::binding(0, 0)]] ConstantBuffer<Globals> globals;
 
-Right to left, as always: model first, then view, then projection.
+struct PushConstants {
+    float4x4 model;
+};
+[[vk::push_constant]] PushConstants push;
+
+[[vk::binding(1, 0)]] Sampler2D tex;
+```
+
+```slang title="code/src/1.getting_started/coordinate_systems/cube.slang"
+[shader("vertex")]
+VSOutput vertexMain(VSInput input) {
+    VSOutput output;
+```
+
+```slang title="code/src/1.getting_started/coordinate_systems/cube.slang"
+    float4 world = mul(push.model, float4(input.position, 1.0));
+    float4 view_space = mul(globals.view, world);
+    output.position = mul(globals.projection, view_space);
+```
+
+```slang title="code/src/1.getting_started/coordinate_systems/cube.slang"
+    output.uv = input.uv;
+    return output;
+}
+
+[shader("fragment")]
+float4 fragmentMain(VSOutput input) : SV_Target {
+    return tex.Sample(input.uv);
+}
+```
+
+Nested `mul()` calls would be the literal translation of GLSL's `projection * view * model *
+position`, but three named steps read better and compile to the same thing — and the names are the
+coordinate spaces this chapter is about.
 
 After that the hardware divides all four components by `w` to get **normalised device
 coordinates**, and maps those onto the viewport. That divide is the whole of perspective:
-the projection matrix puts the distance to the camera into `w`, so a vertex twice as far
-away is divided by twice as much and lands twice as close to the centre of the screen.
+
+```
+   a vertex 2 units away    →  w = 2   →  x/2, y/2   lands near the centre
+   a vertex 8 units away    →  w = 8   →  x/8, y/8   lands four times closer to the centre
+```
+
+The projection matrix is what puts the distance into `w`.
 
 :::tip[Three multiplies per vertex, or one]
-Multiplying the three matrices on the CPU once per object and pushing the result saves
-the GPU two matrix multiplies per vertex. Worth doing when a model has 100 000 vertices.
+Multiplying the three matrices on the CPU once per object and pushing the result saves the GPU two
+matrix multiplies per vertex. Worth doing when a model has 100 000 vertices.
 
-They are kept separate here because the separation is the lesson, and because the
-lighting chapters need world-space and view-space positions as well as the final one.
+They are kept separate here because the separation is the lesson, and because the lighting chapters
+need world-space and view-space positions as well as the final one.
 :::
+
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+struct Globals {
+    glm::mat4 view;
+    glm::mat4 projection;
+};
+static_assert(sizeof(Globals) == 128);
+```
+
+Two matrices, 128 bytes, and **no padding needed** — a `mat4` is four 16-byte columns, so std140
+and C++ agree exactly. This is the struct chapter 1.10's alignment section was preparing you to
+check.
 
 ## The projection
 
 ```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
-glm::mat4 projection = glm::perspective(glm::radians(45.0F), aspect, 0.1F, 100.0F);
-projection[1][1] *= -1.0F;
+    [[nodiscard]] static glm::mat4 build_projection(VkExtent2D extent) {
+        const float aspect = static_cast<float>(extent.width) /
+                             static_cast<float>(extent.height);
+
+        glm::mat4 projection = glm::perspective(glm::radians(45.0F), aspect, 0.1F, 100.0F);
 ```
 
-Four arguments: **vertical field of view**, **aspect ratio**, **near plane**, **far
-plane**. The aspect ratio is what replaces the hand-rolled `aspect_fix` from chapter 1.12
-— that was an orthographic projection all along, and this is the real thing.
+Four arguments: **vertical field of view**, **aspect ratio**, **near plane**, **far plane**. The
+aspect ratio is what replaces the hand-rolled `aspect_fix` from chapter 1.12 — that was an
+orthographic projection all along, and this is the real thing.
 
-The near plane deserves more thought than it usually gets. Depth precision is
-concentrated near the camera, and the concentration is extreme: halving `near` costs
-precision *everywhere else*. When surfaces start flickering against each other at a
-distance, pushing the near plane out is the first thing to try, ahead of anything
-cleverer.
+### Where that matrix comes from
+
+`glm::perspective` is four lines of arithmetic, and leaving it a black box makes the next two
+sections impossible to follow. It is worth deriving, because every term in it answers a question
+you can ask in plain English.
+
+The camera sits at the origin of view space looking down **−z**, so a point in front of it has a
+negative `z`; call its distance `d = -z`. Perspective is the observation that a thing twice as far
+away covers half the angle — so the question "where on screen does this land?" is answered by
+similar triangles:
+
+```
+              top edge of the view
+            ┌ · · · · · · · · · · ·
+            │        ╱│
+   camera   │     ╱   │ y            a point at height y,
+      ●─────┼──╱──────●              distance d from the camera
+            │╱        │
+            └ · · · · · · · · · · ·
+             ←    d    →
+
+   the top edge, at distance d, is at height   d · tan(fov/2)
+   so the point's height as a fraction of it:  y / (d · tan(fov/2))
+```
+
+That fraction is what has to come out as −1…1 across the screen, so writing `t = tan(fov/2)`:
+
+```
+   ndc.y = y / (d · t)
+   ndc.x = x / (d · t · aspect)      horizontal half-angle is `aspect` times the vertical
+```
+
+Both divide by `d`. That is the one thing a matrix *cannot* do — a matrix multiply has no division
+in it — and it is the reason the hardware's divide-by-`w` exists at all. So the matrix's job is to
+put `d` into `w` and let the fixed-function divide finish the job. Since `d = -z`, that is a single
+`-1` in the bottom row:
+
+```
+        x       y       z          w
+   ┌                                        ┐
+   │  1/(a·t)   0       0          0        │   →  clip.x = x/(a·t)
+   │  0         1/t     0          0        │   →  clip.y = y/t
+   │  0         0       f/(n-f)    f·n/(n-f)│   →  clip.z = the depth mapping, below
+   │  0         0      -1          0        │   →  clip.w = -z = d
+   └                                        ┘
+
+        a = aspect,  t = tan(fov/2),  n = near,  f = far
+```
+
+Divide the first two rows by that `w` and you get the two similar-triangle formulas back exactly.
+**The entire content of perspective is that `-1`.**
+
+The third row is a separate problem with a separate answer: `z` has to come out as 0 at the near
+plane and 1 at the far plane, and it has to survive the same divide by `d`. Two conditions, two
+unknowns, and the `f/(n-f)` and `f·n/(n-f)` above are their solution. Check it:
+
+```
+   at z = -n :   clip.z = -n·f/(n-f) + f·n/(n-f) = 0,      clip.w = n   →  0/n = 0   ✓
+   at z = -f :   clip.z = -f·f/(n-f) + f·n/(n-f) = f,      clip.w = f   →  f/f = 1   ✓
+```
+
+### Why the near plane matters so much
+
+Working that division through for any distance `d` gives the depth actually stored:
+
+```
+   depth(d) = f/(f-n) · (1 - n/d)
+```
+
+The `n/d` is the whole story: depth is **hyperbolic** in distance, not linear. Doubling the
+distance does not halve the remaining precision, it does something far more lopsided. Setting
+`depth = 0.5` and solving for `d` says where the first half of the buffer's range is spent:
+
+```
+   half the range is used up by   d = 2·f·n / (f + n)
+
+   near = 0.1,  far = 100   →   d = 0.1998     half the precision covers 0.1 → 0.2
+   near = 0.01, far = 100   →   d = 0.02       half of it covers 0.01 → 0.02
+```
+
+Moving the near plane *in* by a factor of ten costs an order of magnitude of precision everywhere
+else, and the far plane barely matters by comparison — it appears only in the `f/(f-n)` scale.
+When surfaces flicker against each other at a distance, pushing the near plane out is the first
+thing to try, ahead of anything cleverer.
 
 ### Trap one: y points down
 
-```cpp
-projection[1][1] *= -1.0F;
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+        projection[1][1] *= -1.0F;
+
+        return projection;
+    }
 ```
 
 **Vulkan's clip-space y axis points down. OpenGL's points up.**
 
-glm produces an OpenGL projection, because glm was written for OpenGL. Negating the
-matrix entry that scales y turns one into the other. Leave it out and everything renders
-upside down — and because a rotating cube looks plausible either way, it is entirely
-possible not to notice until a letter of text appears.
+glm produces an OpenGL projection, because glm was written for OpenGL. Negating the matrix entry
+that scales y turns one into the other.
 
-There is a second way to do it: give the viewport a **negative height**, with `y` set to
-the bottom of the image:
+That entry is the `1/t` in the matrix above, and `projection[1][1]` is how you reach it: a
+`glm::mat4` is stored column by column, so the first index is the **column** and the second the
+row. Column 1, row 1 is the y scale. (Chapter 1.12's section on getting a matrix to the shader is
+where that indexing convention was introduced; it is the one piece of glm that regularly reads as
+a typo.)
+
+Leave the negation out and everything renders upside down — and because a rotating cube looks
+plausible either way, it is entirely possible not to notice until a letter of text appears.
+
+There is a second way to do it: give the viewport a **negative height**, with `y` set to the bottom
+of the image:
 
 ```cpp
 const VkViewport viewport{
@@ -94,106 +360,175 @@ const VkViewport viewport{
 };
 ```
 
-This is legal in core Vulkan (it came from `VK_KHR_maintenance1`, folded in at 1.1) and
-some codebases prefer it because it leaves the matrices exactly as an OpenGL port had
-them. Either works. Pick one and be consistent, because doing both gets you back where
-you started.
+This is legal in core Vulkan (it came from `VK_KHR_maintenance1`, folded in at 1.1). Either works.
+Pick one and be consistent, because doing both gets you back where you started.
 
 ### Trap two: z runs 0 to 1
 
 **Vulkan's clip-space z runs 0 to 1. OpenGL's runs −1 to 1.**
 
-An OpenGL projection maps the near plane to −1, and Vulkan clips anything below 0 — so
-the entire near half of the frustum is thrown away, and the far half has half its
-precision. The result is a scene with chunks missing and depth fighting in whatever
-survives.
+```
+   OpenGL projection output:  near → -1     far → +1
+   Vulkan clips at:           0 ................ 1
+                              └── everything from -1 to 0 is thrown away
+```
 
-This one is handled once, project-wide, in `code/common/base/CMakeLists.txt`:
+So the entire near half of the frustum disappears, and the far half has half its precision. The
+result is a scene with chunks missing and depth fighting in whatever survives.
+
+This is handled once, project-wide:
 
 ```cmake title="code/common/base/CMakeLists.txt"
 GLM_FORCE_DEPTH_ZERO_TO_ONE   # Vulkan clip space is z in [0,1], not [-1,1]
 ```
 
-With that defined, every glm projection emits 0…1 depth and there is nothing further to
-do. It must be defined for **every** translation unit that includes glm, which is why it
-is `PUBLIC` on `vkbase` rather than set per chapter — half a program with it and half
-without is a genuinely horrible bug to find.
+It must be defined for **every** translation unit that includes glm, which is why it is `PUBLIC` on
+`vkbase` rather than set per chapter — half a program with it and half without is a genuinely
+horrible bug to find.
 
 :::note[0 to 1 is also just better]
-Even setting compatibility aside, 0…1 is the right range. Depth values are stored with
-the precision of a float, and floats are dense near zero. OpenGL's −1…1 range wastes
-roughly half the representable values mapping them onto a symmetric range nobody needed.
+Even setting compatibility aside, 0…1 is the right range. Depth values are stored with the
+precision of a float, and floats are dense near zero. OpenGL's −1…1 range wastes roughly half the
+representable values on a symmetric range nobody needed.
 
-This is also why **reversed-z** — mapping near to 1 and far to 0, with a `GREATER` depth
-test — gives so much better precision with a floating-point depth buffer. It is a common
-technique and it is worth knowing the name now; chapter 4.1 works through it.
+This is also why **reversed-z** — mapping near to 1 and far to 0, with a `GREATER` depth test —
+gives so much better precision with a floating-point depth buffer. Chapter 4.1 works through it.
 :::
+
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+    void update_globals(size_t slot, VkExtent2D extent) {
+        const Globals globals{
+            .view = glm::translate(glm::mat4(1.0F), glm::vec3(0.0F, 0.0F, -3.5F)),
+            .projection = build_projection(extent),
+        };
+
+        std::memcpy(uniform_buffers_[slot].mapped(), &globals, sizeof(globals));
+    }
+```
+
+A fixed camera, three and a half units back. **Moving the world away from the camera and moving the
+camera away from the world are the same matrix**, which is why a translation of −3.5 serves as a
+view matrix. Chapter 1.14 makes this interactive and explains why a view matrix is the camera's
+transform *inverted*.
+
+Rebuilding the projection every frame from the current extent is what makes resizing work for free.
 
 ## The depth buffer
 
-Three cubes overlap on screen. Without a depth buffer, whichever is drawn last wins,
-everywhere it covers — which is wrong roughly half the time.
+Three cubes overlap on screen. Without a depth buffer, whichever is drawn last wins, everywhere it
+covers — which is wrong roughly half the time.
 
-A depth buffer stores, per pixel, the depth of the nearest surface written so far. Each
-fragment compares its own depth against it, and is discarded if it loses. The comparison,
-the test and the write are fixed-function hardware, and they are close to free.
-
-### Creating it
-
-It is an image, with three things different from a texture:
-
-```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
-depth_ = vkc::Image(context(), vkc::ImageDesc{
-                                   .format = depth_format_,
-                                   .extent = extent,
-                                   .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
-                                   .mip_levels = 1,
-                                   .aspect = VK_IMAGE_ASPECT_DEPTH_BIT,
-                               });
+```
+   for each fragment:
+       if (its depth < the depth already stored here)   ← VK_COMPARE_OP_LESS
+           keep it, write the new depth
+       else
+           discard it
 ```
 
-A **depth format**, **`DEPTH_STENCIL_ATTACHMENT` usage** instead of `SAMPLED`, and a
-**`DEPTH` aspect** instead of `COLOR`. The aspect is the one that gets forgotten, and it
-must match everywhere — in the view, in every barrier, in every copy.
-
-Depth formats are not all mandatory, so the sample asks:
+The comparison, the test and the write are fixed-function hardware, and they are close to free.
 
 ```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
-constexpr std::array candidates{
-    VK_FORMAT_D32_SFLOAT,
-    VK_FORMAT_D32_SFLOAT_S8_UINT,
-    VK_FORMAT_D24_UNORM_S8_UINT,
-};
+    [[nodiscard]] VkFormat choose_depth_format() {
+        constexpr std::array candidates{
+            VK_FORMAT_D32_SFLOAT,
+            VK_FORMAT_D32_SFLOAT_S8_UINT,
+            VK_FORMAT_D24_UNORM_S8_UINT,
+        };
+
+        for (const VkFormat format : candidates) {
+            VkFormatProperties properties{};
+            vkGetPhysicalDeviceFormatProperties(context().physical_device(), format,
+                                                &properties);
+            if ((properties.optimalTilingFeatures &
+                 VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0) {
+                spdlog::info("Depth format: {}",
+                             format == VK_FORMAT_D32_SFLOAT ? "D32_SFLOAT" : "other");
+                return format;
+            }
+        }
+        throw std::runtime_error("No supported depth attachment format was found.");
+    }
 ```
 
-`D32_SFLOAT` is what to want: full float precision and no stencil bits to pay for.
-`D24_UNORM_S8_UINT` is the traditional alternative and what some older hardware prefers.
-`D16_UNORM` is mandatory everywhere and is genuinely too coarse for a scene of any depth
-— it is where a lot of z-fighting comes from.
+Depth formats are not all mandatory, so the first supported one wins. `D32_SFLOAT` is what to want:
+full float precision and no stencil bits to pay for. `D24_UNORM_S8_UINT` is the traditional
+alternative. `D16_UNORM` is mandatory everywhere and is genuinely too coarse for a scene of any
+depth — it is where a lot of z-fighting comes from, and it is deliberately not in the list.
+
+This is the same "ask, do not assume" pattern as chapter 1.11's linear-blit check.
+
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+    void create_depth_buffer(VkExtent2D extent) {
+        context().wait_idle();
+
+        depth_ = vkc::Image(context(), vkc::ImageDesc{
+                                           .format = depth_format_,
+                                           .extent = extent,
+                                           .usage =
+                                               VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                                           .mip_levels = 1,
+                                           .aspect = VK_IMAGE_ASPECT_DEPTH_BIT,
+                                       });
+```
+
+It is an image, with three things different from a texture: a **depth format**,
+**`DEPTH_STENCIL_ATTACHMENT` usage** instead of `SAMPLED`, and a **`DEPTH` aspect** instead of
+`COLOR`. The aspect is the one that gets forgotten, and it must match everywhere — in the view, in
+every barrier, in every copy.
+
+`wait_idle()` first, because this also runs on resize, and the old depth image may still be in use
+by a frame in flight. Assigning over `depth_` destroys the old one.
+
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+        vkc::immediate_submit(context(), [&](VkCommandBuffer cmd) {
+            depth_.transition(cmd, VK_IMAGE_LAYOUT_UNDEFINED,
+                              VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
+        });
+
+        context().name(depth_.handle(), VK_OBJECT_TYPE_IMAGE, "depth buffer");
+    }
+```
+
+A new image is in `UNDEFINED`. Moving it to the attachment layout once here means the rendering
+scope never has to, and since `loadOp` is `CLEAR` the previous contents are discarded every frame
+anyway.
 
 ### Attaching it
 
-Dynamic rendering takes a depth attachment beside the colour one:
-
 ```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
-const VkClearValue depth_clear{.depthStencil = {1.0F, 0}};
-
-const VkRenderingAttachmentInfo depth_attachment{
-    .imageView = depth_.view(),
-    .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-    .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-    .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-    .clearValue = depth_clear,
-};
+        const VkClearValue colour_clear{.color = {{0.02F, 0.02F, 0.04F, 1.0F}}};
 ```
 
-Cleared to **1.0**, the far plane, because the test keeps the *smaller* value and
-everything must start out further away than "infinitely far".
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+        const VkClearValue depth_clear{.depthStencil = {1.0F, 0}};
 
-`storeOp` is `DONT_CARE`, and that is a real optimisation rather than tidiness. Nothing
-reads the depth buffer after the frame ends, so the driver can skip writing it back to
-memory. On a tile-based GPU — every phone, and Apple silicon — the depth buffer can then
-live entirely in tile memory and never touch RAM at all. One word, a large saving.
+        const VkRenderingAttachmentInfo depth_attachment{
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .pNext = nullptr,
+            .imageView = depth_.view(),
+            .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+            .resolveMode = VK_RESOLVE_MODE_NONE,
+            .resolveImageView = VK_NULL_HANDLE,
+            .resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            .clearValue = depth_clear,
+        };
+```
+
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+            .pDepthAttachment = &depth_attachment,
+```
+
+Cleared to **1.0**, the far plane, because the test keeps the *smaller* value and everything must
+start out further away than "infinitely far". `.depthStencil` is the other arm of the
+`VkClearValue` union that `.color` came from.
+
+`storeOp` is `DONT_CARE`, and that is a real optimisation rather than tidiness. Nothing reads the
+depth buffer after the frame ends, so the driver can skip writing it back to memory. On a
+tile-based GPU — every phone, and Apple silicon — the depth buffer can then live entirely in tile
+memory and never touch RAM at all.
 
 Compare that with `VkRenderPass`, where expressing the same thing meant a `storeOp` on an
 attachment description, a subpass dependency, and a framebuffer object built to match.
@@ -201,61 +536,278 @@ attachment description, a subpass dependency, and a framebuffer object built to 
 ### Turning the test on
 
 ```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
-.depth(depth_format_, /*test=*/true, /*write=*/true, VK_COMPARE_OP_LESS)
+                .depth(depth_format_, /*test=*/true, /*write=*/true, VK_COMPARE_OP_LESS)
 ```
 
 Test and write are separate switches, and the combination matters:
 
-- **test on, write on** — opaque geometry. The default.
-- **test on, write off** — transparent geometry. It must be hidden by things in front of
-  it, but must not hide the things behind it.
-- **test off, write off** — UI drawn over everything.
+| test | write | for |
+|---|---|---|
+| on | on | opaque geometry — the default |
+| on | off | transparent geometry: hidden by things in front, but does not hide what is behind |
+| off | off | UI drawn over everything |
 
-`VK_COMPARE_OP_LESS` keeps the nearer fragment. With a reversed-z depth buffer this
-becomes `GREATER`, and with an equal-depth pre-pass it becomes `EQUAL`.
+`VK_COMPARE_OP_LESS` keeps the nearer fragment. With a reversed-z depth buffer this becomes
+`GREATER`, and with an equal-depth pre-pass it becomes `EQUAL`.
 
-The pipeline is also told the depth *format*, for the same reason it is told the colour
-format: there is no render pass to describe the attachments, so
-`VkPipelineRenderingCreateInfo` carries it.
+The pipeline is also told the depth *format*, for the same reason it is told the colour format:
+there is no render pass to describe the attachments, so `VkPipelineRenderingCreateInfo` carries it.
 
 ## Back-face culling
 
 ```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
-.cull(VK_CULL_MODE_BACK_BIT, VK_FRONT_FACE_COUNTER_CLOCKWISE)
+                .cull(VK_CULL_MODE_BACK_BIT, VK_FRONT_FACE_COUNTER_CLOCKWISE)
 ```
 
-Half the triangles of a closed object face away from the camera and are entirely hidden
-by the half that do not. Culling throws them out before rasterisation, for free.
+Half the triangles of a closed object face away from the camera and are entirely hidden by the half
+that do not. Culling throws them out before rasterisation, for free.
 
-Which winding counts as "front" is the fiddly part, and it is worth being precise about
-because the reasoning is not obvious.
+Which winding counts as "front" is the fiddly part, and the reasoning is not obvious:
 
-The cube is wound counter-clockwise when seen from outside. The y flip in the projection
-is a mirror, and a mirror reverses apparent winding — so you would expect to need
-`CLOCKWISE`. You do not, because there are **two** mirrors: `glm::perspective` is
-right-handed and negates z on the way to clip space as well. Two reflections compose to a
-rotation, and the winding on screen comes out unchanged.
+```
+   the cube is wound counter-clockwise seen from outside
+        │
+        ├── the y flip in the projection is a MIRROR    → reverses winding
+        └── glm::perspective is right-handed and
+            negates z on the way to clip space          → reverses winding again
+
+   two reflections compose to a rotation → the winding on screen is unchanged
+```
 
 :::tip[Do not reason about this — look]
-The failure is subtle. A cube with the wrong winding still renders as a cube-shaped
-thing; it is the *inside* you are seeing, and it reads as an open box with a concave
-corner rather than a solid one.
+The failure is subtle. A cube with the wrong winding still renders as a cube-shaped thing; it is
+the *inside* you are seeing, and it reads as an open box with a concave corner rather than a solid
+one.
 
-Set `cullMode` to `VK_CULL_MODE_NONE` and it always looks right, which makes culling a
-good thing to turn off when geometry is behaving strangely and a bad thing to leave off.
+Set `cullMode` to `VK_CULL_MODE_NONE` and it always looks right, which makes culling a good thing
+to turn off when geometry is behaving strangely and a bad thing to leave off.
 :::
+
+## Per-frame matrices
+
+The uniform buffer is chapter 1.10's, arriving in a sample that has not needed one since. It comes
+back because the view and projection matrices are shared by every draw in the frame and are far too
+large for the push constant block, which already holds the model matrix.
+
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+    void create_uniform_buffers() {
+        for (vkc::Buffer& buffer : uniform_buffers_) {
+            buffer = vkc::Buffer(context().allocator(), sizeof(Globals),
+                                 VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                                 VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                                     VMA_ALLOCATION_CREATE_MAPPED_BIT);
+        }
+    }
+```
+
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+    std::array<vkc::Buffer, vkc::kFramesInFlight> uniform_buffers_;
+    std::array<VkDescriptorSet, vkc::kFramesInFlight> descriptor_sets_{};
+```
+
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+        create_uniform_buffers();
+```
+
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+        for (vkc::Buffer& buffer : uniform_buffers_) {
+            buffer.destroy();
+        }
+```
+
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+        const size_t slot = frame.frame_number % vkc::kFramesInFlight;
+        update_globals(slot, frame.extent);
+```
+
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+            .clearValue = colour_clear,
+```
+
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+                                pipeline_layout_, 0, 1, &descriptor_sets_[slot], 0,
+                                nullptr);
+```
+
+One buffer and one descriptor set per frame in flight, for chapter 1.10's reason exactly.
+
+## Two bindings
+
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+        const std::array<VkDescriptorSetLayoutBinding, 2> bindings{{
+            {
+                .binding = 0,
+                .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                .descriptorCount = 1,
+                .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+                .pImmutableSamplers = nullptr,
+            },
+            {
+                .binding = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .descriptorCount = 1,
+                .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+                .pImmutableSamplers = nullptr,
+            },
+        }};
+
+        const VkDescriptorSetLayoutCreateInfo layout_info{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .bindingCount = static_cast<uint32_t>(bindings.size()),
+            .pBindings = bindings.data(),
+        };
+```
+
+Chapter 1.10's uniform buffer and chapter 1.11's texture, in one set. Each names only the stage that
+reads it: matrices for the vertex stage, texture for the fragment stage.
+
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+        const std::array<VkDescriptorPoolSize, 2> pool_sizes{{
+            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, vkc::kFramesInFlight},
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, vkc::kFramesInFlight},
+        }};
+```
+
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+            .maxSets = vkc::kFramesInFlight,
+            .poolSizeCount = static_cast<uint32_t>(pool_sizes.size()),
+            .pPoolSizes = pool_sizes.data(),
+```
+
+One pool size per descriptor *type*. Note the image sampler count is `kFramesInFlight` even though
+the texture never changes: the count is per-set, and there are two sets.
+
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+        const std::array<VkDescriptorSetLayout, vkc::kFramesInFlight> layouts{
+            set_layout_, set_layout_};
+```
+
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+            .descriptorSetCount = vkc::kFramesInFlight,
+            .pSetLayouts = layouts.data(),
+        };
+        VK_CHECK(vkAllocateDescriptorSets(device, &alloc_info, descriptor_sets_.data()));
+
+        for (size_t i = 0; i < vkc::kFramesInFlight; ++i) {
+            const VkDescriptorBufferInfo buffer_info{
+                .buffer = uniform_buffers_[i].handle(),
+                .offset = 0,
+                .range = sizeof(Globals),
+            };
+```
+
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+            const VkDescriptorImageInfo image_info{
+                .sampler = sampler_.handle(),
+                .imageView = texture_.view(),
+                .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            };
+
+            const std::array<VkWriteDescriptorSet, 2> writes{{
+                {
+                    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                    .pNext = nullptr,
+                    .dstSet = descriptor_sets_[i],
+                    .dstBinding = 0,
+                    .dstArrayElement = 0,
+                    .descriptorCount = 1,
+                    .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                    .pImageInfo = nullptr,
+                    .pBufferInfo = &buffer_info,
+                    .pTexelBufferView = nullptr,
+                },
+                {
+                    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                    .pNext = nullptr,
+                    .dstSet = descriptor_sets_[i],
+                    .dstBinding = 1,
+                    .dstArrayElement = 0,
+                    .descriptorCount = 1,
+                    .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                    .pImageInfo = &image_info,
+                    .pBufferInfo = nullptr,
+                    .pTexelBufferView = nullptr,
+                },
+            }};
+
+            vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()),
+                                   writes.data(), 0, nullptr);
+        }
+    }
+```
+
+Two writes in one call, which is what `vkUpdateDescriptorSets` takes an array for. Batching them
+matters once there are hundreds.
+
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+                .format = VK_FORMAT_R32G32B32_SFLOAT,
+                .offset = offsetof(Vertex, position),
+```
+
+The position attribute is three floats now rather than two.
+
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+            vkc::load_shader(device, LVK_CHAPTER_ID, "cube.slang");
+
+        pipeline_ =
+            vkc::PipelineBuilder(device)
+                .shaders(shader)
+                .vertex_input(std::span(&binding, 1), attributes)
+```
+
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+                .colour_attachment(swapchain().format())
+                .layout(pipeline_layout_)
+                .build();
+```
+
+The builder gains `.cull(...)` and `.depth(...)` between those two halves; everything else is
+chapter 1.12's call unchanged.
 
 ## Resizing
 
-The depth buffer must be exactly the size of the colour attachment, so it follows the
-swapchain:
-
 ```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
-void on_resize(VkExtent2D extent) override { create_depth_buffer(extent); }
+    void on_resize(VkExtent2D extent) override { create_depth_buffer(extent); }
 ```
 
-The projection follows too, because the aspect ratio changed — that happens for free,
-since `update_globals` rebuilds it from the current extent every frame.
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+        depth_format_ = choose_depth_format();
+        create_depth_buffer(swapchain().extent());
+```
+
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+        depth_.destroy();
+```
+
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+    VkFormat depth_format_ = VK_FORMAT_UNDEFINED;
+    vkc::Image depth_;
+```
+
+The depth buffer must be exactly the size of the colour attachment, so it follows the swapchain.
+`on_resize` is a `vkc::App` hook, called after the swapchain has been rebuilt. The projection
+follows too, because `update_globals` rebuilds it from the current extent every frame.
+
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+        const float time = static_cast<float>(frame.frame_number) / 60.0F;
+
+        for (const CubePlacement& cube : kCubes) {
+            const glm::mat4 model =
+                glm::translate(glm::mat4(1.0F), cube.position) *
+                glm::rotate(glm::mat4(1.0F), time * cube.speed,
+                            glm::normalize(cube.axis));
+```
+
+Translate then rotate, read right to left: each cube spins about its own centre and is then placed.
+That is chapter 1.12's "spin in place" chain. `glm::normalize` on the axis is required —
+`glm::rotate` assumes a unit axis and silently scales the rotation otherwise.
+
+```cpp title="code/src/1.getting_started/coordinate_systems/main.cpp"
+        options.title = "LearnVulkan 1.13 - Coordinate systems";
+        CubeApp app(vkc::App::parse_args(argc, argv, options));
+```
 
 ## Running it
 
@@ -263,35 +815,117 @@ since `update_globals` rebuilds it from the current extent every frame.
 ./code/out/build/linux-debug/bin/1.13.coordinate_systems
 ```
 
-Three cubes, turning on different axes at different distances, each correctly hiding
-whatever is behind it. Resize the window and the proportions stay right.
+Three cubes, turning on different axes at different distances, each correctly hiding whatever is
+behind it. Resize the window and the proportions stay right.
 
-## What changed
+## What moves into `vkcommon`
 
-- vertices are `glm::vec3`, and the mesh is a 24-vertex cube
-- a view matrix and a projection matrix, in a per-frame uniform buffer
-- a depth image, recreated on resize, attached through `pDepthAttachment`
-- the pipeline has a depth test, a depth format, and back-face culling
-- the descriptor set has two bindings: matrices for the vertex stage, texture for the
-  fragment stage
+The two depth functions join `image.cpp`, beside the `vkc::Image` chapter 1.11 wrote.
+Chapter 1.14 calls both.
 
-Nothing new in `vkcommon` — `vkc::Image` already covered a depth image, which is why it
-takes a `format`, a `usage` and an `aspect` rather than assuming a texture.
+```cpp title="code/common/scaffold/src/image.cpp"
+VkFormat choose_depth_format(VkPhysicalDevice physical_device) {
+    // Most precise first. A format is only usable as a depth attachment if the GPU says
+    // so, and asking is cheaper than assuming: D24_UNORM_S8_UINT is absent on some
+    // desktop GPUs and D32_SFLOAT_S8_UINT on some mobile ones.
+    constexpr std::array candidates{
+        VK_FORMAT_D32_SFLOAT,
+        VK_FORMAT_D32_SFLOAT_S8_UINT,
+        VK_FORMAT_D24_UNORM_S8_UINT,
+    };
+
+    for (const VkFormat format : candidates) {
+        VkFormatProperties properties{};
+        vkGetPhysicalDeviceFormatProperties(physical_device, format, &properties);
+        if ((properties.optimalTilingFeatures &
+             VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0) {
+            return format;
+        }
+    }
+    throw std::runtime_error("No supported depth attachment format was found.");
+}
+```
+
+Your function with the logging removed, and taking the physical device as a parameter
+rather than reaching for `context()`. The comment records *why* all three candidates are
+needed rather than just the first: `D24_UNORM_S8_UINT` is missing on some desktop GPUs and
+`D32_SFLOAT_S8_UINT` on some mobile ones, so a list of one would fail somewhere real.
+
+```cpp title="code/common/scaffold/src/image.cpp"
+Image create_depth_buffer(Context& context, VkFormat format, VkExtent2D extent) {
+    // The GPU must have finished with the old depth buffer before it is replaced. A
+    // resize already waits for idle, and at start-up there is nothing in flight, so this
+    // costs nothing in either case.
+    context.wait_idle();
+
+    Image depth(context, ImageDesc{
+                             .format = format,
+                             .extent = extent,
+                             .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                             .mip_levels = 1,
+                             // The aspect is the easy one to forget, and it has to match
+                             // in the view and in every barrier.
+                             .aspect = VK_IMAGE_ASPECT_DEPTH_BIT,
+                         });
+
+    // A new image is in UNDEFINED. Moving it to the attachment layout once here means no
+    // frame ever has to, and loadOp CLEAR discards the contents anyway.
+    immediate_submit(context, [&](VkCommandBuffer cmd) {
+        depth.transition(cmd, VK_IMAGE_LAYOUT_UNDEFINED,
+                         VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
+    });
+
+    context.name(depth.handle(), VK_OBJECT_TYPE_IMAGE, "depth buffer");
+    return depth;
+}
+```
+
+Your `create_depth_buffer`, unchanged apart from **returning** the image rather than
+assigning to a member. That difference is what makes the next chapter's resize handler a
+single line:
+
+```cpp
+depth_ = vkc::create_depth_buffer(context(), depth_format_, extent);
+```
+
+Assigning over `depth_` invokes `Image`'s move-assignment operator, which — as chapter 1.11
+noted — destroys the old image first. Without that, every resize would leak a full-screen
+depth buffer.
+
+The `wait_idle()` at the top is still here and still necessary for the same reason: on a
+resize the old depth image may be in use by a frame in flight.
+
+## Words introduced in this chapter
+
+| | |
+|---|---|
+| **model / view / projection** | the three matrices taking a vertex from its own space to clip space |
+| **field of view** | the vertical angle the camera sees; `tan(fov/2)` is the scale it becomes |
+| **normalised device coordinates** | what clip space becomes after the divide by `w` |
+| **perspective divide** | dividing by `w`, which is what makes distant things small |
+| **hyperbolic depth** | stored depth goes as `1 − n/d`, so precision piles up near the camera |
+| **near / far plane** | the range the projection maps into the depth buffer |
+| **depth buffer** | a per-pixel record of the nearest surface so far |
+| **z-fighting** | flickering where two surfaces are too close for the depth buffer to separate |
+| **back-face culling** | discarding triangles whose winding shows they face away |
+| **reversed-z** | mapping near to 1 and far to 0 for far better float precision |
 
 ## Exercises
 
-1. Delete `projection[1][1] *= -1.0F`. The scene turns upside down. Now instead give the
-   viewport a negative height and check you get the original image back.
-2. Set `storeOp` on the depth attachment to `VK_ATTACHMENT_STORE_OP_STORE`. Nothing
-   changes on screen, which is the point: you have just asked the GPU to write several
-   megabytes per frame that nobody reads.
-3. Set the near plane to `0.0001F`. Look for flickering where the cubes intersect, and
-   then read the note about reversed-z again.
-4. Set `depthCompareOp` to `VK_COMPARE_OP_GREATER` via the pipeline builder. You are now
-   seeing the *back* of every cube — the depth test is keeping the furthest surface.
-5. Turn culling off with `VK_CULL_MODE_NONE` and set the front face to `CLOCKWISE`.
-   Nothing changes, because nothing is being culled. Now turn culling back on and watch
-   the cubes turn inside out.
-6. Remove the depth attachment entirely and set `depth_test` to `false`. The cubes still
-   draw, in the order the loop submits them, and it is immediately obvious why sorting by
-   hand is not a plan.
+1. Delete `projection[1][1] *= -1.0F`. The scene turns upside down. Now instead give the viewport a
+   negative height and check you get the original image back.
+2. Set `storeOp` on the depth attachment to `VK_ATTACHMENT_STORE_OP_STORE`. Nothing changes on
+   screen, which is the point: you have just asked the GPU to write several megabytes per frame that
+   nobody reads.
+3. Set the near plane to `0.0001F`. Look for flickering where the cubes intersect, then read the
+   note about reversed-z again.
+4. Set the depth compare op to `VK_COMPARE_OP_GREATER`. You are now seeing the *back* of every cube.
+5. Turn culling off with `VK_CULL_MODE_NONE` and set the front face to `CLOCKWISE`. Nothing changes,
+   because nothing is being culled. Now turn culling back on and watch the cubes turn inside out.
+6. Remove the depth attachment entirely and pass `false` for the depth test. The cubes still draw,
+   in the order the loop submits them, and it is immediately obvious why sorting by hand is not a
+   plan.
+7. Add `VK_FORMAT_D16_UNORM` to the front of the `candidates` array. It is mandatory, so it wins,
+   and the cubes begin to fight where they intersect.
+
+Next: [camera](/getting-started/camera/) — making that fixed view matrix something you can fly.

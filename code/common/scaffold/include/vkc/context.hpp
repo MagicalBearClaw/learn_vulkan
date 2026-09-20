@@ -1,19 +1,27 @@
 #pragma once
 
+#include "vkc/device.hpp"
+#include "vkc/instance.hpp"
+
 #include <volk.h>
 
 #include <vk_mem_alloc.h>
 
 #include <cstdint>
+#include <memory>
 #include <string_view>
 
 namespace vkc {
 
 class Window;
 
-// Everything that is created once at start-up and lives for the whole run: the
-// instance, the debug messenger, the chosen GPU, the logical device, the queue we
-// submit to, and the memory allocator.
+// Everything that is created once at start-up and lives for the whole run.
+//
+// This is a facade over two objects that are taught separately and can be used
+// separately: Instance is chapter 1.2's subject, Device is chapter 1.3's, and the
+// surface that joins them comes from the Window. A chapter that has read both can use
+// Instance and Device directly; everything from 1.4 onward takes the whole Context,
+// because from there on it always wants all three.
 //
 // This series targets Vulkan 1.3 with dynamic rendering and synchronization2 always
 // enabled, so there are no VkRenderPass or VkFramebuffer objects anywhere in it, and
@@ -33,27 +41,39 @@ public:
     Context(Context&&) = delete;
     Context& operator=(Context&&) = delete;
 
-    [[nodiscard]] VkInstance instance() const noexcept { return instance_; }
-    [[nodiscard]] VkPhysicalDevice physical_device() const noexcept { return gpu_; }
-    [[nodiscard]] VkDevice device() const noexcept { return device_; }
+    // The two halves, for a chapter that wants to name them.
+    [[nodiscard]] const Instance& vk_instance() const noexcept { return *instance_; }
+    [[nodiscard]] const Device& vk_device() const noexcept { return *device_; }
+
+    [[nodiscard]] VkInstance instance() const noexcept { return instance_->handle(); }
+    [[nodiscard]] VkPhysicalDevice physical_device() const noexcept {
+        return device_->physical_device();
+    }
+    [[nodiscard]] VkDevice device() const noexcept { return device_->handle(); }
     [[nodiscard]] VkSurfaceKHR surface() const noexcept { return surface_; }
-    [[nodiscard]] VmaAllocator allocator() const noexcept { return allocator_; }
+    [[nodiscard]] VmaAllocator allocator() const noexcept {
+        return device_->allocator();
+    }
 
     // A single queue that supports graphics, compute, transfer and presentation.
     // Every desktop GPU exposes at least one such queue family, and using one queue
     // for everything removes an entire class of ownership-transfer barriers from the
     // early chapters. Multiple queues get their own chapter much later.
-    [[nodiscard]] VkQueue queue() const noexcept { return queue_; }
-    [[nodiscard]] uint32_t queue_family() const noexcept { return queue_family_; }
+    [[nodiscard]] VkQueue queue() const noexcept { return device_->queue(); }
+    [[nodiscard]] uint32_t queue_family() const noexcept {
+        return device_->queue_family();
+    }
 
     [[nodiscard]] const VkPhysicalDeviceProperties& gpu_properties() const noexcept {
-        return gpu_properties_;
+        return device_->gpu_properties();
     }
 
     // Attaches a readable name to a Vulkan object. Costs nothing in release builds
     // and turns RenderDoc captures and validation messages from handle soup into
     // something you can actually read.
-    void set_debug_name(uint64_t handle, VkObjectType type, const char* name) const;
+    void set_debug_name(uint64_t handle, VkObjectType type, const char* name) const {
+        device_->set_debug_name(handle, type, name);
+    }
 
     template <typename Handle>
     void name(Handle handle, VkObjectType type, const char* label) const {
@@ -62,28 +82,14 @@ public:
 
     // Blocks until the GPU is completely idle. Only ever correct at teardown or
     // during a window resize; never in a frame loop.
-    void wait_idle() const;
+    void wait_idle() const { device_->wait_idle(); }
 
 private:
-    void create_instance(const Config& config);
-    void create_debug_messenger();
-    void select_physical_device();
-    void create_device();
-    void create_allocator();
-
-    VkInstance instance_ = VK_NULL_HANDLE;
-    VkDebugUtilsMessengerEXT debug_messenger_ = VK_NULL_HANDLE;
+    std::unique_ptr<Instance> instance_;
     VkSurfaceKHR surface_ = VK_NULL_HANDLE;
-    VkPhysicalDevice gpu_ = VK_NULL_HANDLE;
-    VkPhysicalDeviceProperties gpu_properties_{};
-    VkDevice device_ = VK_NULL_HANDLE;
-    VkQueue queue_ = VK_NULL_HANDLE;
-    uint32_t queue_family_ = UINT32_MAX;
-    VmaAllocator allocator_ = VK_NULL_HANDLE;
+    std::unique_ptr<Device> device_;
 
     Window* window_ = nullptr;
-    bool validation_enabled_ = false;
-    bool debug_utils_enabled_ = false;
 };
 
 }  // namespace vkc

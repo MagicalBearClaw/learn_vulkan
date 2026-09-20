@@ -12,8 +12,8 @@ sidebar:
 
 There is **no Vulkan in this chapter**. That is worth saying plainly, because "camera" is
 not a Vulkan concept and there is no `VkCamera` to go looking for. The view matrix was
-already a uniform in 1.13; the only change is that its contents now come from a position
-and two angles that the keyboard and mouse update.
+already a uniform in 1.13; the only change is that its contents now come from a position and
+two angles that the keyboard and mouse update.
 
 ```bash
 WASD      move
@@ -22,91 +22,216 @@ space     up          ctrl   down
 shift     sprint      Escape quit
 ```
 
+```cmake title="code/src/1.getting_started/camera/CMakeLists.txt"
+add_chapter(1.14.camera
+    SOURCES main.cpp
+    SHADERS cube.slang
+)
+```
+
+The same shader as chapter 1.13, because the camera changes nothing about what is drawn —
+only where it is seen from.
+
+```cpp title="code/src/1.getting_started/camera/main.cpp"
+#include <SDL3/SDL.h>
+```
+
+```cpp title="code/src/1.getting_started/camera/main.cpp"
+#include <algorithm>
+#include <cmath>
+```
+
+SDL comes back into a sample for the first time since 1.7 — `vkc::App` normally keeps it
+out of sight, but this chapter reads input. `<algorithm>` is for `std::clamp` and `<cmath>`
+for the trigonometry.
+
 ## The view matrix is an inverse
 
 There is no camera in a rendering pipeline. There is an origin, and there is geometry.
 "Moving the camera one unit right" and "moving the entire world one unit left" produce
 identical pixels, and the second is what actually happens.
 
-So the view matrix is the **inverse** of the camera's own transform. If the camera sits
-at `(0, 0, 4)`, the view matrix translates everything by `(0, 0, −4)`.
-
-`glm::lookAt` builds it from three vectors:
+So the view matrix is the **inverse** of the camera's own transform. If the camera sits at
+`(0, 0, 4)`, the view matrix translates everything by `(0, 0, −4)` — which is exactly the
+fixed translation chapter 1.13 used in place of a camera.
 
 ```cpp title="code/src/1.getting_started/camera/main.cpp"
-[[nodiscard]] glm::mat4 view() const {
-    return glm::lookAt(position, position + front(), glm::vec3{0.0F, 1.0F, 0.0F});
-}
+    [[nodiscard]] glm::mat4 view() const {
+        return glm::lookAt(position, position + front(), glm::vec3{0.0F, 1.0F, 0.0F});
+    }
+};
 ```
 
-Where the camera is, what it is looking **at** (not a direction — a point, which is why
-`front()` is added to the position), and which way is up.
+`glm::lookAt` builds it from three vectors: where the camera is, what it is looking **at**
+(not a direction — a point, which is why `front()` is added to the position), and which way
+is up.
 
-Inverting a general 4×4 matrix is expensive. `lookAt` never does: for a matrix that is
-only a rotation and a translation, the inverse is the transpose of the rotation part plus
-a negated, rotated translation, which is a handful of multiplies. Worth knowing because
-it is the reason a view matrix is cheap to rebuild every frame.
+Inverting a general 4×4 matrix is expensive — and `lookAt` never does one. It is worth seeing
+what it builds instead, because the trick is reused constantly.
+
+From its three arguments it first works out the camera's own three axes, each a unit vector:
+
+```
+   forward  f = normalise(centre - eye)
+   right    s = normalise(cross(f, up))      ← the cross product, below
+   true up  u = cross(s, f)                  ← already unit length, both inputs are
+```
+
+Those three arrows are where the camera's own basis vectors point, so as *columns* they would form
+the camera's transform. The view matrix is its inverse, and a rotation's inverse is its transpose
+— so the same three vectors go in as **rows** instead:
+
+```
+   ┌                                  ┐
+   │   s.x    s.y    s.z    -(s·eye)  │
+   │   u.x    u.y    u.z    -(u·eye)  │
+   │  -f.x   -f.y   -f.z     (f·eye)  │
+   │   0      0      0        1       │
+   └                                  ┘
+```
+
+Reading a row at a time: each one dot-products a world position against one camera axis, which
+answers "how far along the camera's right/up/forward does this point sit?" — which is exactly what
+view space means. The last column subtracts the camera's own position first, so that the camera
+lands at the origin.
+
+The third row is negated because the camera looks down **−z** by convention, so its forward
+direction and the axis it is stored on point opposite ways.
+
+No inverse was computed: a transpose and three dot products. That is why a view matrix can be
+rebuilt from scratch every frame and nobody notices. The
+[mathematics appendix](/appendices/mathematics/) works through why a rotation's transpose is its
+inverse.
 
 ## Two angles, not a matrix
 
 ```cpp title="code/src/1.getting_started/camera/main.cpp"
 struct Camera {
     glm::vec3 position{0.0F, 0.0F, 4.0F};
+
     float yaw = -90.0F;
     float pitch = 0.0F;
-};
+
+    float speed = 4.0F;        // world units per second
+    float sensitivity = 0.1F;  // degrees per pixel of mouse motion
 ```
 
 The tempting alternative is to keep a matrix and multiply a small rotation into it each
-frame. Do not. Floating-point error accumulates in a matrix that is repeatedly
-multiplied, and after a few thousand frames the rotation part is no longer quite a
-rotation — the view shears, subtly, and it gets worse the longer the program runs.
+frame. Do not. Floating-point error accumulates in a matrix that is repeatedly multiplied,
+and after a few thousand frames the rotation part is no longer quite a rotation — the view
+shears, subtly, and it gets worse the longer the program runs.
 
-Storing the angles and rebuilding the matrix from scratch every frame cannot drift, and
-it costs nothing.
+Storing the angles and rebuilding the matrix from scratch every frame cannot drift, and it
+costs nothing.
 
 Two angles is also exactly the right number for a camera that should never roll, which is
-what you want for anything standing on ground. Add roll and you need a third angle, and
-then you meet gimbal lock, and then you want quaternions — which is a later appendix and
-not something a first-person camera needs.
+what you want for anything standing on ground. Add roll and you need a third angle, and then
+you meet gimbal lock, and then you want quaternions — which is a later appendix and not
+something a first-person camera needs.
 
-`yaw = -90` because yaw is measured from the +x axis, and −90° points down −z, which is
-the conventional "forward".
+`yaw = -90` because yaw is measured from the +x axis, and −90° points down −z, which is the
+conventional "forward" and is where the cubes are.
 
 ## Angles to a direction
 
 ```cpp title="code/src/1.getting_started/camera/main.cpp"
-[[nodiscard]] glm::vec3 front() const {
-    const float yaw_radians = glm::radians(yaw);
-    const float pitch_radians = glm::radians(pitch);
-    return glm::normalize(glm::vec3{
-        std::cos(yaw_radians) * std::cos(pitch_radians),
-        std::sin(pitch_radians),
-        std::sin(yaw_radians) * std::cos(pitch_radians),
-    });
-}
+    [[nodiscard]] glm::vec3 front() const {
+        const float yaw_radians = glm::radians(yaw);
+        const float pitch_radians = glm::radians(pitch);
+        return glm::normalize(glm::vec3{
+            std::cos(yaw_radians) * std::cos(pitch_radians),
+            std::sin(pitch_radians),
+            std::sin(yaw_radians) * std::cos(pitch_radians),
+        });
+    }
 ```
 
-This is spherical coordinates. Yaw sweeps around the vertical axis; pitch lifts out of
-the horizontal plane. The `cos(pitch)` factor on x and z is what keeps the vector unit
-length as it tilts — look straight up and the horizontal component is zero.
+This is a conversion from **spherical coordinates** — two angles — to Cartesian ones, and it
+is two applications of school trigonometry stacked.
 
-The sideways direction comes from a cross product:
+Take the pitch first. The facing direction is a unit arrow; tilt it up by `pitch` out of the
+horizontal plane and it forms a right triangle whose hypotenuse is 1:
+
+```
+              ╱│
+        1   ╱  │ sin(pitch)      the vertical part:   y = sin(pitch)
+          ╱    │                 what is left over
+        ╱pitch │                 in the horizontal
+      ●────────┘                 plane:               r = cos(pitch)
+         cos(pitch)
+```
+
+So `y` is settled, and a horizontal arrow of length `r = cos(pitch)` remains to be pointed. Yaw
+does that, in the xz-plane, by the same triangle one dimension over:
+
+```
+   x = r · cos(yaw)  =  cos(yaw) · cos(pitch)
+   z = r · sin(yaw)  =  sin(yaw) · cos(pitch)
+```
+
+Which is the function, line for line. The `cos(pitch)` factor on x and z is not a correction bolted
+on — it is the horizontal leg of the first triangle, and it is what keeps the result unit length as
+the camera tilts. Check it with the Pythagorean identity, twice:
+
+```
+   cos²y·cos²p + sin²p + sin²y·cos²p
+     = cos²p·(cos²y + sin²y) + sin²p
+     = cos²p + sin²p
+     = 1
+```
+
+The vector is already unit length, so the `glm::normalize` is belt and braces against accumulated
+floating-point error rather than a necessity. Look straight up — `pitch = 90` — and `cos(pitch)`
+is zero, so x and z vanish and only `y = 1` is left. Hold on to that; it is about to be a problem.
 
 ```cpp title="code/src/1.getting_started/camera/main.cpp"
-[[nodiscard]] glm::vec3 right() const {
-    return glm::normalize(glm::cross(front(), glm::vec3{0.0F, 1.0F, 0.0F}));
-}
+    [[nodiscard]] glm::vec3 right() const {
+        return glm::normalize(glm::cross(front(), glm::vec3{0.0F, 1.0F, 0.0F}));
+    }
 ```
 
-**World up, not the camera's own up.** That is the detail that makes a fly camera feel
-controllable: strafing stays horizontal no matter how far up or down you are looking. A
-camera that uses its own up drifts sideways and upwards at once when you look up, and it
-feels broken even if you cannot say why.
+### The cross product
+
+The sideways direction is the one axis the two angles do not give you, and the **cross product** is
+how you obtain an axis you do not already have. Given two vectors, it returns a third that is
+perpendicular to both:
+
+```
+   a × b = ( ay·bz - az·by,
+             az·bx - ax·bz,
+             ax·by - ay·bx )
+```
+
+Do not memorise the shape; remember what it is for. Two directions span a plane, and the cross
+product points out of it. Facing and up span the vertical plane you are looking along, so the
+perpendicular to that plane is sideways — which is precisely what strafing needs.
+
+Two of its properties do real work here.
+
+**It is anti-commutative:** `b × a = -(a × b)`. Swapping the arguments flips the answer end for
+end, and which one you get follows the right-hand rule — fingers along `a`, curl toward `b`, thumb
+gives `a × b`. So the argument order in that one line is load-bearing:
+
+```
+   facing down -z, world up is +y
+
+   cross(front, up)  =  cross((0,0,-1), (0,1,0))  =  ( 1, 0, 0)   +x, to the right  ✓
+   cross(up, front)  =  cross((0,1,0), (0,0,-1))  =  (-1, 0, 0)   -x, to the left
+```
+
+Write it the other way round and the program builds, runs, and has A and D reversed.
+
+**Its length is `|a|·|b|·sin θ`**, so it shrinks to nothing as the two inputs line up, and is
+exactly the zero vector when they are parallel. That is the failure the next box is about.
+
+The other half of the line is which "up" to use. It is **world up, not the camera's own up**, and
+that is the detail that makes a fly camera feel controllable: strafing stays horizontal no matter
+how far up or down you are looking. A camera that crosses against its own up drifts sideways and
+upwards at once when you look up, and it feels broken even if you cannot say why.
 
 :::caution[Why the pitch is clamped]
 ```cpp title="code/src/1.getting_started/camera/main.cpp"
-camera_.pitch = std::clamp(camera_.pitch, -89.0F, 89.0F);
+            camera_.pitch = std::clamp(camera_.pitch, -89.0F, 89.0F);
 ```
 
 At exactly ±90° the facing direction is parallel to world up. The cross product of two
@@ -117,67 +242,189 @@ becomes `NaN`. On screen the camera flips over or the world vanishes.
 product stays well-conditioned. Every first-person camera you have ever used does this.
 :::
 
+## Mouse look
+
+```cpp title="code/src/1.getting_started/camera/main.cpp"
+    void on_event(const SDL_Event& event) override {
+        if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN &&
+            event.button.button == SDL_BUTTON_RIGHT) {
+            mouse_captured_ = !mouse_captured_;
+            SDL_SetWindowRelativeMouseMode(window().handle(), mouse_captured_);
+            return;
+        }
+
+        if (event.type == SDL_EVENT_MOUSE_MOTION && mouse_captured_) {
+            camera_.yaw += event.motion.xrel * camera_.sensitivity;
+
+            camera_.pitch -= event.motion.yrel * camera_.sensitivity;
+```
+
+`SDL_SetWindowRelativeMouseMode` hides the cursor and reports motion as deltas with no
+screen edges to run into, which is what a look control needs. It is toggled with the right
+mouse button here so the window stays usable.
+
+The pitch is **subtracted, not added**: SDL's y grows downwards, and moving the mouse up
+should raise the pitch. This is the same downward-y convention as Vulkan's clip space, for
+an entirely unrelated reason.
+
 ## Keyboard state, not key events
 
 ```cpp title="code/src/1.getting_started/camera/main.cpp"
-const bool* keys = SDL_GetKeyboardState(nullptr);
-
-if (keys[SDL_SCANCODE_W]) {
-    camera_.position += front * distance;
-}
+    void move_camera() {
+        const bool* keys = SDL_GetKeyboardState(nullptr);
 ```
 
-A key *event* fires once when the key goes down, once when it comes up, and then at
-whatever repeat rate the OS is configured for. That is exactly right for typing and
-exactly wrong for movement — holding W would produce one step, a pause, then a stutter.
+A key *event* fires once when the key goes down, once when it comes up, and then at whatever
+repeat rate the OS is configured for. That is exactly right for typing and exactly wrong for
+movement — holding W would produce one step, a pause, then a stutter.
 
-What movement needs is "is this key held down right now", which is what the keyboard
-state array answers. This is the single most common beginner mistake in game input, and
-it looks like a bug in the camera rather than a bug in the input.
+What movement needs is "is this key held down right now", which is what the keyboard state
+array answers. This is the single most common beginner mistake in game input, and it looks
+like a bug in the camera rather than a bug in the input.
 
 Mouse *motion* is the opposite case: it genuinely is a stream of deltas, so it belongs in
-the event handler.
+the event handler above.
 
 ```cpp title="code/src/1.getting_started/camera/main.cpp"
-camera_.yaw += event.motion.xrel * camera_.sensitivity;
-camera_.pitch -= event.motion.yrel * camera_.sensitivity;
+        float distance = camera_.speed * delta_time();
+        if (keys[SDL_SCANCODE_LSHIFT] || keys[SDL_SCANCODE_RSHIFT]) {
+            distance *= 4.0F;
+        }
 ```
 
-Subtracted, not added, on the y axis: SDL's y grows downwards, and moving the mouse up
-should raise the pitch.
+`speed` is in world units per **second**, and multiplying by the time since the last frame
+gives units for **this** frame. Without it, movement speed is tied to frame rate: the same
+code moves four times as fast on a 240 Hz monitor as on a 60 Hz one, and it speeds up and
+slows down as the scene load changes.
 
-`SDL_SetWindowRelativeMouseMode` hides the cursor and reports motion as deltas with no
-screen edges to run into, which is what a look control needs. It is toggled with the
-right mouse button here so the window stays usable.
-
-## Multiply by the frame time
-
-```cpp title="code/src/1.getting_started/camera/main.cpp"
-float distance = camera_.speed * delta_time();
-```
-
-`speed` is in world units per **second**, and multiplying by the time since the last
-frame gives units for **this** frame. Without it, movement speed is tied to frame rate:
-the same code moves four times as fast on a 240 Hz monitor as on a 60 Hz one, and it
-speeds up and slows down as the scene load changes.
-
-This is why a number of older games run at absurd speed on modern hardware — their
-movement was measured in units per *frame*, and nobody expected the frame to get 20 times
-shorter.
+This is why a number of older games run at absurd speed on modern hardware — their movement
+was measured in units per *frame*, and nobody expected the frame to get 20 times shorter.
 
 `vkc::App` measures the frame time and exposes it as `delta_time()`.
+
+```cpp title="code/src/1.getting_started/camera/main.cpp"
+        const glm::vec3 front = camera_.front();
+        const glm::vec3 right = camera_.right();
+
+        if (keys[SDL_SCANCODE_W]) {
+            camera_.position += front * distance;
+        }
+        if (keys[SDL_SCANCODE_S]) {
+            camera_.position -= front * distance;
+        }
+        if (keys[SDL_SCANCODE_A]) {
+            camera_.position -= right * distance;
+        }
+        if (keys[SDL_SCANCODE_D]) {
+            camera_.position += right * distance;
+        }
+```
+
+Both vectors are computed once rather than inside each branch — `front()` is four
+trigonometric calls and `right()` calls it again.
+
+```cpp title="code/src/1.getting_started/camera/main.cpp"
+        if (keys[SDL_SCANCODE_SPACE]) {
+            camera_.position.y += distance;
+        }
+        if (keys[SDL_SCANCODE_LCTRL]) {
+            camera_.position.y -= distance;
+        }
+    }
+```
+
+Up and down along **world** up, not the camera's up, which is what makes a fly camera feel
+controllable rather than disorientating. Look down at the floor, press space, and you still
+rise rather than flying into it.
+
+```cpp title="code/src/1.getting_started/camera/main.cpp"
+            .view = camera_.view(),
+```
+
+The one line in `update_globals` that changed. Everything downstream of it — the uniform
+buffer, the descriptor, the shader — is chapter 1.13's, untouched.
+
+```cpp title="code/src/1.getting_started/camera/main.cpp"
+class CameraApp : public vkc::App {
+```
+
+```cpp title="code/src/1.getting_started/camera/main.cpp"
+        move_camera();
+```
+
+```cpp title="code/src/1.getting_started/camera/main.cpp"
+    Camera camera_;
+    bool mouse_captured_ = false;
+```
+
+`move_camera()` is called at the top of `on_render` rather than from a timer, so the camera
+advances exactly once per frame — which is what `delta_time()` measures.
 
 :::note[One new thing in `vkcommon`]
 `vkc::App` gained an `on_event` hook:
 
 ```cpp title="code/common/scaffold/include/vkc/app.hpp"
-virtual void on_event(const SDL_Event& event) {}
+virtual void on_event(const SDL_Event& /*event*/) {}
 ```
 
-It is called for every SDL event before `App` looks at it. Window close, Escape and
-resize are still handled by `App` regardless of what a sample does, so a chapter can
-never accidentally make the window unclosable.
+It is called for every SDL event before `App` looks at it. Window close, Escape and resize
+are still handled by `App` regardless of what a sample does, so a chapter can never
+accidentally make the window unclosable.
 :::
+
+## A bigger scene
+
+```cpp title="code/src/1.getting_started/camera/main.cpp"
+constexpr std::array<CubePlacement, 10> kCubes{{
+    {{0.0F, 0.0F, 0.0F}, {0.35F, 1.0F, 0.2F}, 0.7F},
+    {{2.4F, 0.8F, -3.0F}, {1.0F, 0.3F, 0.0F}, -0.5F},
+    {{-2.0F, -0.6F, -2.2F}, {0.2F, 0.4F, 1.0F}, 0.45F},
+    {{1.2F, -1.4F, -5.5F}, {0.0F, 1.0F, 0.0F}, 0.9F},
+    {{-3.1F, 1.6F, -6.0F}, {1.0F, 1.0F, 0.0F}, -0.3F},
+    {{0.6F, 2.2F, -4.1F}, {0.5F, 0.0F, 1.0F}, 0.6F},
+    {{-1.4F, 0.2F, -8.0F}, {1.0F, 0.0F, 0.3F}, -0.8F},
+    {{3.4F, -1.0F, -7.2F}, {0.3F, 1.0F, 0.6F}, 0.35F},
+    {{-4.0F, -1.8F, -4.6F}, {0.0F, 0.4F, 1.0F}, 0.55F},
+    {{2.0F, 2.6F, -9.5F}, {1.0F, 0.6F, 0.2F}, -0.45F},
+}};
+```
+
+Ten rather than three, spread over about ten units of depth, so that there is something to
+fly through and so the perspective divide has room to be visible.
+
+```cpp title="code/src/1.getting_started/camera/main.cpp"
+        spdlog::info(
+            "WASD to move, space/ctrl for up and down, shift to sprint. "
+            "Right-click to capture the mouse and look around, right-click again to "
+            "release it. Escape quits.");
+```
+
+```cpp title="code/src/1.getting_started/camera/main.cpp"
+        options.title = "LearnVulkan 1.14 - Camera";
+        CameraApp app(vkc::App::parse_args(argc, argv, options));
+```
+
+## The depth buffer moves into `vkcommon`
+
+```cpp title="code/src/1.getting_started/camera/main.cpp"
+        depth_format_ = vkc::choose_depth_format(context().physical_device());
+        depth_ = vkc::create_depth_buffer(context(), depth_format_,
+                                          swapchain().extent());
+```
+
+```cpp title="code/src/1.getting_started/camera/main.cpp"
+    void on_resize(VkExtent2D extent) override {
+        depth_ = vkc::create_depth_buffer(context(), depth_format_, extent);
+    }
+```
+
+Chapter 1.13 wrote `choose_depth_format` and `create_depth_buffer` out in full and explained
+every line of both; from here on they are two calls. `create_depth_buffer` still does
+exactly what 1.13 did: wait for the GPU to go idle, create a depth-format image with the
+`DEPTH` aspect, and move it to `DEPTH_ATTACHMENT_OPTIMAL` once so that no frame ever has to.
+
+The shader is chapter 1.13's, unchanged — the camera never reaches it as anything other
+than a different set of sixteen floats in `globals.view`.
 
 ## Running it
 
@@ -198,39 +445,221 @@ start being one thing that works.
 - `move_camera` reads the keyboard state each frame, scaled by `delta_time()`
 - the view matrix comes from the camera instead of being a fixed translation
 - ten cubes instead of three
+- the depth buffer comes from `vkcommon` instead of being built in the sample
 
-Added to `vkcommon` after this chapter: `vkc::Camera`, which is this code with the SDL
-handling folded in. The first chapter to use it is 2.1, where the subject is lighting and
-a camera is something you want to already have.
+## What moves into `vkcommon`
 
-This is also the first chapter that takes its **depth buffer** from `vkcommon` instead of
-building one itself. Chapter 1.13 wrote `choose_depth_format` and `create_depth_buffer`
-out in full and explained every line of both; from here on they are two calls:
+`vkc::Camera` is this chapter's code with the SDL handling folded in. The first chapter to
+use it is 2.1, where the subject is lighting and a camera is something you want to already
+have.
 
-```cpp title="code/src/1.getting_started/camera/main.cpp"
-depth_format_ = vkc::choose_depth_format(context().physical_device());
-depth_ = vkc::create_depth_buffer(context(), depth_format_, swapchain().extent());
+It is the last file to join the scaffold.
+
+```cpp title="code/common/scaffold/include/vkc/camera.hpp"
+#include <glm/glm.hpp>
+
+union SDL_Event;
+struct SDL_Window;
+
+namespace vkc {
+
+class Camera {
+public:
+    glm::vec3 position{0.0F, 0.0F, 4.0F};
+
+    // Degrees. -90 yaw faces down -z, which is the conventional "forward".
+    float yaw = -90.0F;
+    float pitch = 0.0F;
+
+    float speed = 4.0F;        // world units per second
+    float sensitivity = 0.1F;  // degrees per pixel of mouse motion
+    float sprint_multiplier = 4.0F;
 ```
 
-`create_depth_buffer` still does exactly what 1.13 did: wait for the GPU to go idle,
-create a depth-format image with the `DEPTH` aspect, and move it to
-`DEPTH_ATTACHMENT_OPTIMAL` once so that no frame ever has to.
+`union SDL_Event;` rather than `struct` — `SDL_Event` really is a union, and a forward
+declaration has to match the kind of type it names or the compiler rejects it. This is the
+only place in the scaffold where that distinction comes up.
+
+The state is **public data members**, with no getters or setters. That is unusual in this
+codebase, and deliberate: there is no invariant to protect. Any position is a valid
+position, any speed a valid speed, and a `set_speed` that only assigns would be ceremony.
+The one field with a constraint — `pitch`, which must stay short of vertical — is clamped
+where it is changed, because that is the only place it can go wrong.
+
+`sprint_multiplier` is new. This chapter's sample hard-coded `4.0F`; making it a field
+costs nothing and means a sample can slow it down without editing the scaffold.
+
+```cpp title="code/common/scaffold/include/vkc/camera.hpp"
+    [[nodiscard]] glm::vec3 front() const;
+    [[nodiscard]] glm::vec3 right() const;
+    [[nodiscard]] glm::mat4 view() const;
+
+    // Feed it every SDL event. Handles mouse look and the right-click capture toggle.
+    void handle_event(const SDL_Event& event, SDL_Window* window);
+
+    // Call once per frame with the frame time. Reads the keyboard state directly,
+    // because movement wants "is this key held now", not "was it just pressed".
+    void update(float delta_time);
+
+    [[nodiscard]] bool mouse_captured() const noexcept { return mouse_captured_; }
+
+private:
+    bool mouse_captured_ = false;
+};
+
+}  // namespace vkc
+```
+
+The three derived vectors are functions rather than cached members, which is the decision
+this chapter already argued: recomputing from two angles cannot drift, and a cache would
+have to be invalidated every time `yaw` or `pitch` changed — which, with public members,
+nothing could enforce.
+
+`handle_event` takes the window because capturing the mouse is a property of a window, not
+of a camera. `update` takes `delta_time` rather than reading a clock, so the caller decides
+what a frame is worth — and `vkc::App::delta_time()` is what a sample passes.
+
+`mouse_captured_` is the one genuinely private thing, because it is state the class owns
+and keeps in step with SDL.
+
+```cpp title="code/common/scaffold/src/camera.cpp"
+#include "vkc/camera.hpp"
+
+#include <SDL3/SDL.h>
+
+#include <glm/gtc/matrix_transform.hpp>
+
+#include <algorithm>
+#include <cmath>
+
+namespace vkc {
+
+glm::vec3 Camera::front() const {
+    const float yaw_radians = glm::radians(yaw);
+    const float pitch_radians = glm::radians(pitch);
+    return glm::normalize(glm::vec3{
+        std::cos(yaw_radians) * std::cos(pitch_radians),
+        std::sin(pitch_radians),
+        std::sin(yaw_radians) * std::cos(pitch_radians),
+    });
+}
+
+glm::vec3 Camera::right() const {
+    return glm::normalize(glm::cross(front(), glm::vec3{0.0F, 1.0F, 0.0F}));
+}
+
+glm::mat4 Camera::view() const {
+    return glm::lookAt(position, position + front(), glm::vec3{0.0F, 1.0F, 0.0F});
+}
+```
+
+The spherical-coordinate conversion, the cross product against **world** up, and the
+`lookAt` — all three exactly as written above.
+
+```cpp title="code/common/scaffold/src/camera.cpp"
+void Camera::handle_event(const SDL_Event& event, SDL_Window* window) {
+    if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN &&
+        event.button.button == SDL_BUTTON_RIGHT) {
+        mouse_captured_ = !mouse_captured_;
+        SDL_SetWindowRelativeMouseMode(window, mouse_captured_);
+        return;
+    }
+
+    if (event.type == SDL_EVENT_MOUSE_MOTION && mouse_captured_) {
+        yaw += event.motion.xrel * sensitivity;
+        pitch -= event.motion.yrel * sensitivity;
+        pitch = std::clamp(pitch, -89.0F, 89.0F);
+    }
+}
+```
+
+This chapter's `on_event`, with the window passed in rather than reached for. The pitch
+subtraction and the clamp are the two details the caution box above was about, kept
+together on consecutive lines because they belong together.
+
+```cpp title="code/common/scaffold/src/camera.cpp"
+void Camera::update(float delta_time) {
+    const bool* keys = SDL_GetKeyboardState(nullptr);
+
+    float distance = speed * delta_time;
+    if (keys[SDL_SCANCODE_LSHIFT] || keys[SDL_SCANCODE_RSHIFT]) {
+        distance *= sprint_multiplier;
+    }
+
+    const glm::vec3 forward = front();
+    const glm::vec3 sideways = right();
+
+    if (keys[SDL_SCANCODE_W]) {
+        position += forward * distance;
+    }
+    if (keys[SDL_SCANCODE_S]) {
+        position -= forward * distance;
+    }
+    if (keys[SDL_SCANCODE_A]) {
+        position -= sideways * distance;
+    }
+    if (keys[SDL_SCANCODE_D]) {
+        position += sideways * distance;
+    }
+    if (keys[SDL_SCANCODE_SPACE]) {
+        position.y += distance;
+    }
+    if (keys[SDL_SCANCODE_LCTRL]) {
+        position.y -= distance;
+    }
+}
+
+}  // namespace vkc
+```
+
+`move_camera` renamed, with the two vectors computed once before the branches for the
+reason given above, and `4.0F` replaced by the field.
+
+The locals are `forward` and `sideways` rather than `front` and `right`, because the
+methods of those names are in scope here — a local called `front` would shadow
+`Camera::front` and make `front()` fail to compile.
+
+From chapter 2.1, the whole of this is:
+
+```cpp
+camera_.update(delta_time());
+// ...
+.view = camera_.view(),
+```
+
+and there is nothing left in `vkcommon` that you have not now read in full.
+
+## Words introduced in this chapter
+
+| | |
+|---|---|
+| **view matrix** | the inverse of the camera's own transform — there is no camera, only a moved world |
+| **yaw / pitch** | rotation about the vertical axis, and rotation out of the horizontal plane |
+| **spherical coordinates** | naming a direction by two angles rather than three components |
+| **cross product** | a vector perpendicular to two others; how you get an axis you do not have |
+| **right-hand rule** | which of the two perpendiculars `a × b` picks, and why argument order matters |
+| **world up** | the fixed up axis, used instead of the camera's own so that strafing stays level |
+| **relative mouse mode** | cursor hidden, motion reported as deltas, no screen edge to reach |
+| **delta time** | seconds since the previous frame, which is what makes movement frame-rate independent |
+| **keyboard state** | "is this key held down right now", as opposed to a key event |
+| **gimbal lock** | the degree of freedom lost when two rotation axes line up |
 
 ## Exercises
 
 1. Remove the `delta_time()` multiplication and run the sample with `--frames 2000` while
    dragging the window over a heavy background. The speed changes as the frame rate does.
-2. Remove the pitch clamp and look straight up. Note that the failure is not a crash —
-   it is `NaN` propagating through the view matrix, and the screen goes blank.
-3. Pass the camera's *own* up — `glm::cross(right(), front())` — to `lookAt` instead of
-   world up, then look steeply upward while strafing. Everything still works, and it
-   feels subtly wrong; that is what a camera that can roll feels like when you did not
-   ask it to.
-4. Add roll: a third angle, applied about the facing direction, bound to Q and E. Then
-   pitch up 90 degrees and try to yaw. That is gimbal lock, and it is why quaternions
-   exist.
-5. Make the camera ease into motion rather than starting instantly: keep a velocity
-   vector, accelerate it toward the desired direction, and damp it. Three lines, and it
-   is the difference between a debug camera and one that feels good.
-6. Print the camera position and angles each second. Fly somewhere interesting, then
-   paste the values in as the starting state.
+2. Remove the pitch clamp and look straight up. Note that the failure is not a crash — it is
+   `NaN` propagating through the view matrix, and the screen goes blank.
+3. Pass the camera's *own* up — `glm::cross(right(), front())` — to `lookAt` instead of world
+   up, then look steeply upward while strafing. Everything still works, and it feels subtly
+   wrong; that is what a camera that can roll feels like when you did not ask it to.
+4. Add roll: a third angle, applied about the facing direction, bound to Q and E. Then pitch
+   up 90 degrees and try to yaw. That is gimbal lock, and it is why quaternions exist.
+5. Make the camera ease into motion rather than starting instantly: keep a velocity vector,
+   accelerate it toward the desired direction, and damp it. Three lines, and it is the
+   difference between a debug camera and one that feels good.
+6. Print the camera position and angles each second. Fly somewhere interesting, then paste
+   the values in as the starting state.
+7. Move `move_camera()` from `on_render` into `on_event`, called on every event. The camera
+   now moves faster when you wiggle the mouse, because movement has become tied to event
+   volume rather than to time.

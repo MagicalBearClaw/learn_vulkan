@@ -10,13 +10,13 @@ sidebar:
   <figcaption>Chapter 1.10: one quad, four draws. What they share came from a uniform buffer; what differs came from push constants.</figcaption>
 </figure>
 
-Every shader so far has been sealed: vertex data in, colour out, nothing else. This
-chapter opens it up.
+Every shader so far has been sealed: vertex data in, colour out, nothing else. This chapter
+opens it up.
 
-In OpenGL that was `glUniform4f`. Vulkan has no such call, and the reason is the reason
-for most of Vulkan's shape — `glUniform` is a hidden allocation, a hidden copy, and a
-hidden synchronisation, and the driver has to guess how long the value must stay alive.
-Vulkan makes you say.
+In OpenGL that was `glUniform4f`. Vulkan has no such call, and the reason is the reason for
+most of Vulkan's shape — `glUniform` is a hidden allocation, a hidden copy, and a hidden
+synchronisation, and the driver has to guess how long the value must stay alive. Vulkan makes
+you say.
 
 There are two mechanisms, and choosing between them is easy once you know the rule.
 
@@ -29,15 +29,41 @@ There are two mechanisms, and choosing between them is easy once you know the ru
 
 **Small and per-draw → push constants. Large or shared → a uniform buffer.**
 
-This chapter draws the quad four times. The four draws share an ambient colour and a
-clock, which live in a uniform buffer. Each draw has its own position, scale and phase,
-which arrive as push constants.
+```cmake title="code/src/1.getting_started/descriptors/CMakeLists.txt"
+add_chapter(1.10.descriptors
+    SOURCES main.cpp
+    SHADERS quad.slang
+)
+```
+
+```cpp title="code/src/1.getting_started/descriptors/main.cpp"
+#include <vkc/frame.hpp>
+```
+
+```cpp title="code/src/1.getting_started/descriptors/main.cpp"
+#include <numbers>
+```
+
+`vkc/frame.hpp` for `vkc::kFramesInFlight`, which this chapter needs to size two arrays. That
+constant was chapter 1.6's, and this is the first time a sample outside the frame loop has had
+to care about it.
+
+```cpp title="code/src/1.getting_started/descriptors/main.cpp"
+constexpr std::array<Vertex, 4> kVertices{{
+    {{-1.0F, -1.0F}, {1.0F, 0.0F, 0.0F}},
+    {{1.0F, -1.0F}, {0.0F, 1.0F, 0.0F}},
+    {{1.0F, 1.0F}, {0.0F, 0.0F, 1.0F}},
+    {{-1.0F, 1.0F}, {1.0F, 1.0F, 0.0F}},
+}};
+```
+
+The quad now spans the whole of clip space, −1 to 1, because each draw is about to scale it down
+and move it into a corner. A unit quad positioned by per-draw data is the beginning of the idea
+that becomes a model matrix in chapter 1.12.
 
 ## Push constants first
 
 They are the simpler half by a wide margin.
-
-Declare the block in the shader:
 
 ```slang title="code/src/1.getting_started/descriptors/quad.slang"
 struct PushConstants {
@@ -48,205 +74,347 @@ struct PushConstants {
 [[vk::push_constant]] PushConstants push;
 ```
 
-Declared once, at file scope, and both entry points read it. In GLSL each stage repeats
-the block in its own file and the two copies have to agree.
-
-Declare a matching range in the pipeline layout:
+Declared once, at file scope, and both entry points read it. In GLSL each stage repeats the
+block in its own file and the two copies have to agree.
 
 ```cpp title="code/src/1.getting_started/descriptors/main.cpp"
-const VkPushConstantRange push_range{
-    .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-    .offset = 0,
-    .size = sizeof(PushConstants),
+struct PushConstants {
+    glm::vec2 offset;  // where this copy of the quad goes, in clip space
+    float scale;       // how big
+    float phase;       // where in the pulse it starts
 };
+static_assert(sizeof(PushConstants) == 16);
+
+constexpr std::array<PushConstants, 4> kQuads{{
+    {{-0.45F, -0.45F}, 0.35F, 0.0F},
+    {{0.45F, -0.45F}, 0.35F, 1.57F},
+    {{0.45F, 0.45F}, 0.35F, 3.14F},
+    {{-0.45F, 0.45F}, 0.35F, 4.71F},
+}};
 ```
 
-And write values in as you record:
+Four quads differing only in where they sit and where in the pulse they start — roughly
+quarter-turns of a sine wave, since 1.57 ≈ π/2.
 
 ```cpp title="code/src/1.getting_started/descriptors/main.cpp"
-for (const PushConstants& quad : kQuads) {
-    vkCmdPushConstants(frame.cmd, pipeline_layout_,
-                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                       0, sizeof(PushConstants), &quad);
-
-    vkCmdDrawIndexed(frame.cmd, static_cast<uint32_t>(kIndices.size()), 1, 0, 0, 0);
-}
+        const VkPushConstantRange push_range{
+            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+            .offset = 0,
+            .size = sizeof(PushConstants),
+        };
 ```
 
-That is the whole mechanism. The bytes are copied into the command buffer at record
-time, so there is no buffer to allocate, no descriptor to write, nothing to keep alive
-until the GPU is finished, and no per-frame duplication. Each draw sees the values that
-were pushed before it.
+A `VkPushConstantRange` is the declaration in the pipeline layout that says these bytes
+exist: which stages may read them, at what offset, and how many. A layout with no range
+means `vkCmdPushConstants` has nowhere to put anything.
 
-There is **one push constant block per pipeline layout**, not one per binding. Everything
-a draw needs goes in that single struct.
+`stageFlags` must cover every stage that reads the
+block; both do here, and naming only one is a validation error rather than a silent read of
+nothing.
+
+```cpp title="code/src/1.getting_started/descriptors/main.cpp"
+        for (const PushConstants& quad : kQuads) {
+            vkCmdPushConstants(frame.cmd, pipeline_layout_,
+                               VK_SHADER_STAGE_VERTEX_BIT |
+                                   VK_SHADER_STAGE_FRAGMENT_BIT,
+                               0, sizeof(PushConstants), &quad);
+
+            vkCmdDrawIndexed(frame.cmd, static_cast<uint32_t>(kIndices.size()), 1, 0, 0,
+                             0);
+        }
+```
+
+That is the whole mechanism. The bytes are **copied into the command buffer** at record time:
+
+```
+   command buffer: [ ...bind... ][ 16 bytes ][ draw ][ 16 bytes ][ draw ][ 16 bytes ][ draw ]
+                                  quad 0              quad 1              quad 2
+```
+
+No buffer to allocate, no descriptor to write, nothing to keep alive until the GPU is finished,
+and no per-frame duplication. Each draw sees the values pushed before it.
+
+There is **one push constant block per pipeline layout**, not one per binding. Everything a draw
+needs goes in that single struct.
 
 :::caution[128 bytes is the budget]
-`maxPushConstantsSize` is guaranteed to be at least 128 bytes and that is exactly what
-a good deal of hardware offers. The sample prints yours at startup.
+`maxPushConstantsSize` is guaranteed to be at least 128 bytes and that is exactly what a good
+deal of hardware offers. The sample prints yours at startup:
+
+```cpp title="code/src/1.getting_started/descriptors/main.cpp"
+        spdlog::info("maxPushConstantsSize on this GPU: {} bytes",
+                     context().gpu_properties().limits.maxPushConstantsSize);
+```
 
 128 bytes is two 4×4 matrices with nothing left over, which is why the usual arrangement is a
-model matrix in push constants and the camera matrices in a uniform buffer. Chapter 1.13
-does precisely that.
+model matrix in push constants and the camera matrices in a uniform buffer. Chapter 1.13 does
+precisely that.
 :::
 
 ## Descriptors: the three-layer idea
 
 Uniform buffers are more work, because Vulkan separates three things OpenGL merged.
 
-A **descriptor** is a pointer the GPU can follow — this buffer, at this offset, this
-many bytes.
+```
+   DESCRIPTOR SET LAYOUT      the shape: "binding 0 is a uniform buffer, vertex+fragment"
+          │                   no memory, no buffer — built into the pipeline
+          ▼
+   DESCRIPTOR POOL            preallocated storage for N sets of M descriptors
+          │
+          ▼
+   DESCRIPTOR SET             an instance of that shape, allocated from the pool
+          │                   starts out empty
+          ▼
+   WRITE                      now it points at an actual buffer
+```
 
-A **descriptor set** is a group of descriptors bound together. Sets are the unit of
-binding, and the split between them is a performance decision: one set for things that
-change per frame, one for per-material, one for per-object is the standard arrangement.
+A **descriptor** is a pointer the GPU can follow — this buffer, at this offset, this many bytes.
+A **descriptor set** is a group of them bound together, and sets are the unit of binding: the
+split between them is a performance decision, and one set for per-frame data, one for
+per-material, one for per-object is the standard arrangement.
 
-A **descriptor set layout** describes the *shape* of a set — binding 0 is a uniform
-buffer visible to these stages — without referring to any actual memory. The pipeline is
-built against the layout; the set is bound at draw time.
-
-Four objects have to be created, in order.
+Four objects, in order.
 
 ### 1. The layout
 
 ```cpp title="code/src/1.getting_started/descriptors/main.cpp"
-const VkDescriptorSetLayoutBinding binding{
-    .binding = 0,
-    .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-    .descriptorCount = 1,
-    .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-    .pImmutableSamplers = nullptr,
-};
+    void create_descriptors() {
+        const VkDevice device = context().device();
+
+        const VkDescriptorSetLayoutBinding binding{
+            .binding = 0,
+            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+            .pImmutableSamplers = nullptr,
+        };
+
+        const VkDescriptorSetLayoutCreateInfo layout_info{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .bindingCount = 1,
+            .pBindings = &binding,
+        };
+        VK_CHECK(vkCreateDescriptorSetLayout(device, &layout_info, nullptr,
+                                             &set_layout_));
 ```
 
-`descriptorCount` above 1 makes the binding an *array* of descriptors, which is how
-bindless rendering works — chapter 3.4.
+This is a description only: no memory, no buffer, nothing bound. It is the *type* of the set.
 
-`stageFlags` should list only the stages that actually read it. Some hardware can skip
-work for stages that do not.
+`descriptorCount` above 1 makes the binding an *array* of descriptors, which is how bindless
+rendering works — chapter 3.4. `stageFlags` should list only the stages that actually read it;
+some hardware can skip work for stages that do not.
 
 ### 2. The pool
 
-Descriptor sets are not created individually; they are allocated out of a pool that is
-told up front how many of each type it must serve:
-
 ```cpp title="code/src/1.getting_started/descriptors/main.cpp"
-const VkDescriptorPoolSize pool_size{
-    .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-    .descriptorCount = vkc::kFramesInFlight,
-};
+        const VkDescriptorPoolSize pool_size{
+            .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .descriptorCount = vkc::kFramesInFlight,
+        };
 
-const VkDescriptorPoolCreateInfo pool_info{
-    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-    .maxSets = vkc::kFramesInFlight,
-    .poolSizeCount = 1,
-    .pPoolSizes = &pool_size,
-};
+        const VkDescriptorPoolCreateInfo pool_info{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .maxSets = vkc::kFramesInFlight,
+            .poolSizeCount = 1,
+            .pPoolSizes = &pool_size,
+        };
+        VK_CHECK(vkCreateDescriptorPool(device, &pool_info, nullptr, &descriptor_pool_));
 ```
 
-A pool does not grow. Ask for more sets than `maxSets`, or more descriptors of a type
-than you declared, and allocation fails with `VK_ERROR_OUT_OF_POOL_MEMORY`. Getting
-those counts wrong is a common early stumble, and the fix is always either a bigger pool
-or a second one.
+Descriptor sets are not created individually; they are allocated out of a pool told up front how
+many of each type it must serve.
+
+**A pool does not grow.** There are two independent limits: `maxSets` counts *sets*, and each
+`VkDescriptorPoolSize` counts *descriptors of one type* across all of them. Exhaust either and
+allocation fails with `VK_ERROR_OUT_OF_POOL_MEMORY`.
 
 ### 3. The sets
 
 ```cpp title="code/src/1.getting_started/descriptors/main.cpp"
-const VkDescriptorSetAllocateInfo alloc_info{
-    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-    .descriptorPool = descriptor_pool_,
-    .descriptorSetCount = vkc::kFramesInFlight,
-    .pSetLayouts = layouts.data(),
-};
-VK_CHECK(vkAllocateDescriptorSets(device, &alloc_info, descriptor_sets_.data()));
+        const std::array<VkDescriptorSetLayout, vkc::kFramesInFlight> layouts{
+            set_layout_, set_layout_};
+
+        const VkDescriptorSetAllocateInfo alloc_info{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .pNext = nullptr,
+            .descriptorPool = descriptor_pool_,
+            .descriptorSetCount = vkc::kFramesInFlight,
+            .pSetLayouts = layouts.data(),
+        };
+        VK_CHECK(vkAllocateDescriptorSets(device, &alloc_info, descriptor_sets_.data()));
 ```
 
-An allocated set is empty. It has the right shape and points at nothing.
+One layout repeated, because both sets have the same shape — the API wants one layout per set it
+is allocating, even when they are identical. An allocated set is **empty**: it has the right
+shape and points at nothing.
 
 ### 4. The write
 
 ```cpp title="code/src/1.getting_started/descriptors/main.cpp"
-const VkDescriptorBufferInfo buffer_info{
-    .buffer = uniform_buffers_[i].handle(),
-    .offset = 0,
-    .range = sizeof(Globals),
-};
+        for (size_t i = 0; i < vkc::kFramesInFlight; ++i) {
+            const VkDescriptorBufferInfo buffer_info{
+                .buffer = uniform_buffers_[i].handle(),
+                .offset = 0,
+                .range = sizeof(Globals),
+            };
 
-const VkWriteDescriptorSet write{
-    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-    .dstSet = descriptor_sets_[i],
-    .dstBinding = 0,
-    .dstArrayElement = 0,
-    .descriptorCount = 1,
-    .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-    .pBufferInfo = &buffer_info,
-};
+            const VkWriteDescriptorSet write{
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .pNext = nullptr,
+                .dstSet = descriptor_sets_[i],
+                .dstBinding = 0,
+                .dstArrayElement = 0,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                .pImageInfo = nullptr,
+                .pBufferInfo = &buffer_info,
+                .pTexelBufferView = nullptr,
+            };
 
-vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+            vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+        }
+    }
 ```
+
+A `VkDescriptorBufferInfo` is the descriptor itself in its raw form — the buffer, the byte
+offset into it, and the number of bytes visible. That triple is what the GPU ends up
+following.
+
+Writing into a set is what makes it refer to anything. The three
+`pImageInfo`/`pBufferInfo`/`pTexelBufferView` pointers are a union in all but name —
+`descriptorType` decides which one is read, and the other two must be null.
 
 This happens **once, at startup**. The set points at the same buffer for the life of the
-program; only the buffer's *contents* change per frame. Rewriting descriptor sets every
-frame is a common mistake that costs real time — and it is not needed, because the
-descriptor is a pointer and the pointer is not what is changing.
-
-Then binding, once per frame, before the draws:
+program; only the buffer's *contents* change per frame. Rewriting descriptor sets every frame is
+a common mistake that costs real time — and it is not needed, because the descriptor is a
+pointer and the pointer is not what changes.
 
 ```cpp title="code/src/1.getting_started/descriptors/main.cpp"
-vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                        pipeline_layout_, 0, 1, &descriptor_sets_[slot], 0, nullptr);
+        vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                pipeline_layout_, 0, 1, &descriptor_sets_[slot], 0,
+                                nullptr);
 ```
 
-The `0` after the layout is the **set index**, and it is the second number in the
-shader's `[[vk::binding(0, 0)]]` — Slang writes the attribute as
-`[[vk::binding(binding, set)]]`, binding first.
+Bound once for the whole frame, because nothing in it changes between draws. A descriptor set
+binding is relatively expensive; a push constant is not, which is exactly why the per-draw data
+went the other way.
+
+The `0` after the layout is the **set index**, and it is the second number in the shader's
+`[[vk::binding(0, 0)]]` — Slang writes the attribute as `[[vk::binding(binding, set)]]`, binding
+first.
+
+```slang title="code/src/1.getting_started/descriptors/quad.slang"
+struct Globals {
+    float4 ambient;
+    float time;
+};
+[[vk::binding(0, 0)]] ConstantBuffer<Globals> globals;
+```
+
+`ConstantBuffer<T>` is Slang's name for a uniform buffer. The struct's *name* is not matched
+against anything on the host; only the numbers are.
 
 ## One buffer per frame in flight
 
-This is the detail that turns a working program into a subtly broken one, and it is
-worth being deliberate about.
+This is the detail that turns a working program into a subtly broken one.
 
-The CPU runs up to `kFramesInFlight` frames ahead of the GPU — that was the whole point
-of chapter 1.6. So when the CPU writes frame 7's data, the GPU may still be reading
-frame 6's. With one uniform buffer, frame 7 overwrites what frame 6 is using.
+The CPU runs up to `kFramesInFlight` frames ahead of the GPU — that was chapter 1.6's whole
+point. So when the CPU writes frame 7's data, the GPU may still be reading frame 6's:
 
-The symptom is nasty: everything looks right most of the time, and occasionally a frame
-flickers with next frame's values. It gets worse under load, and it may not happen at all
-on your machine.
+```
+   one buffer:    CPU writes frame 7 ──▶ [ Globals ] ◀── GPU still reading it for frame 6
+                                          corrupted mid-frame
 
-The fix is one buffer and one descriptor set per frame slot:
-
-```cpp title="code/src/1.getting_started/descriptors/main.cpp"
-const size_t slot = frame.frame_number % vkc::kFramesInFlight;
+   two buffers:   CPU writes frame 7 ──▶ [ slot 1 ]
+                                         [ slot 0 ] ◀── GPU reads frame 6 undisturbed
 ```
 
-Exactly the reasoning behind 1.6's per-frame command buffers, applied to data instead of
-commands. Anything the CPU writes while a frame may still be in flight needs one copy per
-slot.
+```cpp title="code/src/1.getting_started/descriptors/main.cpp"
+        const size_t slot = frame.frame_number % vkc::kFramesInFlight;
+
+        update_globals(slot, frame.frame_number);
+```
+
+```cpp title="code/src/1.getting_started/descriptors/main.cpp"
+    std::array<vkc::Buffer, vkc::kFramesInFlight> uniform_buffers_;
+    std::array<VkDescriptorSet, vkc::kFramesInFlight> descriptor_sets_{};
+
+    VkDescriptorSetLayout set_layout_ = VK_NULL_HANDLE;
+    VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
+```
+
+The symptom of getting this wrong is nasty: everything looks right most of the time, and
+occasionally a frame flickers with the next frame's values. It gets worse under load, and it may
+not happen at all on your machine.
+
+The *layout* and the *pool* are not duplicated, because neither is written to per frame. Only
+the things the CPU touches while the GPU might be reading them need a copy each.
 
 ## Uniform buffer memory
 
-The vertex buffer in 1.8 was device-local, uploaded once through a staging buffer. A
-uniform buffer that changes every frame wants the opposite:
-
 ```cpp title="code/src/1.getting_started/descriptors/main.cpp"
-buffer = vkc::Buffer(context().allocator(), sizeof(Globals),
-                     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-                     VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
-                         VMA_ALLOCATION_CREATE_MAPPED_BIT);
+    void create_uniform_buffers() {
+        for (vkc::Buffer& buffer : uniform_buffers_) {
+            buffer = vkc::Buffer(context().allocator(), sizeof(Globals),
+                                 VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                                 VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                                     VMA_ALLOCATION_CREATE_MAPPED_BIT);
+        }
+    }
 ```
 
-Host-visible and permanently mapped, so updating it is a `memcpy`:
+The vertex buffer in 1.8 was device-local, uploaded once through a staging buffer. A uniform
+buffer that changes every frame wants the opposite: host-visible and permanently mapped, so
+updating it is a `memcpy`. A staging copy per frame would cost more than the slower GPU reads
+do, for 32 bytes read a handful of times.
 
 ```cpp title="code/src/1.getting_started/descriptors/main.cpp"
-std::memcpy(uniform_buffers_[slot].mapped(), &globals, sizeof(globals));
+    void update_globals(size_t slot, uint64_t frame_number) {
+        const Globals globals{
+            .ambient = glm::vec4(0.12F, 0.10F, 0.18F, 1.0F),
+            .time = static_cast<float>(frame_number) / 30.0F,
+            .padding = {},
+        };
+
+        std::memcpy(uniform_buffers_[slot].mapped(), &globals, sizeof(globals));
+    }
 ```
 
-A staging copy per frame would cost more than the slower GPU reads do, for 32 bytes read
-a handful of times.
+Frame-counter driven rather than clock driven, so frame N always looks the same and
+`tools/capture.py` can diff screenshots.
 
-No flush is needed here because VMA gave us coherent memory. On memory that is not
-coherent, `vmaFlushAllocation` goes after the `memcpy`.
+No flush is needed because VMA gave us coherent memory. On memory that is not coherent,
+`vmaFlushAllocation` goes after the `memcpy`.
+
+```cpp title="code/src/1.getting_started/descriptors/main.cpp"
+class DescriptorApp : public vkc::App {
+```
+
+```cpp title="code/src/1.getting_started/descriptors/main.cpp"
+        create_uniform_buffers();
+        create_descriptors();
+```
+
+```cpp title="code/src/1.getting_started/descriptors/main.cpp"
+        vkDestroyPipeline(device, pipeline_, nullptr);
+        vkDestroyPipelineLayout(device, pipeline_layout_, nullptr);
+```
+
+```cpp title="code/src/1.getting_started/descriptors/main.cpp"
+        vkDestroyDescriptorPool(device, descriptor_pool_, nullptr);
+        vkDestroyDescriptorSetLayout(device, set_layout_, nullptr);
+
+        for (vkc::Buffer& buffer : uniform_buffers_) {
+            buffer.destroy();
+        }
+```
+
+Sets allocated from the pool are freed with it, so there is no `vkFreeDescriptorSets` here. The
+layout is a separate object and has to go separately.
 
 ## The alignment trap
 
@@ -263,19 +431,12 @@ A uniform buffer is laid out by **std140** rules, and they are not C++'s rules:
 | `float4x4` | 16 |
 | struct or array | 16, rounded up |
 
-The two that bite are `float3` aligning to 16 rather than 12, and the whole block's size
-rounding up to a multiple of 16.
+The two that bite are `float3` aligning to 16 rather than 12, and the whole block's size rounding
+up to a multiple of 16.
 
-Slang applies these rules to every `ConstantBuffer<T>`, and the SPIR-V says so out loud —
-the generated type is literally named `Globals_std140`. It will not warn you when the
-C++ struct disagrees with it.
-
-`glm::vec3` in C++ is 12 bytes. Put one in the middle of a uniform struct and everything
-after it lands at the wrong offset — and *nothing reports an error*. The shader reads
-whatever bytes are at the offset it expected. Colours come out as fragments of a
-position, a matrix comes out sheared, and there is no message anywhere.
-
-This chapter's struct is padded explicitly:
+Slang applies these rules to every `ConstantBuffer<T>`, and the SPIR-V says so out loud — the
+generated type is literally named `Globals_std140`. **It will not warn you when the C++ struct
+disagrees.**
 
 ```cpp title="code/src/1.getting_started/descriptors/main.cpp"
 struct Globals {
@@ -286,27 +447,103 @@ struct Globals {
 static_assert(sizeof(Globals) == 32);
 ```
 
+Here is what happens if you put `time` first and drop the padding, which looks perfectly
+symmetric on both sides:
+
+```
+   C++                          std140
+   time    at offset 0          time    at offset 0
+   ambient at offset 4          ambient at offset 16      ← aligns to 16
+   size 20                      size 32
+
+   the shader reads ambient from bytes 16..32 — which in your struct is
+   twelve bytes past the end of it
+```
+
+Nothing reports an error. The shader reads whatever bytes are at the offset it expected.
+
 Three habits make this a non-issue:
 
-1. **Use `float4`, not `float3`**, in uniform blocks. The fourth component is free — the
-   space is there either way — and you can put something useful in it.
-2. **`static_assert` the size** of every uniform struct. It turns a silent corruption
-   into a compile error.
-3. **Order members largest first**: `float4x4`, then `float4`, then `float2`, then
-   scalars. The padding mostly takes care of itself.
+1. **Use `float4`, not `float3`**, in uniform blocks. The fourth component is free — the space is
+   there either way — and you can put something useful in it.
+2. **`static_assert` the size** of every uniform struct. It turns a silent corruption into a
+   compile error.
+3. **Order members largest first**: `float4x4`, then `float4`, then `float2`, then scalars.
 
-You can also annotate the C++ side with `alignas(16)`, and glm offers
-`GLM_FORCE_DEFAULT_ALIGNED_GENTYPES` to make its types match std140. Both help. Neither
-removes the need to check.
+Note that the Slang side declares only `ambient` and `time` — the padding is implicit there,
+because std140 adds it whether you write it or not. The C++ side has to say it out loud.
 
 :::tip[Getting the offsets from the shader]
-`spirv-dis` prints the real offsets the compiler chose, and it settles any argument:
+There is no `.spv` file to inspect, so produce one with `slangc` the way chapter 1.9 showed, then
+ask for the offsets the compiler chose:
 
 ```bash
-spirv-dis code/out/build/linux-debug/bin/shaders/1.10.descriptors/quad.slang.spv \
-  | grep Offset
+SLANGC=code/out/build/linux-debug/vcpkg_installed/x64-linux/tools/shader-slang/slangc
+$SLANGC code/src/1.getting_started/descriptors/quad.slang \
+    -target spirv -profile spirv_1_6 -matrix-layout-column-major \
+    -emit-spirv-directly -fvk-use-entrypoint-name -o /tmp/quad.spv
+
+spirv-dis /tmp/quad.spv | grep Offset
 ```
 :::
+
+## The shaders
+
+```slang title="code/src/1.getting_started/descriptors/quad.slang"
+[shader("vertex")]
+VSOutput vertexMain(VSInput input) {
+    float pulse = 0.85 + 0.15 * sin(globals.time + push.phase);
+
+    VSOutput output;
+    output.position = float4(input.position * push.scale * pulse + push.offset, 0.0, 1.0);
+    output.colour = input.colour;
+    return output;
+}
+```
+
+```slang title="code/src/1.getting_started/descriptors/quad.slang"
+[shader("fragment")]
+float4 fragmentMain(VSOutput input) : SV_Target {
+    float brightness = 0.6 + 0.4 * sin(globals.time + push.phase);
+
+    return float4(input.colour * brightness + globals.ambient.rgb, 1.0);
+}
+```
+
+Both data paths are live in both stages: `time` is shared by all four quads and comes from the
+uniform buffer, `phase` differs per quad and comes from a push constant. The ambient term is
+identical across the four; the brightness is not.
+
+```cpp title="code/src/1.getting_started/descriptors/main.cpp"
+        const VkPipelineLayoutCreateInfo layout_info{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .setLayoutCount = 1,
+            .pSetLayouts = &set_layout_,
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &push_range,
+        };
+        VK_CHECK(vkCreatePipelineLayout(device, &layout_info, nullptr,
+                                        &pipeline_layout_));
+```
+
+The pipeline layout, finally doing something. Every chapter until now created an empty one; it is
+the declaration of what the shaders can see, and now they can see two things.
+
+```cpp title="code/src/1.getting_started/descriptors/main.cpp"
+        pipeline_ = vkc::PipelineBuilder(device)
+                        .shaders(shader)
+                        .vertex_input(std::span(&binding, 1), attributes)
+                        .colour_attachment(swapchain().format())
+                        .layout(pipeline_layout_)
+                        .build();
+```
+
+```cpp title="code/src/1.getting_started/descriptors/main.cpp"
+        options.title = "LearnVulkan 1.10 - Descriptors and push constants";
+        DescriptorApp app(vkc::App::parse_args(argc, argv, options));
+```
 
 ## Running it
 
@@ -314,40 +551,37 @@ spirv-dis code/out/build/linux-debug/bin/shaders/1.10.descriptors/quad.slang.spv
 ./code/out/build/linux-debug/bin/1.10.descriptors
 ```
 
-Four quads in the corners, each pulsing at its own phase — the phase is a push constant,
-the clock driving it is in the uniform buffer, so both paths are visibly live.
+Four quads in the corners, each pulsing at its own phase.
 
-## What changed
+## Words introduced in this chapter
 
-- the pipeline layout stopped being empty: one descriptor set layout, one push constant range
-- a descriptor set layout, pool and sets exist, written once at startup
-- there are `kFramesInFlight` uniform buffers and `kFramesInFlight` descriptor sets
-- one `vkCmdBindDescriptorSets` per frame, one `vkCmdPushConstants` per draw
-- both shaders declare the uniform block and the push constant block
-
-Nothing was added to `vkcommon`. A descriptor allocator that handles pool growth is
-worth having, but not before chapter 1.11 has shown what a second descriptor type looks
-like.
+| | |
+|---|---|
+| **push constant** | a few bytes copied straight into the command buffer, per draw |
+| **uniform buffer** | GPU memory a shader reads through a descriptor |
+| **descriptor** | a pointer the GPU follows: this buffer, this offset, this size |
+| **descriptor set** | a group of descriptors bound together; the unit of binding |
+| **descriptor set layout** | the *shape* of a set, with no memory attached |
+| **descriptor pool** | preallocated storage sets are carved from; it does not grow |
+| **std140** | the layout rules a uniform block obeys, which are not C++'s |
 
 ## Exercises
 
-1. Swap the two members round — `float time` first, `glm::vec4 ambient` second — in the
-   C++ `Globals` and in the shader's `Globals`, and drop the padding. There are only two
-   declarations to change now, and they agree with each other, so this *looks* correct.
+1. Swap the two members round — `float time` first, `glm::vec4 ambient` second — in the C++
+   `Globals` and in the shader's `Globals`, and drop the padding. There are only two declarations
+   to change and they agree with each other, so this *looks* correct. It is not, and the quads
+   come out bright orange and magenta. Nothing in the validation layers says a word.
+2. Now put `ambient` back first but change it to `float3`/`glm::vec3` on both sides, with no
+   padding. Work out, before running it, what the shader reads for `time`.
+3. Use one uniform buffer instead of two, by forcing `slot` to `0`. It will very likely look
+   fine — the bug needs the GPU to actually be a frame behind. Try `--frames 2000` with the
+   window dragged around.
+4. Move `ambient` into the push constant block. It fits easily, and the sample gets simpler. Now
+   consider what happens when it is a 64-light array instead.
+5. Add a second binding to the set and watch what the pool says when you forget to increase
+   `descriptorCount`. That `VK_ERROR_OUT_OF_POOL_MEMORY` is worth meeting deliberately once.
+6. Drop `VK_SHADER_STAGE_FRAGMENT_BIT` from `push_range.stageFlags` but leave the
+   `vkCmdPushConstants` call alone. The layers object, and the message names both the stage and
+   the range — a good example of the pipeline layout being a contract rather than a formality.
 
-   It is not, and the quads come out bright orange and magenta. C++ puts `ambient` at
-   offset 4; std140 puts it at 16, because a `float4` aligns to 16. The shader reads twelve
-   bytes of `ambient` as the tail of nothing in particular.
-
-   Nothing in the validation layers says a word. Convince yourself of that before moving
-   on — it is the single best reason to `static_assert` your uniform structs.
-2. Now put `ambient` back first but change it to `float3`/`glm::vec3` on both sides, with
-   no padding. Work out, before running it, what the shader reads for `time`.
-3. Use one uniform buffer instead of two, by forcing `slot` to `0`. It will very likely
-   look perfectly fine — the bug needs the GPU to actually be a frame behind. Try it with
-   `--frames 2000` and a window dragged around to make the GPU work.
-4. Move `ambient` into the push constant block. It fits easily, and the sample gets
-   simpler. Now consider what happens when it is a 64-light array instead.
-5. Add a second binding to the set — another uniform buffer, with anything in it — and
-   watch what the pool says when you forget to increase `descriptorCount`. That
-   `VK_ERROR_OUT_OF_POOL_MEMORY` is worth meeting deliberately once.
+Next: [textures](/getting-started/textures/) — images, views, samplers, and the mip chain.
