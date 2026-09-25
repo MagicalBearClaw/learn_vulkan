@@ -1,13 +1,13 @@
 ---
 title: Model
-description: The node hierarchy stops being baked away. A model becomes a tree, the walk that flattens it becomes the chapter, and one transposed matrix becomes the bug you will write at least once.
+description: The node hierarchy stops being baked away. A model becomes a tree, the walk that flattens it becomes the chapter, matrix composition becomes the maths, and one transposed matrix becomes the bug you will write at least once.
 sidebar:
   order: 3
 ---
 
 <figure>
   <img src="/img/reference/3.3.model.png" alt="A leather flight helmet with a breathing hose, mounted on a polished wooden display base: six separate meshes with six separate materials, each drawn where its node says it belongs" />
-  <figcaption>Chapter 3.3: six meshes, six materials, six nodes, one draw call each.</figcaption>
+  <figcaption>Chapter 3.3: six meshes, seven materials, six nodes, one draw call each.</figcaption>
 </figure>
 
 Chapter 3.2 took apart two of 3.1's simplifications and left the third standing, in plain sight,
@@ -49,9 +49,10 @@ constexpr unsigned int kImportFlags =
 
 Assimp gives a loaded file two separate things, and the distinction is the chapter.
 
-`scene->mMeshes` is a flat array of geometry. `scene->mRootNode` is a tree of `aiNode`, each
-carrying a name, a 4×4 transform *relative to its parent*, a list of children, and — the part that
-matters — a list of **indices into `scene->mMeshes`**.
+`scene->mMeshes` is a flat array of geometry. `scene->mRootNode` is the root of a **scene graph**:
+a tree of **nodes**, each an `aiNode` carrying a name, a 4×4 **node transform** *relative to its
+parent*, a list of children, and — the part that matters — a list of **indices into
+`scene->mMeshes`**.
 
 Indices, not meshes. A node does not own geometry, it *refers* to it, and nothing stops two nodes
 referring to the same index. A model that uses one bolt in forty places stores the bolt once and
@@ -63,10 +64,16 @@ move is to give `Mesh` a `glm::mat4 transform`. It works, right up until a mesh 
 then the model cannot be expressed at all, because the geometry has one transform field and needs
 two. Where something sits is a property of the node, not of the geometry.
 
-So `Mesh` keeps 3.2's shape, with no transform in it, and a second small type carries the placement:
+So `Mesh` keeps 3.2's shape, with no transform in it, and gains only its local bounds:
 
 ```cpp title="code/src/3.model_loading/model/main.cpp"
-// One mesh, drawn once, somewhere.
+    glm::vec3 min{};
+    glm::vec3 max{};
+```
+
+A second small type carries the placement:
+
+```cpp title="code/src/3.model_loading/model/main.cpp"
 struct Draw {
     uint32_t mesh = 0;
     glm::mat4 transform{1.0F};
@@ -74,16 +81,105 @@ struct Draw {
 };
 ```
 
-A `Draw` is the tree flattened: one entry per *placement*, not per mesh. The frame loop iterates
-draws, and a mesh referenced by three nodes produces three of them.
+A `Draw` is the tree **flattened**: one entry per *placement*, not per mesh. The list of them is
+the **draw list**, and `Model` grows one field to hold it:
+
+```cpp title="code/src/3.model_loading/model/main.cpp"
+    std::vector<Draw> draws;
+```
+
+The frame loop iterates draws, and a mesh referenced by three nodes produces three of them.
+
+## Matrix composition, and why parent goes on the left
+
+The walk multiplies each node's transform onto its parent's. That one line deserves its derivation,
+because getting it backwards is the second most common bug in a loader and it does not always
+look wrong.
+
+1.12 established the convention this series uses: a point is a **column** vector, and a matrix acts
+on it from the left.
+
+```
+   p'  =  M p
+```
+
+Apply two transforms in turn — first `B`, then `A`:
+
+```
+   p'   =  B p
+   p''  =  A p'  =  A (B p)  =  (A B) p
+```
+
+Matrix multiplication is associative, so the two transforms collapse into one product `A B`. And
+the order reads **right to left**: the matrix nearest the vector is applied first. That is not a
+convention you may choose — it follows from writing the vector on the right.
+
+A node's transform is relative to its parent. So for a chain from the root down,
+
+```
+   node:     root  ──▶  chest  ──▶  arm  ──▶  hand
+   local:     R          C           A         H
+```
+
+a vertex of the hand's mesh is first placed in the arm's space by `H`, then in the chest's by `A`,
+then in the root's by `C`, then in the model's by `R`:
+
+```
+   p_model  =  R C A H p_local
+```
+
+Which is the same as saying: **the world transform of a node is the product of every transform
+from the root down, parent on the left.** Walking the tree top-down and carrying
+`parent * node->mTransformation` computes exactly that, one level at a time.
+
+Get the order backwards — `node->mTransformation * parent` — and a child rotates about its own
+origin instead of its parent's. For a tree one level deep, where the parent is the identity, the
+two are identical and the bug is invisible. Both models in this chapter are one level deep, which
+is exactly why exercise 3 exists.
+
+### The normal matrix composes too
+
+2.2 derived the **normal matrix** `G = (M⁻¹)ᵀ` from the requirement that a normal stay
+perpendicular to the surface. Now `M` is a product, and there is a small result worth having.
+
+Start from the two facts already in hand — inverting a product reverses the order, and so does
+transposing one:
+
+```
+   (A B)⁻¹  =  B⁻¹ A⁻¹
+   (X Y)ᵀ   =  Yᵀ Xᵀ
+```
+
+Put them together:
+
+```
+   G(A B)  =  ((A B)⁻¹)ᵀ  =  (B⁻¹ A⁻¹)ᵀ  =  (A⁻¹)ᵀ (B⁻¹)ᵀ  =  G(A) G(B)
+```
+
+Two reversals cancel. **The normal matrix of a product is the product of the normal matrices, in
+the same order as the originals.** Checked numerically over random pairs, the two sides agree to
+8 × 10⁻¹⁴, while the reversed product `G(B) G(A)` is wrong by order 1.
+
+Nothing in the sample exploits this — it builds the composed matrix and inverts once, which is
+simpler and no less correct. It is worth knowing because it means a hierarchy needs no special
+handling for normals: whatever composition rule the positions follow, the normals follow the same
+one.
 
 ## The walk
 
 The chapter, in fourteen lines:
 
 ```cpp title="code/src/3.model_loading/model/main.cpp"
-void collect_draws(const aiNode* node, const glm::mat4& parent, Model& model, int depth) {
+void collect_draws(const aiNode* node, const glm::mat4& parent, Model& model,
+                   int depth) {
     const glm::mat4 transform = parent * to_glm(node->mTransformation);
+
+    if (node->mNumMeshes > 0) {
+        spdlog::info("  {:>{}}node \"{}\": {} mesh(es){}", "", depth * 2,
+                     node->mName.C_Str(), node->mNumMeshes,
+                     to_glm(node->mTransformation) == glm::mat4(1.0F) ? ""
+                                                                     : ", transformed");
+    }
 
     for (unsigned int i = 0; i < node->mNumMeshes; ++i) {
         model.draws.push_back(Draw{
@@ -99,17 +195,38 @@ void collect_draws(const aiNode* node, const glm::mat4& parent, Model& model, in
 }
 ```
 
-Depth-first, carrying the product of every transform from the root down. A node's own transform is
-relative to its parent, so the matrix that puts its meshes into the model's space is the whole
-chain multiplied together — and multiplied in *that* order, parent on the left, because these are
-column vectors and the rightmost matrix is applied first. Get the order backwards and a child
-rotates about its own origin instead of its parent's.
+Depth-first, carrying the product derived above. The recursion passes `transform` — the
+accumulated matrix — down to the children, so each level multiplies exactly once and the chain
+builds itself.
+
+`depth` exists only for the log: `{:>{}}` is a `std::format` nested replacement field, padding an
+empty string to `depth * 2` spaces so the printed tree is indented. The `, transformed` suffix
+compares the node's *own* transform against the identity, which is what makes the two models'
+difference visible in the output rather than only on screen.
 
 Nothing in here touches the GPU or reads a vertex. It reads structure, which is precisely what the
 flag was destroying.
 
 It is called once, at load time, because nothing in this sample moves. An engine with animation
-walks the same tree every frame and rebuilds exactly this list.
+walks the same tree every frame and rebuilds exactly this list:
+
+```cpp title="code/src/3.model_loading/model/main.cpp"
+    spdlog::info("  node tree:");
+    collect_draws(scene->mRootNode, glm::mat4(1.0F), model, 1);
+```
+
+The identity is the right seed: the root has no parent, and the identity is what "no transform
+yet" means.
+
+A model with geometry that no node refers to is loadable and undrawable, so it is refused:
+
+```cpp title="code/src/3.model_loading/model/main.cpp"
+    if (model.draws.empty()) {
+        throw std::runtime_error(
+            "Model has meshes but no node refers to them: " + path.string() +
+            "\nThe file's scene graph is empty, which no glTF this series uses should be.");
+    }
+```
 
 ## The transposed matrix you will write at least once
 
@@ -126,12 +243,26 @@ This is the most common bug in a hand-written Assimp loader, and it is silent. B
 sixteen floats in a row, so `std::memcpy` compiles, `reinterpret_cast` compiles, and a
 constructor call that fills the matrix in the wrong order compiles too.
 
-Assimp stores **rows**: `a1 a2 a3 a4` is the first row. glm stores **columns**, and its constructor
-takes them in that order. So column 0 is `(a1, b1, c1, d1)` — Assimp's first column, read downward.
+Assimp is **row-major**: it stores the matrix a row at a time, so `a1 a2 a3 a4` is the first row.
+glm is column-major — 1.12's convention — and its constructor takes columns in order. So column 0
+is `(a1, b1, c1, d1)`: Assimp's first column, read downward.
 
-Feed one to the other unchanged and every transform comes out transposed. For a pure rotation that
-means rotating the opposite way; for a transform with translation in it, the offset ends up in the
-bottom row where the projection terms live, and parts of the model fly off toward infinity. If your
+The two layouts are transposes of each other in memory, which is why copying the bytes across gives
+you `Mᵀ` rather than `M`:
+
+```
+   Assimp's memory order        glm's memory order
+   a1 a2 a3 a4                  a1 b1 c1 d1
+   b1 b2 b3 b4                  a2 b2 c2 d2      ← same sixteen floats,
+   c1 c2 c3 c4                  a3 b3 c3 d3        read in a different order
+   d1 d2 d3 d4                  a4 b4 c4 d4
+```
+
+Feed one to the other unchanged and every transform comes out transposed. For a rotation that is
+a real disaster in a specific way: rotation matrices are orthonormal, so `Rᵀ = R⁻¹` — the
+transpose *is* the inverse, and the model rotates exactly backwards rather than into nonsense.
+For a transform with translation in it the failure is louder: the offset ends up in the bottom
+row, where the projection terms live, and parts of the model fly off toward infinity. If your
 first tree walk produces something spectacular, check this function before you check anything else.
 
 ## Measured: what actually moves
@@ -161,20 +292,38 @@ FlightHelmet.gltf: 6 mesh(es), 7 material(s), 0 embedded texture(s)
   world bounds (-0.204 -0.000 -0.172) to (0.163 0.716 0.200)
 ```
 
-The model is exported pre-assembled: every part's vertices are already in the helmet's own space,
-and the nodes exist to name the parts, not to place them. Run this chapter's loader or 3.2's on
-FlightHelmet and the picture is identical.
+No `, transformed` on any line. The model is exported pre-assembled: every part's vertices are
+already in the helmet's own space, and the nodes exist to name the parts, not to place them. Run
+this chapter's loader or 3.2's on FlightHelmet and the picture is identical.
 
-**DamagedHelmet does move.** It has one mesh in one node, and that node carries a −90° rotation
-about X:
+**DamagedHelmet does move.** It has one mesh in one node, and that node carries a rotation:
 
 ```
 DamagedHelmet.glb: 1 mesh(es), 2 material(s), 5 embedded texture(s)
   node tree:
     node "node_damagedHelmet_-6514": 1 mesh(es), transformed
   1 draw(s) from 1 mesh(es)
-  world bounds (-0.947 -0.901 -1.187) to (0.942 0.813 0.901)
+  world bounds (-0.947 -0.901 -1.187) to (0.942 0.901 0.813)
 ```
+
+The matrix is worth reading rather than taking on trust. Assimp stores it a row at a time:
+
+```
+  row 0:   1    0    0    0
+  row 1:   0    0   -1    0
+  row 2:   0    1    0    0
+  row 3:   0    0    0    1
+```
+
+which maps `(x, y, z)` to `(x, −z, y)`. Compare that with the standard rotation about x,
+
+```
+   y'  =  y cos θ  −  z sin θ
+   z'  =  y sin θ  +  z cos θ
+```
+
+and `θ = +90°` gives `y' = −z`, `z' = y`. So it is a rotation of **+90° about x** — the usual
+z-up-to-y-up correction, which is what most digital-content tools need on export to glTF.
 
 That is the demonstration, and it is measurable rather than aesthetic. The sample takes a
 `--model` flag so you can try it:
@@ -184,19 +333,22 @@ That is the demonstration, and it is measurable rather than aesthetic. The sampl
     --model assets/models/damaged_helmet/DamagedHelmet.glb
 ```
 
-Those world bounds are byte-identical to the bounds 3.2 printed with `PreTransformVertices`
-enabled, which is the cheapest possible proof that the tree walk reproduces what the flag was
-doing. And the failure is just as easy to see: replace the first line of `collect_draws` with
+Those world bounds are 3.2's, to the printed precision — 3.2 with `aiProcess_PreTransformVertices`
+enabled reported `(-0.95 -0.90 -1.19)` to `(0.94 0.90 0.81)`. That is the cheapest possible proof
+that the tree walk reproduces what the flag was doing.
+
+And the failure is just as easy to see: replace the first line of `collect_draws` with
 `const glm::mat4 transform = parent;`, so the node's own transform is ignored, and the bounds come
-back as
+back as the mesh's untouched local box:
 
 ```
 world bounds (-0.947 -1.187 -0.901) to (0.942 0.813 0.901)
 ```
 
-with Y and Z swapped — the helmet tipped onto its back, crown toward the camera, staring at the
-ceiling. One model in this chapter needs the walk and one does not, and the lesson is that you
-cannot tell which from looking at the render. You find out by reading the tree.
+with y and z swapped relative to the correct answer — the helmet tipped onto its back, crown
+toward the camera, staring at the ceiling. One model in this chapter needs the walk and one does
+not, and the lesson is that you cannot tell which from looking at the render. You find out by
+reading the tree.
 
 :::note[Why the two models disagree]
 Neither file is doing anything unusual. glTF lets an exporter bake a part's placement into its
@@ -204,88 +356,286 @@ vertex data or leave it in the node, and different tools make different choices.
 handles only the model in front of it will work until the day someone hands it the other kind.
 :::
 
+FlightHelmet also exercises a branch DamagedHelmet never reached — textures in files beside the
+model rather than embedded — so the loader gains one log line to say so:
+
+```cpp title="code/src/3.model_loading/model/main.cpp"
+        spdlog::info("    base colour \"{}\" (file)", texture_path.C_Str());
+```
+
 ## Bounds need a pass of their own now
 
 3.2 accumulated the model's bounding box straight out of the vertex loop, which was correct only
 because every vertex was already in its final position. These have not been placed yet, so the
-vertex loop now produces *local* bounds per mesh, and the world-space box is computed afterwards,
-once the draws are known:
+vertex loop now produces *local* bounds per mesh:
 
 ```cpp title="code/src/3.model_loading/model/main.cpp"
-for (const Draw& draw : model.draws) {
-    const Mesh& mesh = model.meshes[draw.mesh];
-    for (int corner = 0; corner < 8; ++corner) {
-        const glm::vec3 local((corner & 1) != 0 ? mesh.max.x : mesh.min.x,
-                              (corner & 2) != 0 ? mesh.max.y : mesh.min.y,
-                              (corner & 4) != 0 ? mesh.max.z : mesh.min.z);
-        const glm::vec3 world = glm::vec3(draw.transform * glm::vec4(local, 1.0F));
-        model.min = glm::min(model.min, world);
-        model.max = glm::max(model.max, world);
-    }
-}
+        glm::vec3 min(std::numeric_limits<float>::max());
+        glm::vec3 max(std::numeric_limits<float>::lowest());
 ```
 
-A box has eight corners; a transform moves all eight; the box around the moved corners contains
-the moved geometry. This is *conservative* rather than exact — a rotated box does not stay
-axis-aligned, so the new box can be larger than the box around the transformed vertices. For
-pointing a camera at a model that does not matter. For frustum culling in Part 8 it will, and the
-usual answer there is a bounding sphere, which does not care about orientation at all.
+```cpp title="code/src/3.model_loading/model/main.cpp"
+            min = glm::min(min, vertex.position);
+            max = glm::max(max, vertex.position);
+```
+
+which are stored on the mesh:
+
+```cpp title="code/src/3.model_loading/model/main.cpp"
+            .min = min,
+            .max = max,
+```
+
+and the **world bounds** are computed afterwards, once the draws are known:
+
+```cpp title="code/src/3.model_loading/model/main.cpp"
+    model.min = glm::vec3(std::numeric_limits<float>::max());
+    model.max = glm::vec3(std::numeric_limits<float>::lowest());
+    for (const Draw& draw : model.draws) {
+        const Mesh& mesh = model.meshes[draw.mesh];
+        for (int corner = 0; corner < 8; ++corner) {
+            const glm::vec3 local((corner & 1) != 0 ? mesh.max.x : mesh.min.x,
+                                  (corner & 2) != 0 ? mesh.max.y : mesh.min.y,
+                                  (corner & 4) != 0 ? mesh.max.z : mesh.min.z);
+            const glm::vec3 world = glm::vec3(draw.transform * glm::vec4(local, 1.0F));
+            model.min = glm::min(model.min, world);
+            model.max = glm::max(model.max, world);
+        }
+    }
+```
+
+The three bit tests enumerate the eight corners by treating `corner` as three bits, each choosing
+`min` or `max` on one axis. `glm::vec4(local, 1.0F)` makes it a point rather than a direction, so
+the translation applies — 1.12's distinction, still load-bearing.
+
+### Why not just transform min and max
+
+This is the **AABB transform**, and it is worth doing properly because the shortcut is so
+tempting. A box is described by two corners, a transform is a matrix, so surely:
+
+```
+   min'  =  M · min
+   max'  =  M · max
+```
+
+**No.** That transforms two points and calls the box around them the answer, but under a rotation
+the corner that *was* the minimum is not the corner that ends up lowest. The other six corners are
+unaccounted for, and the resulting box is too small — which is the dangerous direction, because a
+bounding box that is too small culls away geometry that is actually visible.
+
+Measured over six random rotate-scale-translate transforms, against the true box around all eight
+transformed corners:
+
+| trial | error of `min`/`max` shortcut | its volume, as a share of the true box |
+|---|---|---|
+| 1 | 1.775 | 36.3% |
+| 2 | 0.434 | 24.6% |
+| 3 | 1.518 | 31.4% |
+| 4 | 3.096 | 13.5% |
+| 5 | 1.843 | 11.8% |
+| 6 | 3.070 | 10.1% |
+
+A box holding a tenth of what it should is not a rounding error.
+
+There is a closed form, and it is worth knowing. Write the box by its **centre** `c` and its
+**half-extent** `e`, so the corners are `c ± (±e₀, ±e₁, ±e₂)`. Under a linear map `A` plus a
+translation `t`, the centre goes where centres go:
+
+```
+   c'  =  A c + t
+```
+
+For the extent, a corner offset is `±e₀` along x plus `±e₁` along y plus `±e₂` along z, so its
+image is `±e₀ a₀ ± e₁ a₁ ± e₂ a₂` where `aᵢ` are `A`'s columns. The signs are free, so the largest
+that sum can reach on each axis is the one where every term is positive:
+
+```
+   e'ᵢ  =  |Aᵢ₀| e₀  +  |Aᵢ₁| e₁  +  |Aᵢ₂| e₂
+```
+
+which is a matrix–vector product with the absolute values of the matrix:
+
+```
+   e'  =  |A| · e            (|A| meaning: take the absolute value of every element)
+```
+
+Checked against the eight-corner answer over the same six transforms, that form is exact to
+9 × 10⁻¹⁶ — it is not an approximation, it is the same box computed in three multiplies per axis
+instead of eight transformed points.
+
+The sample uses the eight corners anyway, because it runs once at load time and the explicit loop
+is easier to read. The closed form is what you want in a culling pass that runs per object per
+frame, which is Part 8.
+
+Either way the result is *conservative*: a rotated box does not stay axis-aligned, so the new box
+can be larger than the box around the transformed vertices. For pointing a camera at a model that
+does not matter. For frustum culling it will, and the usual answer there is a bounding sphere,
+which does not care about orientation at all.
+
+Then the two log lines that close the loader:
+
+```cpp title="code/src/3.model_loading/model/main.cpp"
+    spdlog::info("  {} draw(s) from {} mesh(es)", model.draws.size(),
+                 model.meshes.size());
+    spdlog::info("  world bounds ({:.3f} {:.3f} {:.3f}) to ({:.3f} {:.3f} {:.3f})",
+                 model.min.x, model.min.y, model.min.z, model.max.x, model.max.y,
+                 model.max.z);
+```
+
+Three decimals rather than 3.2's two, because this chapter's whole argument is a comparison
+between two sets of numbers.
+
+## The application
+
+The app now takes its model path as a constructor argument, because the path comes from the
+command line and `on_start` has no access to `argv`:
+
+```cpp title="code/src/3.model_loading/model/main.cpp"
+class ModelApp : public vkc::App {
+public:
+    ModelApp(Options options, std::filesystem::path model_path)
+        : vkc::App(std::move(options)), model_path_(std::move(model_path)) {}
+```
+
+```cpp title="code/src/3.model_loading/model/main.cpp"
+        model_ = load_model(context(), model_path_);
+```
+
+```cpp title="code/src/3.model_loading/model/main.cpp"
+    std::filesystem::path model_path_;
+```
+
+Declaring a constructor means 3.2's `using vkc::App::App;` is gone: this chapter's app cannot be
+built without a model path, which is the type system saying what the program needs.
+
+The framing turns 200° rather than 3.2's 215°, chosen by eye for a different model:
+
+```cpp title="code/src/3.model_loading/model/main.cpp"
+        model_matrix_ = glm::rotate(glm::mat4(1.0F), glm::radians(200.0F),
+                                    glm::vec3(0.0F, 1.0F, 0.0F)) *
+```
+
+It still works for both models without a per-model constant, because everything else in that
+expression comes from the measured bounds: FlightHelmet stands 0.72 units tall with its feet on
+`y = 0`, DamagedHelmet is about two units across and centred on the origin, and subtracting
+`centre()` puts either one in front of the camera.
 
 ## The draw loop
 
 One line longer than 3.2's, and that line is the chapter:
 
 ```cpp title="code/src/3.model_loading/model/main.cpp"
-for (const Draw& draw : model_.draws) {
-    const Mesh& mesh = model_.meshes[draw.mesh];
-    const Material& material = model_.materials[mesh.material];
-
-    vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            pipeline_layout_, 1, 1, &material.set, 0, nullptr);
-    // ... bind vertex and index buffers ...
-
-    const glm::mat4 model_matrix = model_matrix_ * draw.transform;
-
-    const PushConstants push{
-        .model = model_matrix,
-        .normal_matrix = normal_matrix_of(model_matrix),
-        .colour = material.base_colour_factor,
-    };
-    // ... push, draw ...
-}
+        for (const Draw& draw : model_.draws) {
+            const Mesh& mesh = model_.meshes[draw.mesh];
+            const Material& material = model_.materials[mesh.material];
 ```
 
-Read the multiplication right to left: a vertex is placed by its node, and the result is placed by
-the sample's own model matrix. The `normal_matrix` has to follow, because it is derived from
-whatever ends up in `model` — a node that scales its mesh non-uniformly would otherwise light it
-with the wrong normals.
-
-Note what is *not* sized from the draws. The descriptor pool still asks for one combined image
-sampler per **material**:
+Two indirections now, where 3.2 had one: a draw names a mesh, and a mesh names a material. That
+shape is what 3.4 takes apart.
 
 ```cpp title="code/src/3.model_loading/model/main.cpp"
-const auto material_count = static_cast<uint32_t>(model_.materials.size());
+            const glm::mat4 model_matrix = model_matrix_ * draw.transform;
 ```
 
-A descriptor set describes a surface, and six draws sharing two materials need two sets, not six.
-Sizing a pool from the draw count would work and would waste most of it.
+Read the multiplication right to left, as derived above: a vertex is placed by its node, and the
+result is placed by the sample's own model matrix.
+
+```cpp title="code/src/3.model_loading/model/main.cpp"
+            const PushConstants push{
+                .model = model_matrix,
+                .normal_matrix = normal_matrix_of(model_matrix),
+                .colour = material.base_colour_factor,
+            };
+```
+
+The `normal_matrix` has to follow the composed matrix rather than `model_matrix_` alone, because
+it is derived from whatever ends up in `model` — a node that scales its mesh non-uniformly would
+otherwise light it with the wrong normals, which is exactly the situation 2.2's derivation
+exists for. This is where the composition result above cashes out: one inverse of the product,
+not a correction applied afterwards.
+
+Note what is *not* sized from the draws. The descriptor pool still asks for one combined image
+sampler per **material**. A descriptor set describes a surface, and six draws sharing two
+materials need two sets, not six. Sizing a pool from the draw count would work and would waste
+most of it.
+
+## The `--model` flag
+
+```cpp title="code/src/3.model_loading/model/main.cpp"
+        std::filesystem::path model_path =
+            vkc::asset_path("models/flight_helmet/FlightHelmet.gltf");
+
+        std::vector<char*> forwarded{argv[0]};
+        for (int i = 1; i < argc; ++i) {
+            if (std::strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
+                model_path = argv[++i];
+                continue;
+            }
+            forwarded.push_back(argv[i]);
+        }
+```
+
+```cpp title="code/src/3.model_loading/model/main.cpp"
+        options.title = "LearnVulkan 3.3 - Model";
+        ModelApp app(vkc::App::parse_args(static_cast<int>(forwarded.size()),
+                                          forwarded.data(), options),
+                     std::move(model_path));
+```
+
+`vkc::App::parse_args` is shared by every sample in the book and rejects anything it does not
+recognise, so `--model` is stripped here rather than added there: two models is a Part 3 concern,
+not a book-wide one. `forwarded` keeps `argv[0]` and everything that is not the flag or its value,
+which is why `--frames` and the rest still work alongside it.
+
+`i + 1 < argc` is the bounds check that stops `--model` with nothing after it from reading past
+the end of `argv`.
 
 :::note[What moved into vkcommon]
 Nothing. This chapter adds no shared code — it is entirely CPU-side model handling, and the Vulkan
 calls are 3.2's. `vkc::create_texture`, which 3.2 split out of `vkc::load_texture`, is doing the
-work here without being touched, and FlightHelmet exercises the branch DamagedHelmet never
-reached: textures in files beside the model rather than embedded in it.
+work here without being touched.
 :::
 
 ## The shader is the control
 
-`model.slang` is 3.2's shader. Not "almost" — the lighting, the sampling, the push constant block
-and the `kSpecularStrength` compromise are all unchanged.
+```cmake title="code/src/3.model_loading/model/CMakeLists.txt"
+add_chapter(3.3.model
+    SOURCES main.cpp
+    SHADERS model.slang
+    LIBS assimp::assimp
+)
+```
+
+```cpp title="code/src/3.model_loading/model/main.cpp"
+        const VkShaderModule shader =
+            vkc::load_shader(device, LVK_CHAPTER_ID, "model.slang");
+```
+
+```cpp title="code/src/3.model_loading/model/main.cpp"
+        context().name(pipeline_, VK_OBJECT_TYPE_PIPELINE, "model pipeline");
+```
+
+`model.slang` is 3.2's shader under a different name. Not "almost" — the lighting, the sampling,
+the push constant block and the `kSpecularStrength` compromise are all unchanged.
 
 That is deliberate. If the picture changes and the shader did not, the change came from the CPU,
 which is where this chapter's entire subject lives. The one thing that moved is what the CPU
 *writes into* `push.model`: in 3.2 it was the same matrix for every draw, and it is now per node.
 The shader cannot tell the difference, which is the point.
+
+## Words introduced in this chapter
+
+| | |
+|---|---|
+| **scene graph** | the tree of nodes a model file carries, describing what its parts are and where they sit |
+| **node** | one entry in that tree: a name, a transform relative to its parent, children, and indices into the mesh array |
+| **node transform** | a node's own 4×4 matrix, relative to its parent and not to the world |
+| **matrix composition** | combining transforms by multiplying them, right to left for column vectors, parent on the left down a tree |
+| **row-major** | storing a matrix a row at a time, as Assimp does — the transpose of glm's column-major layout in memory |
+| **flattening** | turning the tree into a list by walking it and carrying the accumulated transform |
+| **draw list** | that list: one entry per placement, so a mesh used twice appears twice |
+| **AABB transform** | moving a bounding box through a matrix — all eight corners, or `e' = \|A\| · e` in closed form, never just `min` and `max` |
+| **world bounds** | the box around every placed mesh, as opposed to a single mesh's own local box |
 
 ## What changed since 3.2
 
@@ -294,9 +644,8 @@ The shader cannot tell the difference, which is the point.
 - a new `Draw` type — mesh index plus transform — and the frame loop iterates draws, not meshes
 - `Mesh` keeps its local-space bounds, and the model's world bounds are computed from the draws
 - `to_glm(const aiMatrix4x4&)`, transposing row-major to column-major
-- a `--model` flag, stripped in `main` before `vkc::parse_args` sees it, because two models is a
-  Part 3 concern rather than a book-wide one
-- the default model is FlightHelmet: six meshes, six materials, and textures in files beside it
+- a `--model` flag, stripped in `main` before `vkc::App::parse_args` sees it
+- the default model is FlightHelmet: six meshes, seven materials, and textures in files beside it
 
 What did **not** change: the shader, the lighting rig, the `Globals` block, the 128-byte push
 constant block, the descriptor layouts, and the pool sizing. One material still means one
@@ -310,18 +659,22 @@ becomes thousands of binds per frame. That is 3.4.
    pictures — the numbers say what happened more precisely than the render does.
 2. Transpose `to_glm` the wrong way, by filling the matrix from `m.a1, m.a2, m.a3, m.a4` instead.
    FlightHelmet will not care. Work out why, then predict what DamagedHelmet will do before you
-   run it.
+   run it — and remember that the node's transform is a pure rotation.
 3. Print the depth of each node as the walk visits it and confirm that both models are one level
    deep. Then find a glTF sample asset that is not — `ABeautifulGame` and `2CylinderEngine` both
-   have real hierarchies — and check that your walk handles it without changes.
+   have real hierarchies — and check that your walk handles it without changes. This is also the
+   only way to catch a `node->mTransformation * parent` mistake, which a one-level tree hides.
 4. Make an instanced draw by hand: after `collect_draws` returns, push a second `Draw` referring to
    mesh 0 with `glm::translate` applied to its transform. Two copies, one vertex buffer. This is
    the case that would be impossible if the transform lived on `Mesh`.
-5. `Draw` stores a whole `glm::mat4` per placement. For a scene with ten thousand of them that is
+5. Implement the closed-form bounds — `c' = A c + t` and `e' = |A| · e` — alongside the eight-corner
+   loop and assert the two agree. Then count the multiplies each one costs.
+6. Confirm the normal-matrix result: build two random matrices `A` and `B`, compute
+   `inverseTranspose(A * B)` and `inverseTranspose(A) * inverseTranspose(B)`, and compare. Then
+   reverse the order of the second and watch it stop agreeing.
+7. `Draw` stores a whole `glm::mat4` per placement. For a scene with ten thousand of them that is
    640 KB of matrices rebuilt every frame if anything animates. What would you store instead, given
    that a node transform is nearly always a translation, a rotation and a scale?
-6. The world-space bounds are conservative. Build a case where they are visibly too big — one mesh,
-   one node, a 45° rotation — and work out how much slack a rotated box costs at worst.
 
 Next: 3.4, where binding a descriptor set per draw stops being acceptable, every texture in the
 model goes into one array, and the material becomes an index rather than a binding.

@@ -1,6 +1,6 @@
 ---
 title: Assimp
-description: Where vertices come from when you stop typing them - what is really inside a model file, what Assimp does with it, and which of its post-processing flags matter.
+description: Where vertices come from when you stop typing them - what is really inside a model file, what Assimp does with it, which of its post-processing flags matter, and where a normal comes from when the file has none.
 sidebar:
   order: 1
 ---
@@ -44,7 +44,8 @@ renderer that only reads glTF cannot open anything an artist hands it.
 ## One library, one tree
 
 Assimp (the Open Asset Import Library) reads about forty formats and hands every one of them
-back in the same shape:
+back in the same shape. The object at the top is an **`aiScene`**, and everything else hangs
+off it:
 
 ```
 aiScene
@@ -54,15 +55,23 @@ aiScene
 └── mTextures[]    aiTexture  ─ images embedded in the file rather than beside it
 ```
 
-Two things about that structure are worth fixing in your head now, because the next three
-chapters are built on them.
+Reading that structure means meeting a handful of small Assimp types, so here they are
+before they appear in a listing. **`aiVector3D`** is Assimp's three-float vector — positions
+and normals are arrays of it. **`aiFace`** is one polygon: a count and a list of indices into
+the mesh's vertices. **`aiString`** is Assimp's own string type, a length and a fixed
+buffer, which is why every name in this chapter goes through `.C_Str()` before it reaches
+`std::string` or a format call. None of them is interesting; all of them are unavoidable.
 
-**A mesh is not an object.** It is a run of vertices sharing *one material*. A single visible
-thing in a scene is usually several meshes, because it is made of several materials.
+Two things about the structure itself are worth fixing in your head now, because the next
+three chapters are built on them.
+
+**A mesh is not an object.** An `aiMesh` is a run of vertices sharing *one material*. A
+single visible thing in a scene is usually several meshes, because it is made of several
+materials.
 
 **The nodes are where the positions come from.** `aiMesh` holds vertices in its own local
-space; the transform that places it in the world is the product of the node transforms from
-the root down. A mesh on its own does not know where it is.
+space; the transform that places it in the world is the product of the `aiNode` transforms
+from the root down. A mesh on its own does not know where it is.
 
 This chapter deliberately uses neither fact, and 3.2 and 3.3 are exactly the chapters that
 stop ducking them.
@@ -71,7 +80,7 @@ stop ducking them.
 
 `ReadFile` takes a bitmask of post-processing steps. They read like options and they are not
 — each one is a real pass over the data, and choosing them is most of what using Assimp well
-consists of.
+consists of. The sample asks for five:
 
 ```cpp title="code/src/3.model_loading/assimp/main.cpp"
 constexpr unsigned int kImportFlags =
@@ -82,17 +91,34 @@ constexpr unsigned int kImportFlags =
 
 | Flag | What it does |
 |---|---|
-| `Triangulate` | Turns every face into triangles. A quad or an n-gon in the file is not something the pipeline can consume. |
-| `GenSmoothNormals` | Generates normals if the file has none, averaged across the faces meeting at each vertex. A no-op when they are present, as they are here. |
-| `JoinIdenticalVertices` | Deduplicates, so a shared corner becomes one vertex referenced many times. This is what makes an index buffer worth having. |
-| `PreTransformVertices` | Collapses the node hierarchy, baking each node's transform into its vertices. |
-| `ImproveCacheLocality` | Reorders triangles so nearby ones share vertices, which the GPU's post-transform cache rewards. |
+| `aiProcess_Triangulate` | **Triangulation**: every face becomes a triangle. A quad or an n-gon in the file is not something the pipeline can consume. |
+| `aiProcess_GenSmoothNormals` | Generates a **vertex normal** for every vertex if the file has none, by averaging the **face normals** of the triangles meeting there. A no-op when normals are present, as they are here. |
+| `aiProcess_JoinIdenticalVertices` | **Vertex deduplication**: a corner shared by several faces becomes one vertex referenced many times rather than one copy per face. |
+| `aiProcess_PreTransformVertices` | Collapses the node hierarchy, baking each node's transform into its vertices. |
+| `aiProcess_ImproveCacheLocality` | Reorders triangles so nearby ones share vertices, which the GPU's **post-transform cache** rewards. |
 
-`PreTransformVertices` is the one doing the most work for this chapter, and it is the
-simplification the whole chapter rests on: it is what lets a sample with no concept of a
-scene graph draw a model correctly. The helmet's single node carries a 90° rotation about x —
-the usual z-up-to-y-up correction — and baking it is the difference between a helmet standing
-up and a helmet lying on its back. Exercise 1 is to see that happen.
+The post-transform cache is worth one sentence, because it is the only one of those five
+whose benefit is invisible. The GPU keeps the last few *transformed* vertices in a small
+cache, so a triangle whose vertices were transformed for a neighbouring triangle a moment ago
+gets them for free. Reordering triangles so that neighbours in the index buffer are also
+neighbours on the surface is what makes those hits happen. It changes no pixel and no count;
+it only changes how often the vertex shader has to run.
+
+`aiProcess_PreTransformVertices` is the one doing the most work for this chapter, and it is
+the simplification the whole chapter rests on: it is what lets a sample with no concept of a
+scene graph draw a model correctly. The helmet's single node carries this transform, which
+Assimp stores a row at a time:
+
+```
+  row 0:   1    0    0    0
+  row 1:   0    0   -1    0
+  row 2:   0    1    0    0
+  row 3:   0    0    0    1
+```
+
+Read it as a map: `(x, y, z)` goes to `(x, −z, y)`. That is a rotation of +90° about x — the
+usual z-up-to-y-up correction — and baking it is the difference between a helmet standing up
+and a helmet lying on its back. Exercise 1 is to see that happen.
 
 :::caution[The `aiProcess_FlipUVs` trap]
 Most OpenGL material passes `aiProcess_FlipUVs`, and copying that here would be a bug.
@@ -108,25 +134,251 @@ mirror each panel in place; it lands every island on a different island's paint.
 still renders, still looks like a helmet, and simply wears the wrong surface.
 :::
 
-## Reading a mesh
+### What deduplication is actually worth here
 
-With those flags chosen, pulling the data out is a loop and no cleverness:
+`aiProcess_JoinIdenticalVertices` is usually described as the flag that makes an index buffer
+worth having. On this file that is an overstatement, and the numbers are easy to get: load the
+helmet with and without the flag and print `mNumVertices`.
 
-```cpp title="code/src/3.model_loading/assimp/main.cpp"
-Assimp::Importer importer;
-const aiScene* scene = importer.ReadFile(path.string(), kImportFlags);
+| | vertices | faces | indices |
+|---|---|---|---|
+| all five flags | 14 354 | 15 452 | 46 356 |
+| without `aiProcess_JoinIdenticalVertices` | 14 556 | 15 452 | 46 356 |
 
-if (scene == nullptr || (scene->mFlags & AI_SCENE_FLAGS_INCOMPLETE) != 0 ||
-    scene->mRootNode == nullptr) {
-    throw std::runtime_error("Assimp could not read " + path.string() + ": " +
-                             importer.GetErrorString());
-}
+**202 vertices, or 1.4%.** Not nothing, and not the order-of-magnitude saving the flag's
+reputation suggests. The reason is that glTF is *already* an indexed format: the exporter
+deduplicated when it wrote the file, and the 202 are the leftovers that Assimp's own
+comparison catches and the exporter's did not.
+
+The flag earns its reputation on formats that carry no index buffer at all. A Wavefront `.obj`
+lists every triangle as three complete vertices, so 15 452 faces arrive as 46 356 vertices;
+deduplicating to 14 354 is then a saving of 69%. Which flags matter depends on which format
+you are reading, and that is a general truth about this library rather than a fact about this
+file.
+
+## Where a normal comes from
+
+`aiProcess_GenSmoothNormals` is one row in a table and a whole piece of geometry. The helmet
+ships its own normals so the pass does nothing here — but a file that does not is common, and
+the maths is the foundation of every lighting chapter you have already read.
+
+### The face normal
+
+Take one triangle with corners `a`, `b`, `c`. Two of its edges are
+
+```
+   e1 = b − a
+   e2 = c − a
 ```
 
-Three failure cases rather than one, and the middle is the dangerous one:
-`AI_SCENE_FLAGS_INCOMPLETE` means Assimp returned a scene it only partly understood. It is
-not null, it is not an error, and it is missing data — check it, or you will debug a renderer
-for something the loader already knew.
+Both lie in the triangle's plane, so any vector perpendicular to both is perpendicular to the
+plane — and that is exactly what the **cross product** from 1.14 produces:
+
+```
+   n_face = e1 × e2
+```
+
+The first triangle in the helmet's mesh gives:
+
+```
+   e1 × e2  =  (−0.003325,  0.001363,  −0.000281)
+```
+
+Two things about that vector, and the second is the one worth remembering.
+
+**Its direction is decided by the winding order.** `e1 × e2` and `e2 × e1` point opposite
+ways — the cross product is anti-commutative — so which face of the triangle the normal comes
+out of depends entirely on the order the corners were listed in. The right-hand rule from 1.14
+settles it: curl your fingers from `e1` to `e2` and your thumb is `n_face`. For a
+counter-clockwise triangle seen from outside the surface, that thumb points outward. This is
+the same convention as `VK_FRONT_FACE_COUNTER_CLOCKWISE` in the pipeline, and it is not a
+coincidence: both are asking "which side is the front", and both answer it from the order of
+the vertices.
+
+Checked across the whole helmet — every face's `(b−a) × (c−a)` against the average of its
+three shipped normals — **all 15 452 triangles agree**, none disagrees, and the worst
+alignment is a dot product of 0.8842. The file's winding and the file's normals tell the same
+story, which is what you want to confirm before trusting either.
+
+**Its length is twice the triangle's area.** `|e1 × e2| = |e1||e2| sin θ`, and the area of a
+triangle with two sides `|e1|`, `|e2|` and angle `θ` between them is `½|e1||e2| sin θ`. So
+
+```
+   area  =  |e1 × e2| / 2
+```
+
+For that first triangle: `|(−0.003325, 0.001363, −0.000281)| / 2 = 0.00180198`. The cross
+product hands you the area for free, as a side effect of computing the direction.
+
+### The vertex normal
+
+A vertex sits at the corner of several triangles. Shading wants one normal per vertex, so the
+face normals have to be combined, and there are two obvious ways to do it:
+
+```
+   unweighted:      n_vertex  =  normalise( Σ  normalise(n_face) )
+
+   area-weighted:   n_vertex  =  normalise( Σ  n_face )
+```
+
+The second is free. Because `|n_face|` *is* twice the area, summing the raw cross products
+weights each face by its size without a single extra multiply — a large triangle should have
+more say in the corner's normal than a sliver, and simply not normalising gives you that.
+
+It is a genuinely elegant result, and it is worth knowing that **Assimp does not use it.**
+From `GenVertexNormalsProcess.cpp`:
+
+```cpp
+const aiVector3D vNor = ((*pV2 - *pV1) ^ (*pV3 - *pV1)).NormalizeSafe();
+```
+
+`^` is Assimp's cross product operator, and `NormalizeSafe` is called before the face normal
+is ever stored. Every face therefore contributes a unit vector, and the area information is
+thrown away.
+
+Does it matter? On this mesh, measured — accumulating both ways over the same 15 452
+triangles:
+
+| | |
+|---|---|
+| triangle area range | 3.73 × 10⁻⁷ to 7.93 × 10⁻² (a ratio of 212 440 : 1) |
+| worst disagreement between the two methods | **16.36°** |
+| vertices differing by more than 1° | 2 364 of 14 556 |
+| mean angle to the file's own normals, area-weighted | 2.6355° |
+| mean angle to the file's own normals, unweighted | **2.3759°** |
+
+So the two methods really do disagree — 16° is a visible difference in a specular highlight —
+and on this model the *unweighted* average, the one that throws the area away, is the one
+closer to what the artist's tool actually wrote. The textbook argument for area weighting is
+sound geometry and is not automatically the right answer for matching a given exporter.
+
+Which is the useful lesson: generated normals are an approximation of an intention the file
+did not record. Use the file's own normals when it has them. That is why the loader below
+reads `HasNormals()` rather than always generating.
+
+:::note[Two more things `GenSmoothNormals` decides for you]
+Assimp merges normals **by position, not by index**: it spatially sorts the vertices and
+averages across everything within an epsilon of each other, so two vertices split apart for a
+UV seam still end up sharing a normal. That is almost always what you want, and it is not what
+a naive per-index loop does.
+
+It also takes a maximum smoothing angle, `AI_CONFIG_PP_GSN_MAX_SMOOTHING_ANGLE`, defaulting to
+175°. Faces meeting at a sharper angle than that are not averaged together, which is how a
+cube keeps its hard edges instead of turning into a rounded blob. At the default of 175° there
+is effectively no limit, and Assimp takes a faster code path that skips the angle test
+entirely.
+:::
+
+## Reading a mesh
+
+The chapter is one new file. It starts with the `vkcommon` headers every chapter has used
+since 1.14, and then three from Assimp:
+
+```cpp title="code/src/3.model_loading/assimp/main.cpp"
+#include <vkc/app.hpp>
+#include <vkc/buffer.hpp>
+#include <vkc/camera.hpp>
+#include <vkc/check.hpp>
+#include <vkc/image.hpp>
+#include <vkc/paths.hpp>
+#include <vkc/pipeline.hpp>
+
+#include <assimp/postprocess.h>
+#include <assimp/scene.h>
+#include <assimp/Importer.hpp>
+
+#include <SDL3/SDL.h>
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_inverse.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <spdlog/spdlog.h>
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <exception>
+#include <filesystem>
+#include <limits>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <vector>
+```
+
+`postprocess.h` is the flags, `scene.h` is `aiScene` and everything under it, and
+`Importer.hpp` is the C++ wrapper that owns the result. The four standard headers that are new
+to this chapter are there for concrete reasons: `<filesystem>` for the path, `<limits>` for
+the bounding-box seed below, `<vector>` because the vertex count is no longer a compile-time
+constant, and `<cstdint>` for the `uint32_t` indices.
+
+`Vertex` is Part 2's layout, unchanged:
+
+```cpp title="code/src/3.model_loading/assimp/main.cpp"
+struct Vertex {
+    glm::vec3 position;
+    glm::vec3 normal;
+    glm::vec2 uv;
+};
+```
+
+What one call to Assimp produces is new:
+
+```cpp title="code/src/3.model_loading/assimp/main.cpp"
+struct ModelData {
+    std::vector<Vertex> vertices;
+    std::vector<uint32_t> indices;
+    glm::vec3 min{};
+    glm::vec3 max{};
+
+    [[nodiscard]] glm::vec3 centre() const { return (min + max) * 0.5F; }
+    [[nodiscard]] float radius() const { return glm::length(max - min) * 0.5F; }
+};
+```
+
+`min` and `max` are an **axis-aligned bounding box**: the smallest box, with faces parallel to
+the coordinate planes, that contains every vertex. Two corners describe it completely, which
+is why it is the cheapest useful summary of "where is this thing and how big is it".
+`centre()` is the midpoint of the diagonal, and `radius()` is half the diagonal's length —
+the radius of a sphere that certainly contains the box, and therefore the model.
+
+Converting Assimp's vector to glm's is a one-liner, and it appears in every chapter of this
+part:
+
+```cpp title="code/src/3.model_loading/assimp/main.cpp"
+[[nodiscard]] glm::vec3 to_glm(const aiVector3D& v) { return {v.x, v.y, v.z}; }
+```
+
+Then the loader itself. First, does the file exist — checked separately, because "no such
+file" deserves a better message than whatever the library says:
+
+```cpp title="code/src/3.model_loading/assimp/main.cpp"
+[[nodiscard]] ModelData load_model(const std::filesystem::path& path) {
+    if (!std::filesystem::exists(path)) {
+        throw std::runtime_error(
+            "Model not found: " + path.string() +
+            "\nFetch the tutorial assets first:  python3 tools/bootstrap.py");
+    }
+```
+
+Then the read:
+
+```cpp title="code/src/3.model_loading/assimp/main.cpp"
+    Assimp::Importer importer;
+    const aiScene* scene = importer.ReadFile(path.string(), kImportFlags);
+
+    if (scene == nullptr || (scene->mFlags & AI_SCENE_FLAGS_INCOMPLETE) != 0 ||
+        scene->mRootNode == nullptr) {
+        throw std::runtime_error("Assimp could not read " + path.string() + ": " +
+                                 importer.GetErrorString());
+    }
+```
+
+The **importer** is the object that does the reading. Three failure cases rather than one, and
+the middle is the dangerous one: `AI_SCENE_FLAGS_INCOMPLETE` means Assimp returned a scene it
+only partly understood. It is not null, it is not an error, and it is missing data — check it,
+or you will debug a renderer for something the loader already knew.
 
 :::note[The `Importer` owns the scene]
 `aiScene` lives inside the `Importer` and dies with it. Everything the sample keeps is copied
@@ -134,29 +386,50 @@ out before `load_model` returns. Holding an `aiScene*` past that point is a use-
 and it is the most common way to misuse this library.
 :::
 
+A line of logging, because the first question about any new file is what was in it:
+
+```cpp title="code/src/3.model_loading/assimp/main.cpp"
+    spdlog::info("{}: {} mesh(es), {} material(s), {} embedded texture(s)",
+                 path.filename().string(), scene->mNumMeshes, scene->mNumMaterials,
+                 scene->mNumTextures);
+```
+
+Now the accumulator. The bounding box is seeded **backwards** — `min` starts at the largest
+representable float and `max` at the lowest — so that the first real vertex replaces both. Seed
+them to zero instead and a model that sits entirely away from the origin gets a box stretched
+back to include a point it does not contain:
+
+```cpp title="code/src/3.model_loading/assimp/main.cpp"
+    ModelData model;
+    model.min = glm::vec3(std::numeric_limits<float>::max());
+    model.max = glm::vec3(std::numeric_limits<float>::lowest());
+```
+
+`lowest()` and not `min()`: for a floating-point type `std::numeric_limits<float>::min()` is
+the smallest *positive* normal value, which is very nearly zero and completely wrong here.
+
 Then, per mesh:
 
 ```cpp title="code/src/3.model_loading/assimp/main.cpp"
-const auto base = static_cast<uint32_t>(model.vertices.size());
+    for (unsigned int m = 0; m < scene->mNumMeshes; ++m) {
+        const aiMesh* mesh = scene->mMeshes[m];
 
-for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
-    Vertex vertex{};
-    vertex.position = to_glm(mesh->mVertices[v]);
-    vertex.normal = mesh->HasNormals() ? to_glm(mesh->mNormals[v])
-                                       : glm::vec3(0.0F, 1.0F, 0.0F);
-    vertex.uv = mesh->HasTextureCoords(0)
-                    ? glm::vec2(mesh->mTextureCoords[0][v].x,
-                                mesh->mTextureCoords[0][v].y)
-                    : glm::vec2(0.0F);
-    model.vertices.push_back(vertex);
-}
+        const auto base = static_cast<uint32_t>(model.vertices.size());
 
-for (unsigned int f = 0; f < mesh->mNumFaces; ++f) {
-    const aiFace& face = mesh->mFaces[f];
-    for (unsigned int i = 0; i < face.mNumIndices; ++i) {
-        model.indices.push_back(base + face.mIndices[i]);
-    }
-}
+        for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
+            Vertex vertex{};
+            vertex.position = to_glm(mesh->mVertices[v]);
+            vertex.normal = mesh->HasNormals() ? to_glm(mesh->mNormals[v])
+                                               : glm::vec3(0.0F, 1.0F, 0.0F);
+            vertex.uv = mesh->HasTextureCoords(0)
+                            ? glm::vec2(mesh->mTextureCoords[0][v].x,
+                                        mesh->mTextureCoords[0][v].y)
+                            : glm::vec2(0.0F);
+
+            model.min = glm::min(model.min, vertex.position);
+            model.max = glm::max(model.max, vertex.position);
+            model.vertices.push_back(vertex);
+        }
 ```
 
 `base` is the only subtle line. Each mesh numbers its indices from zero, and this chapter
@@ -165,9 +438,45 @@ number of vertices already in. Get it wrong with a one-mesh model and nothing ha
 is precisely why it is worth pointing at.
 
 `mTextureCoords` is an array of up to eight UV sets. Set 0 is the one materials use by
-default and the only one this series reads.
+default and the only one this series reads. The fallbacks matter as much as the reads: a
+missing normal becomes straight up and a missing UV becomes the origin, so a file without them
+renders oddly rather than crashing.
 
-Running it prints what it found:
+The faces:
+
+```cpp title="code/src/3.model_loading/assimp/main.cpp"
+        for (unsigned int f = 0; f < mesh->mNumFaces; ++f) {
+            const aiFace& face = mesh->mFaces[f];
+            for (unsigned int i = 0; i < face.mNumIndices; ++i) {
+                model.indices.push_back(base + face.mIndices[i]);
+            }
+        }
+
+        spdlog::info("  mesh {} \"{}\": {} vertices, {} faces, material {}", m,
+                     mesh->mName.C_Str(), mesh->mNumVertices, mesh->mNumFaces,
+                     mesh->mMaterialIndex);
+    }
+```
+
+`aiProcess_Triangulate` guarantees `mNumIndices` is three, and the loop reads it anyway. That
+is the difference between a loader and a loader for one file.
+
+Finally, refuse to return something empty, and report what was built:
+
+```cpp title="code/src/3.model_loading/assimp/main.cpp"
+    if (model.vertices.empty()) {
+        throw std::runtime_error("Model has no vertices: " + path.string());
+    }
+
+    spdlog::info("  total: {} vertices, {} indices, bounds ({:.2f} {:.2f} {:.2f}) to "
+                 "({:.2f} {:.2f} {:.2f})",
+                 model.vertices.size(), model.indices.size(), model.min.x, model.min.y,
+                 model.min.z, model.max.x, model.max.y, model.max.z);
+    return model;
+}
+```
+
+Running it prints:
 
 ```
 DamagedHelmet.glb: 1 mesh(es), 2 material(s), 5 embedded texture(s)
@@ -175,54 +484,409 @@ DamagedHelmet.glb: 1 mesh(es), 2 material(s), 5 embedded texture(s)
   total: 14354 vertices, 46356 indices, bounds (-0.95 -0.90 -1.19) to (0.94 0.90 0.81)
 ```
 
-15 452 faces × 3 = 46 356 indices, which is the arithmetic confirming `Triangulate` did what
-it said.
+15 452 faces × 3 = 46 356 indices, which is the arithmetic confirming `aiProcess_Triangulate`
+did what it said.
 
 **Two materials, in a file that declares one.** Assimp synthesises a default material for
 meshes that reference none, so its material count is routinely one higher than the file's.
 Nothing here uses it — but a loop over `mNumMaterials` that expects the file's own count is
-a bug waiting for 3.3, where materials stop being ignorable.
+a bug waiting for 3.2, where materials stop being ignorable.
 
-## How big is it, and where?
+## The shading data
 
-An array of 24 vertices needs no introduction. A file does:
-
-```cpp title="code/src/3.model_loading/assimp/main.cpp"
-model_matrix_ = glm::rotate(glm::mat4(1.0F), glm::radians(215.0F),
-                            glm::vec3(0.0F, 1.0F, 0.0F)) *
-                glm::translate(glm::mat4(1.0F), -model.centre());
-camera_.position = {0.0F, 0.0F, model.radius() * 2.6F};
-```
-
-This is why `load_model` returns the bounding box along with the buffers. A model file
-carries no promise about scale, origin or facing: it may be centred or it may not, and it may
-be measured in metres, centimetres or nothing in particular. Without measuring it, the first
-run of any new model is either an empty screen or a wall of polygons an inch from the camera,
-and both look exactly like a broken renderer.
-
-The half-turn is chosen by eye. glTF fixes the axes — y up, z toward the viewer — but nothing
-says which way a model *faces*, so you look at it and you turn it.
-
-## What Vulkan sees
-
-Almost nothing changed, which is the honest lesson of the chapter. A vertex buffer does not
-care where its bytes came from, and `vkc::upload_to_device_local` from 1.8 uploads 14 354
-vertices exactly as it uploaded 24.
-
-One line is genuinely different:
+Part 2's `Globals` block, with the six-light array replaced by two directional lights:
 
 ```cpp title="code/src/3.model_loading/assimp/main.cpp"
-vkCmdBindIndexBuffer(frame.cmd, index_buffer_.handle(), 0, VK_INDEX_TYPE_UINT32);
+struct Globals {
+    glm::mat4 view;                // 0
+    glm::mat4 projection;          // 64
+    glm::vec4 view_position;       // 128
+    glm::vec4 key_direction;       // 144
+    glm::vec4 key_colour;          // 160
+    glm::vec4 fill_direction;      // 176
+    glm::vec4 fill_colour;         // 192
+    glm::vec4 ambient;             // 208, w is the shininess
+};
+static_assert(offsetof(Globals, ambient) == 208);
+static_assert(sizeof(Globals) == 224);
 ```
 
-Every chapter so far used `VK_INDEX_TYPE_UINT16`, because a cube has 24 vertices. Models do
-not live under a 65 535-vertex ceiling, and two bytes per index is not a saving worth an
-arbitrary limit for.
+Every field is a `vec4` and every offset is a multiple of 16, so the std140 rules from 1.10
+and 2.2 cost nothing here: two 64-byte matrices, then six 16-byte vectors, 224 bytes. The
+`static_assert`s are the same habit Part 2 built — the layout is a contract with the shader,
+and a contract worth checking at compile time.
 
-The pipeline also declares **two** vertex attributes where `Vertex` has three fields. The
-loader fills `uv` in and nothing samples it yet, so the stride counts it and the pipeline does
-not mention it. Describing it anyway is not free — add a third attribute for it and the
-validation layers say so at pipeline creation:
+`ambient.w` carries the shininess. A `vec3` in a uniform block is padded to 16 bytes whether
+or not anything uses the fourth component, so that float is free.
+
+`PushConstants` is 2.6's block down to the byte, and the normal matrix is still built the way
+2.2 derived it:
+
+```cpp title="code/src/3.model_loading/assimp/main.cpp"
+struct PushConstants {
+    glm::mat4 model;                         // 0
+    std::array<glm::vec4, 3> normal_matrix;  // 64
+    glm::vec4 colour;                        // 112
+};
+static_assert(offsetof(PushConstants, colour) == 112);
+static_assert(sizeof(PushConstants) == 128);
+
+[[nodiscard]] std::array<glm::vec4, 3> normal_matrix_of(const glm::mat4& model) {
+    const glm::mat3 m = glm::inverseTranspose(glm::mat3(model));
+    return {glm::vec4(m[0], 0.0F), glm::vec4(m[1], 0.0F), glm::vec4(m[2], 0.0F)};
+}
+```
+
+Three `vec4` rather than a `glm::mat3`, because a `float3x3` in a shader block has a matrix
+stride of 16 and occupies 48 bytes rather than 36 — the trap 2.2 measured.
+
+The lighting constants, chosen by eye and then kept:
+
+```cpp title="code/src/3.model_loading/assimp/main.cpp"
+constexpr float kShininess = 48.0F;
+
+constexpr glm::vec3 kKeyDirection{-0.5F, -0.8F, -0.6F};
+constexpr glm::vec3 kKeyColour{0.95F, 0.96F, 1.00F};
+constexpr glm::vec3 kFillDirection{0.7F, -0.2F, 0.7F};
+constexpr glm::vec3 kFillColour{0.35F, 0.28F, 0.22F};
+constexpr glm::vec3 kAmbient{0.06F, 0.06F, 0.08F};
+
+constexpr glm::vec4 kAlbedo{0.62F, 0.62F, 0.64F, 1.0F};
+```
+
+A cool key from the front left and a warm fill from behind right, so the side the key misses
+is described rather than black. Both directional: the model is one object with nothing around
+it, and 2.5's distance falloff would say nothing here. The albedo is flat mid-grey — there is
+a full set of PBR textures inside this file and this chapter reads none of them, because the
+subject is the geometry and an untextured surface is where you can see it.
+
+## The application
+
+```cpp title="code/src/3.model_loading/assimp/main.cpp"
+class AssimpApp : public vkc::App {
+public:
+    using vkc::App::App;
+
+protected:
+    void on_start() override {
+        const ModelData model = load_model(vkc::asset_path("models/damaged_helmet/DamagedHelmet.glb"));
+
+        index_count_ = static_cast<uint32_t>(model.indices.size());
+
+        vertex_buffer_ = vkc::upload_to_device_local(
+            context(), model.vertices.data(), model.vertices.size() * sizeof(Vertex),
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+        index_buffer_ = vkc::upload_to_device_local(
+            context(), model.indices.data(), model.indices.size() * sizeof(uint32_t),
+            VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+
+        context().name(vertex_buffer_.handle(), VK_OBJECT_TYPE_BUFFER, "helmet vertices");
+        context().name(index_buffer_.handle(), VK_OBJECT_TYPE_BUFFER, "helmet indices");
+```
+
+`vkc::upload_to_device_local` is 1.8's staging-buffer path, unchanged: it allocates a
+host-visible staging buffer, copies into it, and copies from there into device-local memory.
+It uploads 14 354 vertices exactly as it uploaded 24. That is the honest Vulkan lesson of the
+chapter — **a vertex buffer does not care where its bytes came from.**
+
+`ModelData` is a local, so the `std::vector`s are freed the moment `on_start` returns. Nothing
+keeps the CPU copy; the buffers hold it now.
+
+Then the model is placed:
+
+```cpp title="code/src/3.model_loading/assimp/main.cpp"
+        model_matrix_ = glm::rotate(glm::mat4(1.0F), glm::radians(215.0F),
+                                    glm::vec3(0.0F, 1.0F, 0.0F)) *
+                        glm::translate(glm::mat4(1.0F), -model.centre());
+        camera_.position = {0.0F, 0.0F, model.radius() * 2.6F};
+```
+
+This is why `load_model` returns the bounding box. A model file carries no promise about
+scale, origin or facing: it may be centred or it may not, and it may be measured in metres,
+centimetres or nothing in particular. Without measuring it, the first run of any new model is
+either an empty screen or a wall of polygons an inch from the camera, and both look exactly
+like a broken renderer.
+
+Read the product right to left, as 1.12 established: translate by `−centre` first, putting the
+model's box on the origin, then rotate. The half-turn is chosen by eye — glTF fixes the axes,
+y up and z toward the viewer, but nothing says which way a model *faces*, so you look at it
+and you turn it. `radius() * 2.6F` puts the camera comfortably off the bounding sphere.
+
+The rest of `on_start` is the shape every chapter since 1.13 has used:
+
+```cpp title="code/src/3.model_loading/assimp/main.cpp"
+        depth_format_ = vkc::choose_depth_format(context().physical_device());
+        depth_ = vkc::create_depth_buffer(context(), depth_format_, swapchain().extent());
+
+        create_uniform_buffers();
+        create_descriptors();
+        create_pipeline();
+
+        spdlog::info("Right-click to capture the mouse, WASD to fly, Escape to quit.");
+    }
+
+    void on_resize(VkExtent2D extent) override {
+        depth_ = vkc::create_depth_buffer(context(), depth_format_, extent);
+    }
+
+    void on_event(const SDL_Event& event) override {
+        camera_.handle_event(event, window().handle());
+    }
+```
+
+Teardown, in the reverse of creation order:
+
+```cpp title="code/src/3.model_loading/assimp/main.cpp"
+    void on_shutdown() override {
+        const VkDevice device = context().device();
+
+        vkDestroyPipeline(device, pipeline_, nullptr);
+        vkDestroyPipelineLayout(device, pipeline_layout_, nullptr);
+        vkDestroyDescriptorPool(device, descriptor_pool_, nullptr);
+        vkDestroyDescriptorSetLayout(device, frame_set_layout_, nullptr);
+
+        for (vkc::Buffer& buffer : uniform_buffers_) {
+            buffer.destroy();
+        }
+        depth_.destroy();
+        index_buffer_.destroy();
+        vertex_buffer_.destroy();
+    }
+```
+
+Destroying the pool frees every set allocated from it, which is why the sets themselves are
+never destroyed individually — 1.10's rule, still holding.
+
+## The frame
+
+```cpp title="code/src/3.model_loading/assimp/main.cpp"
+    void on_render(const vkc::FrameInfo& frame) override {
+        camera_.update(delta_time());
+
+        const size_t slot = frame.frame_number % vkc::kFramesInFlight;
+        update_globals(slot, frame.extent);
+
+        vkc::begin_rendering(frame.cmd, frame.view, depth_.view(), frame.extent,
+                             {{0.02F, 0.02F, 0.04F, 1.0F}});
+
+        set_viewport(frame);
+
+        vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
+        vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                pipeline_layout_, 0, 1, &frame_sets_[slot], 0, nullptr);
+
+        const VkDeviceSize offset = 0;
+        const VkBuffer vertices = vertex_buffer_.handle();
+        vkCmdBindVertexBuffers(frame.cmd, 0, 1, &vertices, &offset);
+
+        vkCmdBindIndexBuffer(frame.cmd, index_buffer_.handle(), 0, VK_INDEX_TYPE_UINT32);
+```
+
+One line is genuinely different from Part 2: **`VK_INDEX_TYPE_UINT32`.** Every chapter so far
+used `VK_INDEX_TYPE_UINT16`, because a cube has 24 vertices. Models do not live under a
+65 535-vertex ceiling, and two extra bytes per index is not a saving worth an arbitrary limit
+for. The helmet's 14 354 vertices would in fact still fit in 16 bits — but the buffer was
+filled with `uint32_t`, and the index type describes the bytes, not the model.
+
+Then the per-draw data and the draw:
+
+```cpp title="code/src/3.model_loading/assimp/main.cpp"
+        const PushConstants push{
+            .model = model_matrix_,
+            .normal_matrix = normal_matrix_of(model_matrix_),
+            .colour = kAlbedo,
+        };
+        vkCmdPushConstants(frame.cmd, pipeline_layout_,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                           sizeof(push), &push);
+
+        vkCmdDrawIndexed(frame.cmd, index_count_, 1, 0, 0, 0);
+
+        vkCmdEndRendering(frame.cmd);
+    }
+```
+
+One draw call for the whole model, because the whole model is one buffer and one material.
+That holds for exactly one more chapter.
+
+The two helpers below it are Part 1's, verbatim:
+
+```cpp title="code/src/3.model_loading/assimp/main.cpp"
+private:
+    static void set_viewport(const vkc::FrameInfo& frame) {
+        const VkViewport viewport{
+            .x = 0.0F,
+            .y = 0.0F,
+            .width = static_cast<float>(frame.extent.width),
+            .height = static_cast<float>(frame.extent.height),
+            .minDepth = 0.0F,
+            .maxDepth = 1.0F,
+        };
+        vkCmdSetViewport(frame.cmd, 0, 1, &viewport);
+
+        const VkRect2D scissor{.offset = {0, 0}, .extent = frame.extent};
+        vkCmdSetScissor(frame.cmd, 0, 1, &scissor);
+    }
+
+    [[nodiscard]] static glm::mat4 build_projection(VkExtent2D extent) {
+        const float aspect =
+            static_cast<float>(extent.width) / static_cast<float>(extent.height);
+        glm::mat4 projection =
+            glm::perspective(glm::radians(45.0F), aspect, 0.1F, 100.0F);
+        projection[1][1] *= -1.0F;  // Vulkan's clip-space y points down.
+        return projection;
+    }
+```
+
+And the per-frame uniform write, unchanged in shape since 2.1 — one buffer per frame in
+flight, mapped once, written every frame:
+
+```cpp title="code/src/3.model_loading/assimp/main.cpp"
+    void create_uniform_buffers() {
+        for (vkc::Buffer& buffer : uniform_buffers_) {
+            buffer = vkc::Buffer(context().allocator(), sizeof(Globals),
+                                 VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                                 VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                                     VMA_ALLOCATION_CREATE_MAPPED_BIT);
+        }
+    }
+
+    void update_globals(size_t slot, VkExtent2D extent) {
+        const Globals globals{
+            .view = camera_.view(),
+            .projection = build_projection(extent),
+            .view_position = glm::vec4(camera_.position, 1.0F),
+            .key_direction = glm::vec4(glm::normalize(kKeyDirection), 0.0F),
+            .key_colour = glm::vec4(kKeyColour, 1.0F),
+            .fill_direction = glm::vec4(glm::normalize(kFillDirection), 0.0F),
+            .fill_colour = glm::vec4(kFillColour, 1.0F),
+            .ambient = glm::vec4(kAmbient, kShininess),
+        };
+        std::memcpy(uniform_buffers_[slot].mapped(), &globals, sizeof(globals));
+    }
+```
+
+The directions are normalised here rather than in the shader, so the fragment shader gets unit
+vectors and does not pay for a `normalize` per pixel. `w = 0.0F` on both directions marks them
+as directions rather than points, the distinction 1.12 drew.
+
+## Descriptors
+
+One uniform buffer, visible to both stages, one set per frame in flight. This is 1.10's code
+with nothing added:
+
+```cpp title="code/src/3.model_loading/assimp/main.cpp"
+    void create_descriptors() {
+        const VkDevice device = context().device();
+
+        const VkDescriptorSetLayoutBinding binding{
+            .binding = 0,
+            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+            .pImmutableSamplers = nullptr,
+        };
+        const VkDescriptorSetLayoutCreateInfo layout_info{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .bindingCount = 1,
+            .pBindings = &binding,
+        };
+        VK_CHECK(vkCreateDescriptorSetLayout(device, &layout_info, nullptr,
+                                             &frame_set_layout_));
+```
+
+The pool is sized from the layout: one uniform-buffer descriptor per set, two sets.
+
+```cpp title="code/src/3.model_loading/assimp/main.cpp"
+        const VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                                             vkc::kFramesInFlight};
+        const VkDescriptorPoolCreateInfo pool_info{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .maxSets = vkc::kFramesInFlight,
+            .poolSizeCount = 1,
+            .pPoolSizes = &pool_size,
+        };
+        VK_CHECK(vkCreateDescriptorPool(device, &pool_info, nullptr, &descriptor_pool_));
+```
+
+Allocating both sets takes an array of layouts, one per set, and they are the same layout
+twice:
+
+```cpp title="code/src/3.model_loading/assimp/main.cpp"
+        const std::array<VkDescriptorSetLayout, vkc::kFramesInFlight> layouts{
+            frame_set_layout_, frame_set_layout_};
+        const VkDescriptorSetAllocateInfo alloc{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .pNext = nullptr,
+            .descriptorPool = descriptor_pool_,
+            .descriptorSetCount = vkc::kFramesInFlight,
+            .pSetLayouts = layouts.data(),
+        };
+        VK_CHECK(vkAllocateDescriptorSets(device, &alloc, frame_sets_.data()));
+```
+
+And each set is pointed at its own buffer, once, at start-up:
+
+```cpp title="code/src/3.model_loading/assimp/main.cpp"
+        for (size_t i = 0; i < vkc::kFramesInFlight; ++i) {
+            const VkDescriptorBufferInfo buffer_info{
+                .buffer = uniform_buffers_[i].handle(),
+                .offset = 0,
+                .range = sizeof(Globals),
+            };
+            const VkWriteDescriptorSet write{
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .pNext = nullptr,
+                .dstSet = frame_sets_[i],
+                .dstBinding = 0,
+                .dstArrayElement = 0,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                .pImageInfo = nullptr,
+                .pBufferInfo = &buffer_info,
+                .pTexelBufferView = nullptr,
+            };
+            vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+        }
+    }
+```
+
+## The pipeline
+
+```cpp title="code/src/3.model_loading/assimp/main.cpp"
+    void create_pipeline() {
+        const VkDevice device = context().device();
+
+        const VkVertexInputBindingDescription binding{
+            .binding = 0,
+            .stride = sizeof(Vertex),
+            .inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
+        };
+
+        const std::array<VkVertexInputAttributeDescription, 2> attributes{{
+            {
+                .location = 0,
+                .binding = 0,
+                .format = VK_FORMAT_R32G32B32_SFLOAT,
+                .offset = offsetof(Vertex, position),
+            },
+            {
+                .location = 1,
+                .binding = 0,
+                .format = VK_FORMAT_R32G32B32_SFLOAT,
+                .offset = offsetof(Vertex, normal),
+            },
+        }};
+```
+
+**Two attributes, three fields.** The loader fills `uv` in and nothing samples it yet, so the
+stride counts it — the stride is what the buffer holds — and the pipeline does not mention it.
+Describing it anyway is not free; add a third attribute and the validation layers say so at
+pipeline creation:
 
 ```
 vkCreateGraphicsPipelines(): pCreateInfos[0].pVertexInputState
@@ -233,13 +897,221 @@ Which is a warning rather than an error: the pipeline is created and the model s
 It is worth keeping clean anyway, because it is the same check that catches the genuinely
 broken case — a shader input with no attribute feeding it. 3.2 turns `uv` on properly.
 
-:::note[Nothing new in `vkcommon`]
-Part 3's first chapter adds no shared code. Model loading does not enter `vkcommon` yet
-because the thing worth sharing is not the `Assimp::Importer` call — it is the `Mesh` and
-`Model` types that 3.2 and 3.3 build, and those chapters write them out in full first.
-:::
+The layout and the build are unchanged from 2.6 except for the shader name:
+
+```cpp title="code/src/3.model_loading/assimp/main.cpp"
+        const VkPushConstantRange push_range{
+            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+            .offset = 0,
+            .size = sizeof(PushConstants),
+        };
+
+        const VkPipelineLayoutCreateInfo layout_info{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .setLayoutCount = 1,
+            .pSetLayouts = &frame_set_layout_,
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &push_range,
+        };
+        VK_CHECK(vkCreatePipelineLayout(device, &layout_info, nullptr, &pipeline_layout_));
+
+        const VkShaderModule shader =
+            vkc::load_shader(device, LVK_CHAPTER_ID, "model.slang");
+
+        pipeline_ = vkc::PipelineBuilder(device)
+                        .shaders(shader, "vertexMain", "fragmentMain")
+                        .vertex_input(std::span(&binding, 1), attributes)
+                        .cull(VK_CULL_MODE_BACK_BIT, VK_FRONT_FACE_COUNTER_CLOCKWISE)
+                        .depth(depth_format_, /*test=*/true, /*write=*/true,
+                               VK_COMPARE_OP_LESS)
+                        .colour_attachment(swapchain().format())
+                        .layout(pipeline_layout_)
+                        .build();
+
+        vkDestroyShaderModule(device, shader, nullptr);
+
+        context().name(pipeline_, VK_OBJECT_TYPE_PIPELINE, "model pipeline");
+    }
+```
+
+`VK_FRONT_FACE_COUNTER_CLOCKWISE` is the same convention the cross product used above, and now
+it is load-bearing: the model's triangles were wound by an exporter this project has never
+seen, and it happens to agree. Get it wrong on a closed shape like a helmet and you see the
+inside of the far side — 1.13 has the picture.
+
+The members:
+
+```cpp title="code/src/3.model_loading/assimp/main.cpp"
+    vkc::Camera camera_;
+
+    vkc::Buffer vertex_buffer_;
+    vkc::Buffer index_buffer_;
+    uint32_t index_count_ = 0;
+    glm::mat4 model_matrix_{1.0F};
+
+    VkFormat depth_format_ = VK_FORMAT_UNDEFINED;
+    vkc::Image depth_;
+
+    std::array<vkc::Buffer, vkc::kFramesInFlight> uniform_buffers_;
+    std::array<VkDescriptorSet, vkc::kFramesInFlight> frame_sets_{};
+
+    VkDescriptorSetLayout frame_set_layout_ = VK_NULL_HANDLE;
+    VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
+
+    VkPipelineLayout pipeline_layout_ = VK_NULL_HANDLE;
+    VkPipeline pipeline_ = VK_NULL_HANDLE;
+};
+```
+
+`index_count_` is a member because the draw call needs it every frame and `ModelData` is gone
+by then.
+
+And `main`:
+
+```cpp title="code/src/3.model_loading/assimp/main.cpp"
+int main(int argc, char** argv) {
+    try {
+        vkc::App::Options options{};
+        options.title = "LearnVulkan 3.1 - Assimp";
+        AssimpApp app(vkc::App::parse_args(argc, argv, options));
+        return app.run();
+    } catch (const std::exception& error) {
+        spdlog::error("{}", error.what());
+        return EXIT_FAILURE;
+    }
+}
+```
+
+The `try` block is what turns `load_model`'s `throw` into the printed message rather than a
+`std::terminate`, which is the whole reason the loader throws instead of returning an empty
+model.
+
+## The shader
+
+`model.slang` has nothing new in it, and that is deliberate — the chapter's subject is where
+the vertices came from. It is Part 2's Phong shading cut down to the smallest thing that shows
+a shape clearly.
+
+The inputs are position and normal only, matching the two attributes:
+
+```hlsl title="code/src/3.model_loading/assimp/model.slang"
+struct VSInput {
+    [[vk::location(0)]] float3 position;
+    [[vk::location(1)]] float3 normal;
+};
+
+struct VSOutput {
+    float4 position : SV_Position;
+    [[vk::location(0)]] float3 world_position;
+    [[vk::location(1)]] float3 normal;
+};
+```
+
+The uniform block mirrors the C++ one field for field:
+
+```hlsl title="code/src/3.model_loading/assimp/model.slang"
+struct Globals {
+    float4x4 view;
+    float4x4 projection;
+    float4 view_position;
+
+    float4 key_direction;
+    float4 key_colour;
+    float4 fill_direction;
+    float4 fill_colour;
+
+    float4 ambient;
+};
+[[vk::binding(0, 0)]] ConstantBuffer<Globals> globals;
+
+struct PushConstants {
+    float4x4 model;
+    float3x3 normal_matrix;
+    float4 colour;
+};
+[[vk::push_constant]] PushConstants push;
+```
+
+2.2's diffuse and specular terms, factored into a function because two lights now call it:
+
+```hlsl title="code/src/3.model_loading/assimp/model.slang"
+float3 contribution(float3 to_light, float3 light_colour, float3 normal, float3 to_eye,
+                    float3 albedo, float shininess) {
+    float diffuse_amount = max(dot(normal, to_light), 0.0);
+    float3 diffuse = light_colour * diffuse_amount * albedo;
+
+    float3 reflected = reflect(-to_light, normal);
+    float specular_amount = pow(max(dot(to_eye, reflected), 0.0), shininess);
+    float3 specular = light_colour * specular_amount;
+
+    return diffuse + specular;
+}
+```
+
+`max(dot(normal, to_light), 0.0)` is Lambert's cosine law from 2.2, clamped so that a surface
+facing away from the light contributes nothing rather than a negative amount. `reflect` is the
+`d − 2(d·n)n` from the same chapter, built into Slang.
+
+The vertex stage transforms the position twice — once into world space for the lighting, once
+all the way to clip space — and pushes the normal through the normal matrix:
+
+```hlsl title="code/src/3.model_loading/assimp/model.slang"
+[shader("vertex")]
+VSOutput vertexMain(VSInput input) {
+    VSOutput output;
+    float4 world = mul(push.model, float4(input.position, 1.0));
+    output.world_position = world.xyz;
+    output.position = mul(globals.projection, mul(globals.view, world));
+    output.normal = mul(push.normal_matrix, input.normal);
+    return output;
+}
+```
+
+And the fragment stage sums ambient, key and fill:
+
+```hlsl title="code/src/3.model_loading/assimp/model.slang"
+[shader("fragment")]
+float4 fragmentMain(VSOutput input) : SV_Target {
+    float3 normal = normalize(input.normal);
+    float3 to_eye = normalize(globals.view_position.xyz - input.world_position);
+    float3 albedo = push.colour.rgb;
+    float shininess = globals.ambient.w;
+
+    float3 colour = globals.ambient.rgb * albedo;
+    colour += contribution(normalize(-globals.key_direction.xyz), globals.key_colour.rgb,
+                           normal, to_eye, albedo, shininess);
+    colour += contribution(normalize(-globals.fill_direction.xyz), globals.fill_colour.rgb,
+                           normal, to_eye, albedo, shininess);
+
+    return float4(colour, 1.0);
+}
+```
+
+That `normalize(input.normal)` is not optional. The vertex normals were unit length when they
+left the vertex shader, and the rasteriser interpolates them linearly across the triangle —
+which does not preserve length. A linear blend of two unit vectors is shorter than one
+wherever they disagree, so without the renormalise the surface darkens exactly where it curves
+most.
+
+Which is also, from the other direction, the reason this mesh looks smooth at all. It is
+15 452 flat triangles. The only thing turning them into a curved shell is that the file shipped
+a normal per vertex and the rasteriser blends them across each face.
 
 ## Building it
+
+```cmake title="code/src/3.model_loading/assimp/CMakeLists.txt"
+add_chapter(3.1.assimp
+    SOURCES main.cpp
+    SHADERS model.slang
+    LIBS assimp::assimp
+)
+```
+
+`LIBS` is a parameter no chapter has needed before: every dependency so far was one every
+chapter uses, so `add_chapter` linked it unconditionally. Assimp is the first that belongs to
+one part, and `LIBS` is how a chapter asks for something extra.
 
 Assimp is by a wide margin the largest thing this project links: 193 MB of static library
 in a debug build, and it brings zlib, minizip, pugixml, rapidjson and a pair of
@@ -276,12 +1148,18 @@ translation units that actually read an image file — `vkcommon`'s `image.cpp` 
 #include <stb_image.h>
 ```
 
-A private copy cannot collide with anybody's. `stb_image_write` stays shared in
+A copy with internal linkage cannot collide with anybody's. `stb_image_write` stays shared in
 `stb_impl.cpp`, because nothing else exports `stbi_write_*`.
 
 It is worth knowing this shape in general: a static library that vendors a common
 header-only dependency will export its symbols unless its authors hid them, and the collision
 surfaces at link time in whatever unlucky target happens to use both.
+:::
+
+:::note[Nothing new in `vkcommon`]
+Part 3's first chapter adds no shared code. Model loading does not enter `vkcommon` yet
+because the thing worth sharing is not the `Assimp::Importer` call — it is the `Mesh` and
+`Model` types that 3.2 and 3.3 build, and those chapters write them out in full first.
 :::
 
 ## Running it
@@ -294,8 +1172,23 @@ python3 tools/bootstrap.py          # once, to fetch the model
 A grey helmet, lit by a key and a fill. Right-click to capture the mouse, `WASD` to fly.
 
 Fly close and look along a curved surface. Those are interpolated vertex normals doing the
-work — the mesh is 15 452 flat triangles, and the only reason it reads as a smooth shell is
-that the file shipped a normal per vertex and the rasteriser blends them across each face.
+work.
+
+## Words introduced in this chapter
+
+| | |
+|---|---|
+| **importer** | the object that reads a file and owns the `aiScene` it produced — when it dies, so does the scene |
+| **post-processing pass** | a real transformation of the loaded data, not an option: triangulating, deduplicating, generating normals |
+| **triangulation** | turning quads and n-gons into triangles, because triangles are all the pipeline consumes |
+| **face normal** | the perpendicular of one triangle, `(b−a) × (c−a)`, whose direction comes from the winding and whose length is twice the area |
+| **vertex normal** | one normal per vertex, averaged from the faces meeting there, so that flat triangles shade as a curved surface |
+| **winding order** | the order a triangle's corners are listed in, which decides which side is the front and which way the normal points |
+| **area weighting** | letting each face influence a vertex normal in proportion to its area — free if you sum cross products before normalising, and not what Assimp does |
+| **smoothing angle** | the limit past which two faces are treated as a hard edge instead of averaged together |
+| **vertex deduplication** | collapsing identical vertices so a shared corner is stored once and referenced many times |
+| **axis-aligned bounding box** | the smallest box with faces parallel to the axes containing every vertex; two corners describe it |
+| **post-transform cache** | the GPU's small cache of already-transformed vertices, which rewards index buffers whose neighbours are neighbours on the surface |
 
 ## What changed since 2.6
 
@@ -317,18 +1210,25 @@ that the file shipped a normal per vertex and the rasteriser blends them across 
    file that declares one, and the extra is Assimp's default. Work out which meshes reference
    it here.
 3. Point the loader at `assets/models/flight_helmet/FlightHelmet.gltf`, which `bootstrap.py`
-   has already fetched. It has six meshes and six materials, and this chapter's loader
+   has already fetched. It has six meshes and seven materials, and this chapter's loader
    concatenates them into one buffer and paints the lot in a single grey. It renders — and it
    is exactly the wrong answer, which is what 3.2 exists to fix.
 4. Swap `VK_INDEX_TYPE_UINT32` back to `UINT16` without changing the buffer's contents.
    Predict what you will see before you run it: the model has 14 354 vertices, so its indices
    *would* fit in 16 bits, but the bytes in the buffer are 32-bit values. Then explain the
    shape on screen.
-5. Time the `ReadFile` call with `std::chrono` and print the milliseconds, then run again
+5. Reproduce the deduplication table above: print `mNumVertices` with and without
+   `aiProcess_JoinIdenticalVertices`. You should get 14 354 and 14 556. Then do the same for an
+   `.obj` export of any model and watch the saving turn from 1.4% into something worth having.
+6. Compute the face normals yourself: loop the faces, take `(b−a) × (c−a)`, normalise, and
+   compare with the average of the three shipped vertex normals using a dot product. All
+   15 452 should be positive. Then swap the arguments of the cross product and watch every
+   single one flip sign — that is winding order, in one line.
+7. Time the `ReadFile` call with `std::chrono` and print the milliseconds, then run again
    without `aiProcess_ImproveCacheLocality` and `aiProcess_JoinIdenticalVertices`. Loading is
    not free, and knowing which flags cost what is the difference between a two-second startup
    and a twenty-second one on a real scene.
-6. Feed it a file that does not exist, and one that is not a model at all — rename a `.png` to
+8. Feed it a file that does not exist, and one that is not a model at all — rename a `.png` to
    `.glb`. Both should produce the loader's own message rather than a crash or a blank window.
 
 Next: 3.2, where a mesh stops being a pile of vertices and becomes an object that owns its

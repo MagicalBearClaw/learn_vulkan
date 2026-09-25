@@ -1,0 +1,246 @@
+---
+title: Review
+description: What Part 3 built, the load path in one place, the maths a tree walk needs, every layout rule Part 3 hit, and the six things Part 3 did badly on purpose.
+sidebar:
+  order: 5
+---
+
+Part 2 ended with a lit cube: 24 vertices typed into a C++ array, six lights, and one texture this
+project drew itself. Part 3 threw the array away.
+
+That is the honest summary, and it has an odd shape: **almost nothing in Part 3 is Vulkan.** The
+four chapters introduce no new Vulkan type and no new Vulkan function — every `Vk*` name they use
+was taught in Part 1 or Part 2. What they introduce is a third-party library, a tree walk, and one
+change of mind about where data lives.
+
+This chapter has no new code.
+
+## What you built
+
+| Chapter | Added |
+|---|---|
+| 3.1 | Assimp; post-processing flags; vertices from a file; `UINT32` indices; a bounding box |
+| 3.2 | `Mesh` and `Material` as types; embedded textures decoded from memory; a second descriptor set; a pool sized from the model |
+| 3.3 | The node tree walked instead of baked; a `Draw` list; world bounds from local ones; a `--model` flag |
+| 3.4 | Bindless: one texture array, one material buffer, a material index, and a draw loop that binds nothing |
+
+## The load path, assembled
+
+Every chapter added one stage to the same pipeline. Here it is end to end:
+
+```
+   DamagedHelmet.glb  /  FlightHelmet.gltf
+            │
+            ▼
+   Assimp::Importer::ReadFile(path, kImportFlags)          ── 3.1
+            │   Triangulate · GenSmoothNormals
+            │   JoinIdenticalVertices · ImproveCacheLocality
+            ▼
+         aiScene
+            ├── mMeshes[]     ──▶  Mesh  { vertex buffer, index buffer, material } ── 3.2
+            ├── mMaterials[]  ──▶  MaterialGpu { factor, texture index }           ── 3.4
+            │                         │
+            │                         └─▶ texture cache ──▶ textures[]             ── 3.4
+            │                                 (path → slot)
+            ├── mTextures[]   ──▶  stbi_load_from_memory ──▶ vkc::create_texture   ── 3.2
+            │
+            └── mRootNode     ──▶  collect_draws()  ──▶  Draw { mesh, transform }  ── 3.3
+                                        │
+                                        └─▶ world bounds ──▶ camera framing
+                                                                   │
+                                                                   ▼
+                                                      one draw call per Draw
+```
+
+3.1 built the top half and flattened the bottom. 3.2 split the meshes. 3.3 restored the tree. 3.4
+collapsed the materials into two arrays. Nothing was undone along the way — each chapter kept what
+the last one had.
+
+## The maths Part 3 added
+
+Four results, each derived where it was first needed.
+
+**The face normal is a cross product** (3.1). For a triangle `a, b, c`, `n = (b−a) × (c−a)` is
+perpendicular to both edges and therefore to the plane. Its *direction* comes from the winding
+order by the right-hand rule, which is the same question `VK_FRONT_FACE_COUNTER_CLOCKWISE` answers.
+Its *length* is twice the triangle's area, because `|e₁ × e₂| = |e₁||e₂| sin θ` and the triangle's
+area is half that.
+
+That second fact gives area weighting for free — sum the raw cross products at a shared vertex and
+each face has influence proportional to its size. Assimp normalises first and throws it away, and
+measured on the helmet the two answers differ by up to 16.36°, with the *unweighted* one closer to
+what the exporter wrote. Elegant geometry is not automatically the right answer for matching a
+given tool.
+
+**Transforms compose right to left** (3.3). With column vectors, `p'' = A(Bp) = (AB)p`, so the
+matrix nearest the vector acts first and a node's world transform is the product from the root
+down, parent on the left. A tree one level deep hides every mistake here, which is why both of this
+part's models hide it.
+
+**The normal matrix composes in the same order** (3.3). From `(AB)⁻¹ = B⁻¹A⁻¹` and `(XY)ᵀ = YᵀXᵀ`,
+the two reversals cancel:
+
+```
+   G(A B)  =  ((A B)⁻¹)ᵀ  =  (B⁻¹ A⁻¹)ᵀ  =  (A⁻¹)ᵀ (B⁻¹)ᵀ  =  G(A) G(B)
+```
+
+So a hierarchy needs no special handling for normals: 2.2's `G = (M⁻¹)ᵀ` survives being applied to
+a product.
+
+**A bounding box does not transform by its corners alone** (3.3). Moving `min` and `max` and taking
+the box around them leaves six corners unaccounted for and produces a box that is too *small* —
+measured at 10% to 36% of the true volume across six random transforms, which is the dangerous
+direction for culling. The eight-corner answer is always right; the closed form
+
+```
+   c' = A c + t            e' = |A| · e
+```
+
+is exactly equal to it and costs three multiplies per axis instead of eight transformed points.
+
+**And one convention, not maths but the same kind of trap** (3.2): `v → 1 − v` is a reflection
+about the atlas's midline, not about each island's own. Flipping a texture atlas does not turn the
+picture upside down; it moves every island somewhere else, and the render looks fine.
+
+## The Vulkan lesson: an index is cheaper than a bind
+
+Part 2's lesson was *where data lives*. Part 3's is the sharper version: **how a shader reaches
+data changes what the CPU has to do every frame.**
+
+Follow one thing — the base colour texture — across the four chapters:
+
+| | How the shader finds it | Binds per frame | Pool grows with |
+|---|---|---|---|
+| 3.1 | it does not; albedo is a push constant | 1 | nothing |
+| 3.2 | bound descriptor, set 1 | 1 + one per mesh | material count |
+| 3.3 | bound descriptor, set 1 | 1 + one per draw | material count |
+| 3.4 | `base_colour_maps[material.texture]` | 1, for the whole frame | nothing |
+
+Six draws makes the difference invisible. The point is the *slope*: 3.3's cost is `O(draws)` and
+3.4's is `O(1)`, and a scene is where that stops being a detail. 3.4's picture is byte-identical to
+3.3's, which is the only way to be sure the change was free.
+
+The step after it is the one Part 9 takes. Once a draw is described entirely by numbers in
+buffers — which material, which transform — rather than by binds, the CPU no longer has to issue
+the draws at all. That is `vkCmdDrawIndexedIndirect`, and 3.4 is what makes it reachable.
+
+## Every layout rule Part 3 hit
+
+Part 2 spent six chapters on std140. Part 3 met its looser sibling, and the difference is exactly
+one rule wide.
+
+| | std140 (uniform buffer) | std430 (storage buffer) |
+|---|---|---|
+| scalar | its own size | same |
+| `float2` | 8 | same |
+| `float3` / `float4` | **16** | **16** |
+| struct / array element | rounded up to **16** | rounded up to the largest member's alignment |
+| matrix stride | 16 per column | same |
+
+Only the fourth row differs. Everything Part 2 taught still applies — most importantly the third
+row, which is what broke 3.4:
+
+```
+   uint texture;   // 16
+   uint3 pad;      // NOT 20 — a 3-vector aligns to 16, so this lands at 32
+```
+
+48 bytes in the shader against 32 in C++, no warning from anything, and every material after the
+first reading from the wrong place. The defences this series uses are both cheap: offsets written
+as comments on both sides, and `static_assert` on the side a compiler can see.
+
+Part 3's other size facts, all checked rather than assumed:
+
+- `PushConstants` went 128 → 116 bytes when `vec4 colour` became `uint material`
+- `Globals` stayed 224 bytes through all four chapters, unchanged since 2.6
+- `float3x3` is still 48 bytes and still travels as three `vec4`, which is why `normal_matrix_of`
+  exists
+
+## What is in `vkcommon` now
+
+**Nothing new, for the second part running.**
+
+That deserves stating plainly, because it is the second time this series has gone a whole part
+without adding to its shared library, and it is not an accident. Every file in `code/common/` is
+owned by a chapter in Part 1. Part 2 added no line to it; Part 3 added no line to it.
+
+One thing did *move* inside it, in 3.2: `vkc::create_texture` was split out of 1.11's
+`vkc::load_texture` at the seam between "decode a file" and "upload pixels", so a caller holding
+already-decoded pixels — which is what an embedded JPEG gives you — need not write them to disk
+first. `load_texture` still exists and is now visibly a decode followed by `create_texture`. No new
+concept entered; a reader who has done 1.11 has already seen every line.
+
+And one feature bit gets its first real use here rather than its first appearance:
+`features12.runtimeDescriptorArray`, enabled in `Context::create_device()` by chapter 1.3 and
+explained there, is what 3.4's unbounded `Sampler2D base_colour_maps[]` requires. The vkcommon
+rule has still not been broken: nothing entered the shared library before the chapter that
+explained it.
+
+## Things Part 3 did badly on purpose
+
+Every one of these is a later chapter, or an honest limit.
+
+**Nothing is culled.** Every draw goes to the GPU every frame whether or not it is on screen. The
+world bounds exist and are used only to place a camera. Part 8 is frustum culling, and it is the
+first thing that asks the bounding boxes to do real work.
+
+**The shading model is wrong for these models.** Both are physically-based: they describe surfaces
+with roughness and metalness, and they ship metallic-roughness, normal, occlusion and emissive
+maps. Part 3 reads the base colour and ignores four textures out of five, then lights the result
+with Phong and a `kSpecularStrength = 0.25` chosen by eye because `AI_MATKEY_SHININESS` reads back
+as `0.0`. That is Part 6.
+
+**Normals are still per-vertex.** The normal maps are sitting in the file, unread. 5.5.
+
+**Loading is synchronous and single-threaded.** `on_start` blocks while Assimp parses and every
+texture is decoded and uploaded one at a time; FlightHelmet's six PNGs take most of a second. A
+real loader decodes in parallel and uploads on a transfer queue.
+
+**One pipeline for everything.** Every material has the same descriptor layout — which is why the
+white fallback texture exists — and nothing is transparent, double-sided or alpha-tested. A glTF
+material can ask for all three. 4.2 is where blending and culling state becomes something a
+material chooses.
+
+**The texture cache keys on a path string.** Two identical images under different names are still
+loaded twice, and the real answer is a content hash. For one exporter's output the path is enough;
+for a scene assembled from several it is not.
+
+## Where Part 4 goes
+
+Part 3 was a part about data: where it comes from, how it is shaped, how a shader reaches it. The
+Vulkan surface barely moved — no new object types, no new functions, one feature bit.
+
+Part 4 goes back to the pipeline and takes apart the fixed-function state that every chapter so far
+has set once and never questioned.
+
+**4.1 depth & stencil** — the depth test has been on since 1.13 with `VK_COMPARE_OP_LESS` and no
+discussion. This is the compare ops, depth bias, and the stencil buffer, which no chapter has
+touched at all.
+
+**4.2 blending & culling** — `VK_CULL_MODE_BACK_BIT` and no blending, through twenty-three
+chapters. Transparency, the order it has to be drawn in, and why a two-sided leaf needs culling
+turned off.
+
+**4.3 offscreen rendering** — every chapter so far has rendered into the swapchain image. Render
+into an image of your own instead, and then sample it: the foundation of shadow maps, post
+processing, and most of what a modern frame actually does.
+
+**4.4 cubemaps** — six faces as one image, and the skybox that finally puts something behind the
+model.
+
+**4.5 buffer device address** — a buffer reached by a 64-bit pointer rather than a descriptor,
+which is the other half of the story 3.4 started. `features12.bufferDeviceAddress` has been on
+since 1.3 waiting for it.
+
+Before moving on, one thing worth doing:
+
+```bash
+diff code/src/3.model_loading/model/main.cpp \
+     code/src/3.model_loading/bindless_materials/main.cpp
+```
+
+The picture is identical and roughly a hundred lines are different. That is Part 3's lesson in a
+single diff: the image is not what changed, the renderer is.
+
+Then: chapter 4.1, and the pipeline state you have been setting without being asked to think
+about it.

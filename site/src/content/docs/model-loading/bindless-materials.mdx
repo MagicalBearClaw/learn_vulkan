@@ -1,6 +1,6 @@
 ---
 title: Bindless Materials
-description: A material stops being a descriptor set to bind and becomes an integer to look up. One texture array, one material buffer, and a draw loop that binds nothing at all.
+description: A material stops being a descriptor set to bind and becomes an integer to look up. One texture array, one material buffer, a draw loop that binds nothing at all, and the std430 rule that makes it go wrong silently.
 sidebar:
   order: 4
 ---
@@ -38,58 +38,62 @@ anything, and guesses high.
 
 ## A material becomes an integer
 
-The alternative: put every texture the model uses into **one array**, put every material's
-parameters into **one buffer**, and let a draw name its material with a single number.
+The alternative is **bindless**: resources stop being bound one at a time and are instead reached
+by index out of one large, permanently-bound collection. Put every texture the model uses into a
+**texture array**, put every material's parameters into one **storage buffer**, and let a draw name
+its material with a single number — its **material index**.
+
+A storage buffer is the second kind of buffer a shader can read. 1.10 introduced the uniform
+buffer: small, fast, and limited — the guaranteed minimum is 16 KB. A storage buffer has no such
+ceiling in practice, can be read as an array of arbitrary length, and follows the looser **std430**
+layout rules rather than std140. A table of materials is exactly what it is for.
 
 Set 1 stops being per-material and becomes per-*model*, with two bindings:
 
 ```cpp title="code/src/3.model_loading/bindless_materials/main.cpp"
-const std::array<VkDescriptorSetLayoutBinding, 2> bindless_bindings{{
-    {
-        .binding = 0,
-        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        .descriptorCount = 1,
-        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
-        .pImmutableSamplers = nullptr,
-    },
-    {
-        .binding = 1,
-        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-        .descriptorCount = texture_count,
-        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
-        .pImmutableSamplers = nullptr,
-    },
-}};
+        const std::array<VkDescriptorSetLayoutBinding, 2> bindless_bindings{{
+            {
+                .binding = 0,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .descriptorCount = 1,
+                .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+                .pImmutableSamplers = nullptr,
+            },
+            {
+                .binding = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .descriptorCount = texture_count,
+                .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+                .pImmutableSamplers = nullptr,
+            },
+        }};
 ```
 
-`descriptorCount` on binding 1 is where the array's length is decided — which is why the layout
-still cannot be built until the model has been read. What changed is that the count now sizes *one
-binding* rather than deciding how many sets exist.
+`VK_DESCRIPTOR_TYPE_STORAGE_BUFFER` is the descriptor type matching that buffer, and
+`descriptorCount` on binding 1 is the line that matters: it is not 1, it is however many textures
+the model turned out to have. **That is the array's length**, decided here, which is why the layout
+cannot be built until the file has been read:
 
-On the shader side the array is declared with no length at all:
-
-```hlsl title="code/src/3.model_loading/bindless_materials/bindless_materials.slang"
-[[vk::binding(0, 1)]] StructuredBuffer<Material> materials;
-[[vk::binding(1, 1)]] Sampler2D base_colour_maps[];
+```cpp title="code/src/3.model_loading/bindless_materials/main.cpp"
+        const auto texture_count = static_cast<uint32_t>(model_.textures.size());
 ```
 
-and the fragment shader takes two steps instead of none:
-
-```hlsl title="code/src/3.model_loading/bindless_materials/bindless_materials.slang"
-Material material = materials[push.material];
-
-float3 albedo = base_colour_maps[material.texture].Sample(input.uv).rgb *
-                material.base_colour_factor.rgb;
+```cpp title="code/src/3.model_loading/bindless_materials/main.cpp"
+        const VkDescriptorSetLayoutCreateInfo bindless_layout_info{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .bindingCount = static_cast<uint32_t>(bindless_bindings.size()),
+            .pBindings = bindless_bindings.data(),
+        };
+        VK_CHECK(vkCreateDescriptorSetLayout(device, &bindless_layout_info, nullptr,
+                                             &bindless_set_layout_));
 ```
-
-Both indices are the same for every fragment in the draw — they come from a push constant, which
-cannot vary within a draw — so this is a **dynamically uniform** index and needs no
-`NonUniformResourceIndex()` wrapper. A renderer that packed several materials into a single draw
-would need one, and the validation layers would say so.
 
 ## `descriptorIndexing` is a headline, not a switch
 
-Chapter 1.4 enabled this, and said it was for "bindless textures, used from part 3":
+Reaching a descriptor by a value computed in the shader is **descriptor indexing**, and chapter
+1.3 enabled what looks like the feature for it:
 
 ```cpp
 features12.descriptorIndexing = VK_TRUE;
@@ -109,17 +113,23 @@ Note *where* that arrives. Not at the draw, not at pipeline creation — at `vkC
 the moment the SPIR-V is handed over, because the capability is declared in the module itself.
 That is about as early and as specific as a Vulkan error gets.
 
-:::note[What moved into vkcommon]
-One line, in `Context::create_device()`:
+The capability it wants is the **runtime descriptor array**: an array of descriptors whose length
+the shader does not state. Chapter 1.3 turns it on, one line below the headline, and explains it
+there:
 
-```cpp title="code/common/scaffold/src/context.cpp"
+```cpp title="code/common/scaffold/src/device.cpp"
 features12.runtimeDescriptorArray = VK_TRUE;
 ```
 
-It is the only feature this chapter needs. `shaderSampledImageArrayNonUniformIndexing`,
-`descriptorBindingPartiallyBound` and `descriptorBindingVariableDescriptorCount` are the other
-three you will meet in bindless code, and none of them is required here: the index is dynamically
-uniform, every array slot is written, and the length is known before the layout is built.
+:::note[Nothing new in `vkcommon`]
+This chapter adds no shared code. `runtimeDescriptorArray` is already on because 1.3 turned it
+on — it is the one feature in `Context::create_device()` that exists purely for a chapter in
+Part 3, and 1.3's article says so at the point it is written.
+
+`shaderSampledImageArrayNonUniformIndexing`, `descriptorBindingPartiallyBound` and
+`descriptorBindingVariableDescriptorCount` are the other three you will meet in bindless code, and
+none of them is required here: the index is dynamically uniform, every array slot is written, and
+the length is known before the layout is built.
 :::
 
 ## Two indices, not one
@@ -134,6 +144,22 @@ struct MaterialGpu {
     uint32_t pad1 = 0;                   // 24
     uint32_t pad2 = 0;                   // 28
 };
+```
+
+So a fragment takes two hops to reach its colour. That double **indirection** is the shape of the
+whole chapter:
+
+```
+   draw                     material buffer                texture array
+   ┌───────────────┐        ┌──────────────────────┐       ┌───────────┐
+   │ push.material │───────▶│ 0  factor, texture 0 │       │ 0  wood   │◀─┐
+   │      = 3      │   │    │ 1  factor, texture 0 │──────▶│ 1  glass  │  │
+   └───────────────┘   │    │ 2  factor, texture 1 │       │ 2  metal  │  │
+                       └───▶│ 3  factor, texture 2 │───────│ 3  leather│  │
+                            │ …                    │       │ …         │  │
+                            └──────────────────────┘       └───────────┘  │
+                              one storage buffer             one array    │
+                              materials 0 and 1 share texture 0 ──────────┘
 ```
 
 It would be simpler for material *i* to use texture *i*, and it would be wrong, because materials
@@ -154,11 +180,148 @@ FlightHelmet.gltf: 6 mesh(es), 7 material(s), 0 embedded texture(s)
 `HoseMat` and `RubberWoodMat` are different materials sharing one image. 3.2 and 3.3 uploaded it
 twice and nothing noticed, because each material owned a descriptor set to put its own copy in.
 With a single shared array the duplicate becomes visible: it is another 4 MB sitting at another
-index for no reason. A one-line cache keyed on the texture's path removes it, and seven materials
-resolve to six images.
+index for no reason.
 
-Six instead of seven is a modest saving on a model this size. On a scene where forty materials are
-variations on the same four atlases it is not.
+## The texture cache
+
+A **texture cache** — a map from the path Assimp reports to the array slot already holding it —
+removes the duplicate, and seven materials resolve to six images:
+
+```cpp title="code/src/3.model_loading/bindless_materials/main.cpp"
+#include <unordered_map>
+```
+
+The decode is 3.2's, split out of the material loop so that the cache can sit in front of it:
+
+```cpp title="code/src/3.model_loading/bindless_materials/main.cpp"
+[[nodiscard]] vkc::Image decode_texture(vkc::Context& context, const aiScene* scene,
+                                        const aiString& texture_path,
+                                        const std::filesystem::path& model_path) {
+```
+
+Everything inside it — the embedded-or-file branch, the `mHeight != 0` refusal, the
+`stbi_load_from_memory` call and the `vkc::create_texture` upload — is 3.2's `load_base_colour`
+verbatim, minus the lookup that now happens above it.
+
+And the lookup itself:
+
+```cpp title="code/src/3.model_loading/bindless_materials/main.cpp"
+[[nodiscard]] uint32_t texture_index(vkc::Context& context, const aiScene* scene,
+                                     const aiMaterial* material,
+                                     const std::filesystem::path& model_path,
+                                     std::unordered_map<std::string, uint32_t>& cache,
+                                     std::vector<vkc::Image>& textures) {
+    aiString texture_path;
+    const std::string key =
+        material->GetTexture(aiTextureType_BASE_COLOR, 0, &texture_path) == AI_SUCCESS
+            ? texture_path.C_Str()
+            : std::string{};
+```
+
+The empty string is a real key, not a sentinel for "missing". A material with no base colour map
+maps to the empty key, which resolves to the white fallback texel — so it costs one array slot the
+first time and none after that, and the whole "does this material have a texture" question
+disappears into the cache.
+
+```cpp title="code/src/3.model_loading/bindless_materials/main.cpp"
+    const auto found = cache.find(key);
+    if (found != cache.end()) {
+        spdlog::info("    base colour \"{}\" -> texture {} (already loaded)",
+                     key.empty() ? "(none)" : key, found->second);
+        return found->second;
+    }
+
+    const auto index = static_cast<uint32_t>(textures.size());
+    textures.push_back(key.empty() ? white_texture(context)
+                                   : decode_texture(context, scene, texture_path,
+                                                    model_path));
+    cache.emplace(key, index);
+
+    spdlog::info("    base colour \"{}\" -> texture {}", key.empty() ? "(none)" : key,
+                 index);
+    return index;
+}
+```
+
+The new index is `textures.size()` taken *before* the push, which is the standard
+append-and-return-its-position idiom and the reason the two lines must stay in that order.
+
+Caching on the path string is the cheap version and it is worth knowing its limit: two identical
+images under different filenames will not be caught, and the real fix is a content hash. For a
+model file, where the paths come from one exporter, the path is enough.
+
+## What the loader builds now
+
+`Model` loses its list of `Material` objects — no image, no descriptor set — and gains four
+fields:
+
+```cpp title="code/src/3.model_loading/bindless_materials/main.cpp"
+    std::vector<vkc::Image> textures;
+    std::vector<MaterialGpu> materials;
+    std::vector<std::string> material_names;
+    vkc::Buffer material_buffer;
+```
+
+The names are split into their own vector because `MaterialGpu` is a GPU struct now and a
+`std::string` cannot live in one. Keeping them parallel is the simplest thing that preserves the
+debug logging.
+
+The material loop builds records rather than descriptor sets:
+
+```cpp title="code/src/3.model_loading/bindless_materials/main.cpp"
+    std::unordered_map<std::string, uint32_t> texture_cache;
+```
+
+```cpp title="code/src/3.model_loading/bindless_materials/main.cpp"
+        model.materials.push_back(MaterialGpu{
+            .base_colour_factor = {factor.r, factor.g, factor.b, factor.a},
+            .texture = texture_index(context, scene, source, path, texture_cache,
+                                     model.textures),
+        });
+        model.material_names.emplace_back(source->GetName().C_Str());
+```
+
+The tree walk loses its `depth` parameter, because this chapter prints no tree:
+
+```cpp title="code/src/3.model_loading/bindless_materials/main.cpp"
+void collect_draws(const aiNode* node, const glm::mat4& parent, Model& model) {
+```
+
+```cpp title="code/src/3.model_loading/bindless_materials/main.cpp"
+        collect_draws(node->mChildren[i], transform, model);
+```
+
+```cpp title="code/src/3.model_loading/bindless_materials/main.cpp"
+    collect_draws(scene->mRootNode, glm::mat4(1.0F), model);
+```
+
+```cpp title="code/src/3.model_loading/bindless_materials/main.cpp"
+            "Model has meshes but no node refers to them: " + path.string());
+```
+
+Everything else about the walk is 3.3's, and it produces the same draw list.
+
+Then the materials go to the GPU, once:
+
+```cpp title="code/src/3.model_loading/bindless_materials/main.cpp"
+    model.material_buffer = vkc::upload_to_device_local(
+        context, model.materials.data(), model.materials.size() * sizeof(MaterialGpu),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    context.name(model.material_buffer.handle(), VK_OBJECT_TYPE_BUFFER,
+                 "material buffer");
+```
+
+`VK_BUFFER_USAGE_STORAGE_BUFFER_BIT` is the usage flag that lets a buffer be bound as a storage
+buffer — the same 1.8 upload path every vertex and index buffer in this series has used, with a
+different bit set. A buffer's usage flags are a promise made at creation about what it will be
+asked to do, and Vulkan rejects a binding the buffer was not created for.
+
+```cpp title="code/src/3.model_loading/bindless_materials/main.cpp"
+    spdlog::info("  {} draw(s), {} material(s), {} distinct texture(s)",
+                 model.draws.size(), model.materials.size(), model.textures.size());
+```
+
+That last number is the cache's score, and it is why the log line exists.
 
 ## std430, and the vector that is not the size it looks
 
@@ -176,18 +339,49 @@ struct Material {
 };
 ```
 
-In std430 a three-component vector aligns to **16 bytes**, not 4. So `uint3 pad` does not sit at
-offset 20 next to `texture`; it is pushed out to offset 32, and the struct becomes 48 bytes against
-the CPU's 32. Every read after the first is then displaced by 16 bytes more than the last.
+Part 2 spent six chapters on std140, the uniform-block layout. A storage buffer uses **std430**,
+which is looser in one specific way — an array or struct member is *not* rounded up to a multiple
+of 16 — and identical in every other respect. In particular this rule is unchanged: **a
+three-component vector has the alignment of a four-component one.**
+
+So lay the struct out by the rules and watch where the padding lands:
+
+```
+   member                align   offset   size
+   float4 base_colour_factor  16        0     16
+   uint   texture              4       16      4
+   uint3  pad                 16       32     12      ← 20 is not a multiple of 16
+                                        44
+   struct alignment 16, so sizeof =     48
+```
+
+against the CPU's:
+
+```
+   member                align   offset   size
+   glm::vec4 base_colour_factor 16       0     16
+   uint32_t  texture             4      16      4
+   uint32_t  pad0                4      20      4
+   uint32_t  pad1                4      24      4
+   uint32_t  pad2                4      28      4
+   struct alignment 16, so sizeof =     32
+```
+
+48 against 32. The shader reads material *n* at byte `48n` and the CPU wrote it at `32n`, so
+material 0 is right, material 1 is 16 bytes off, material 2 is 32 bytes off, and the error grows.
+Exactly the symptom observed.
 
 The fix is to pad with three scalars, which align to 4 apiece:
 
-```hlsl
-uint texture;   // 16
-uint pad0;      // 20
-uint pad1;      // 24
-uint pad2;      // 28
+```hlsl title="code/src/3.model_loading/bindless_materials/bindless_materials.slang"
+    float4 base_colour_factor;  // 0
+    uint texture;               // 16
+    uint pad0;                  // 20
+    uint pad1;                  // 24
+    uint pad2;                  // 28
 ```
+
+Both halves now put `texture` at 16 and end at 32.
 
 Nothing warns about this. The shader compiles, the buffer binds, the validation layers are silent —
 the sizes involved are legal, they simply disagree. This is the tax on hand-writing both halves of
@@ -199,46 +393,255 @@ static_assert(sizeof(MaterialGpu) == 32);
 static_assert(offsetof(MaterialGpu, texture) == 16);
 ```
 
+Those two lines cannot catch the shader being wrong. They catch the *C++* drifting from the
+comment, which is half the problem and the half a compiler can see.
+
+## The push block shrinks
+
+```cpp title="code/src/3.model_loading/bindless_materials/main.cpp"
+    uint32_t material;                       // 112
+};
+static_assert(offsetof(PushConstants, material) == 112);
+static_assert(sizeof(PushConstants) == 116);
+```
+
+```hlsl title="code/src/3.model_loading/bindless_materials/bindless_materials.slang"
+    uint material;
+```
+
+128 bytes down to 116. `colour` carried a `vec4` of base colour factor through three chapters at
+offset 112; the factor is in the buffer now, and the four-byte index that finds it takes its place.
+
+Push constants have a guaranteed minimum of 128 bytes, so this is not a saving that buys anything
+yet — it is the block getting *smaller as the renderer gets more capable*, which is the direction
+worth noticing.
+
+## Allocating and filling the bindless set
+
+The pool stops scaling with the scene. Three sets, whatever the model:
+
+```cpp title="code/src/3.model_loading/bindless_materials/main.cpp"
+        const std::array<VkDescriptorPoolSize, 3> pool_sizes{{
+            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, vkc::kFramesInFlight},
+            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1},
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texture_count},
+        }};
+```
+
+```cpp title="code/src/3.model_loading/bindless_materials/main.cpp"
+            .maxSets = vkc::kFramesInFlight + 1,
+```
+
+Note the distinction the pool draws: `maxSets` is fixed at three, while the *descriptor* count for
+images still tracks `texture_count`. A pool is told how many sets and how many descriptors of each
+type; putting every texture in one set changes the first number and not the second.
+
+```cpp title="code/src/3.model_loading/bindless_materials/main.cpp"
+        const VkDescriptorSetAllocateInfo bindless_alloc{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .pNext = nullptr,
+            .descriptorPool = descriptor_pool_,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &bindless_set_layout_,
+        };
+        VK_CHECK(vkAllocateDescriptorSets(device, &bindless_alloc, &bindless_set_));
+```
+
+Every texture is written in a single call. One `VkDescriptorImageInfo` per image, gathered into a
+vector:
+
+```cpp title="code/src/3.model_loading/bindless_materials/main.cpp"
+        std::vector<VkDescriptorImageInfo> image_infos;
+        image_infos.reserve(model_.textures.size());
+        for (const vkc::Image& texture : model_.textures) {
+            image_infos.push_back(VkDescriptorImageInfo{
+                .sampler = sampler_.handle(),
+                .imageView = texture.view(),
+                .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            });
+        }
+```
+
+The one sampler appears in all of them, exactly as in 3.2 — the array is an array of *images*,
+paired with the same sampler each time.
+
+```cpp title="code/src/3.model_loading/bindless_materials/main.cpp"
+        const VkDescriptorBufferInfo material_info{
+            .buffer = model_.material_buffer.handle(),
+            .offset = 0,
+            .range = VK_WHOLE_SIZE,
+        };
+```
+
+`VK_WHOLE_SIZE` is a sentinel meaning "from `offset` to the end of the buffer". 3.1's frame
+descriptor wrote `sizeof(Globals)` because the range was a known struct; here the buffer's length
+depends on the model, and saying "all of it" is both shorter and impossible to get wrong.
+
+Then the two writes:
+
+```cpp title="code/src/3.model_loading/bindless_materials/main.cpp"
+        const std::array<VkWriteDescriptorSet, 2> writes{{
+            {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .pNext = nullptr,
+                .dstSet = bindless_set_,
+                .dstBinding = 0,
+                .dstArrayElement = 0,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .pImageInfo = nullptr,
+                .pBufferInfo = &material_info,
+                .pTexelBufferView = nullptr,
+            },
+            {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .pNext = nullptr,
+                .dstSet = bindless_set_,
+                .dstBinding = 1,
+                .dstArrayElement = 0,
+                .descriptorCount = texture_count,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = image_infos.data(),
+                .pBufferInfo = nullptr,
+                .pTexelBufferView = nullptr,
+            },
+        }};
+        vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()),
+                               writes.data(), 0, nullptr);
+
+        context().name(bindless_set_, VK_OBJECT_TYPE_DESCRIPTOR_SET, "bindless set");
+```
+
+The second write is the interesting one: `descriptorCount` is the array length and `pImageInfo`
+points at that many structs, starting at `dstArrayElement`. **One call fills the entire binding**,
+however many images the model turned out to have. This is the same `VkWriteDescriptorSet` every
+chapter since 1.10 has used — the field that was always `1` is simply not `1` any more.
+
 ## The draw loop binds nothing
 
 Both sets go down once, above the loop:
 
 ```cpp title="code/src/3.model_loading/bindless_materials/main.cpp"
-const std::array<VkDescriptorSet, 2> sets{frame_sets_[slot], bindless_set_};
-vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                        pipeline_layout_, 0,
-                        static_cast<uint32_t>(sets.size()), sets.data(), 0, nullptr);
+        const std::array<VkDescriptorSet, 2> sets{frame_sets_[slot], bindless_set_};
+        vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                pipeline_layout_, 0,
+                                static_cast<uint32_t>(sets.size()), sets.data(), 0,
+                                nullptr);
 ```
 
-and what remains per draw is geometry and one push:
+`firstSet` is 0 and the count is 2, so one call binds both — where 3.3 bound set 0 here and set 1
+six more times below.
+
+What remains per draw is geometry and one push:
 
 ```cpp title="code/src/3.model_loading/bindless_materials/main.cpp"
-for (const Draw& draw : model_.draws) {
-    const Mesh& mesh = model_.meshes[draw.mesh];
-    // ... bind vertex and index buffers ...
-    const PushConstants push{
-        .model = model_matrix,
-        .normal_matrix = normal_matrix_of(model_matrix),
-        .material = mesh.material,
-    };
-    // ... push, draw ...
-}
+            const PushConstants push{
+                .model = model_matrix,
+                .normal_matrix = normal_matrix_of(model_matrix),
+                .material = mesh.material,
+            };
 ```
 
-The push block shrank with it, from 128 bytes to 116. `colour` carried a `vec4` of base colour
-factor through three chapters at offset 112; the factor is in the buffer now, and the four-byte
-index that finds it takes its place.
-
-The descriptor pool stopped scaling with the scene, too. Three sets, whatever the model:
+The pipeline layout still names two set layouts, and the second is the bindless one:
 
 ```cpp title="code/src/3.model_loading/bindless_materials/main.cpp"
-.maxSets = vkc::kFramesInFlight + 1,
+        const std::array<VkDescriptorSetLayout, 2> set_layouts{frame_set_layout_,
+                                                               bindless_set_layout_};
 ```
 
 Two vertex-buffer binds are still there per draw, and Part 9 is where those go as well — once a
 draw is fully described by numbers in buffers rather than by binds, the CPU stops needing to be in
 the loop at all. That is what `vkCmdDrawIndexedIndirect` is for, and this chapter is the step that
 makes it possible.
+
+## The application
+
+```cpp title="code/src/3.model_loading/bindless_materials/main.cpp"
+class BindlessApp : public vkc::App {
+public:
+    BindlessApp(Options options, std::filesystem::path model_path)
+```
+
+3.3's constructor, unchanged, and the `--model` flag with it.
+
+Teardown swaps the per-material cleanup for three lines:
+
+```cpp title="code/src/3.model_loading/bindless_materials/main.cpp"
+        vkDestroyDescriptorSetLayout(device, bindless_set_layout_, nullptr);
+```
+
+```cpp title="code/src/3.model_loading/bindless_materials/main.cpp"
+        model_.material_buffer.destroy();
+        model_.textures.clear();
+```
+
+And the members:
+
+```cpp title="code/src/3.model_loading/bindless_materials/main.cpp"
+    VkDescriptorSetLayout bindless_set_layout_ = VK_NULL_HANDLE;
+    VkDescriptorSet bindless_set_ = VK_NULL_HANDLE;
+```
+
+```cpp title="code/src/3.model_loading/bindless_materials/main.cpp"
+        const VkShaderModule shader =
+            vkc::load_shader(device, LVK_CHAPTER_ID, "bindless_materials.slang");
+```
+
+```cpp title="code/src/3.model_loading/bindless_materials/main.cpp"
+        context().name(pipeline_, VK_OBJECT_TYPE_PIPELINE, "bindless pipeline");
+```
+
+```cpp title="code/src/3.model_loading/bindless_materials/main.cpp"
+        options.title = "LearnVulkan 3.4 - Bindless Materials";
+        BindlessApp app(vkc::App::parse_args(static_cast<int>(forwarded.size()),
+                                             forwarded.data(), options),
+                        std::move(model_path));
+```
+
+## The shader side
+
+The array is declared without a length:
+
+```hlsl title="code/src/3.model_loading/bindless_materials/bindless_materials.slang"
+[[vk::binding(1, 1)]] Sampler2D base_colour_maps[];
+```
+
+`[]` with nothing in it is the runtime descriptor array, and it is this declaration that makes the
+SPIR-V require `runtimeDescriptorArray`. The shader does not know how many textures there are and
+deliberately does not say; the length came from `descriptorCount` in the layout.
+
+The buffer is a `StructuredBuffer`, Slang's typed view of a storage buffer:
+
+```hlsl title="code/src/3.model_loading/bindless_materials/bindless_materials.slang"
+[[vk::binding(0, 1)]] StructuredBuffer<Material> materials;
+```
+
+And the fragment shader takes the two hops:
+
+```hlsl title="code/src/3.model_loading/bindless_materials/bindless_materials.slang"
+    Material material = materials[push.material];
+
+    float3 albedo = base_colour_maps[material.texture].Sample(input.uv).rgb *
+                    material.base_colour_factor.rgb;
+```
+
+Both indices are **dynamically uniform**: they take the same value for every fragment in the draw,
+because they come from a push constant and a push constant cannot vary within a draw. That matters
+because indexing a descriptor array with a value that *does* vary across a subgroup is a different,
+stricter operation — it needs `NonUniformResourceIndex()` around the index and the matching
+`shaderSampledImageArrayNonUniformIndexing` feature. A renderer that packed several materials into
+one draw would need both. This one does not, and saying so is cheaper than enabling a feature it
+never uses.
+
+## Building it
+
+```cmake title="code/src/3.model_loading/bindless_materials/CMakeLists.txt"
+add_chapter(3.4.bindless_materials
+    SOURCES main.cpp
+    SHADERS bindless_materials.slang
+    LIBS assimp::assimp
+)
+```
 
 ## The proof is that nothing changed
 
@@ -253,19 +656,34 @@ the previous chapter's reference:
 Same geometry, same lighting, same textures, same shading arithmetic — reached without binding a
 single descriptor set inside the draw loop.
 
+## Words introduced in this chapter
+
+| | |
+|---|---|
+| **bindless** | reaching resources by index out of one permanently-bound collection instead of binding them one at a time |
+| **descriptor indexing** | the Vulkan feature family that permits a shader to index a descriptor array with a computed value |
+| **runtime descriptor array** | an array of descriptors whose length the shader does not state — it comes from `descriptorCount` in the layout |
+| **texture array** | one descriptor binding holding every texture the model uses, written in a single `vkUpdateDescriptorSets` call |
+| **material index** | the integer a draw pushes to name its material, in place of a descriptor set to bind |
+| **indirection** | the extra hop the index costs: draw names a material, material names a texture |
+| **std430** | the storage-buffer layout rules — looser than std140 about struct and array padding, identical about vector alignment |
+| **storage buffer** | the large, array-shaped buffer a shader reads under std430, where a uniform buffer is small and std140 |
+| **texture cache** | a map from texture path to array slot, so two materials sharing an image share a slot |
+| **dynamically uniform** | a value that is the same for every invocation in a draw, which is what lets this index skip `NonUniformResourceIndex` |
+
 ## What changed since 3.3
 
 - set 1 holds the whole model: a storage buffer of materials and an array of every texture
 - `vkCmdBindDescriptorSets` leaves the draw loop entirely; both sets bind once per frame
 - `MaterialGpu` replaces 3.3's `Material` — no `vkc::Image`, no `VkDescriptorSet`, just a colour
-  factor and a texture index
+  factor and a texture index, and the names move to a parallel vector
 - textures are cached by path, so materials sharing an image share a slot
 - the push block loses `colour` and gains `material`, 128 bytes down to 116
 - the descriptor pool is a fixed three sets rather than one per material
-- `features12.runtimeDescriptorArray = VK_TRUE` in vkcommon
+- `collect_draws` loses its `depth` parameter, because this chapter prints no tree
 
-What did **not** change: the geometry, the node walk, the lighting rig, the `Globals` block, and
-the rendered image.
+What did **not** change: the geometry, the node walk, the lighting rig, the `Globals` block, the
+contents of `vkcommon`, and the rendered image.
 
 ## Exercises
 
@@ -273,16 +691,19 @@ the rendered image.
    Read the message carefully and note which function reports it — then predict, before testing,
    whether a chapter from Part 2 would also fail.
 2. Put the `uint3` back in the shader's `Material` struct and look at the result. Then work out,
-   from the offsets alone, which texture each material ends up sampling.
-3. Delete the texture cache so every material loads its own image. The picture will not change.
+   from the offsets alone, which texture each material ends up sampling — the answer is `48n / 32`
+   rounded down, and you can check it against the picture.
+3. Work the std430 layout of a struct with `float3 a; float b; float3 c;` by hand, then write the
+   matching C++ and `static_assert` your answer. It is not 28 bytes.
+4. Delete the texture cache so every material loads its own image. The picture will not change.
    Find the change with `VK_LAYER_ENABLES` best-practices output, or by printing the number of
    `vkc::Image` objects.
-4. Move `base_colour_factor` back into the push constants and leave only the texture index in the
+5. Move `base_colour_factor` back into the push constants and leave only the texture index in the
    buffer. Measure nothing; just decide which version you would rather extend to twenty material
    parameters, and why.
-5. Give each material its own sampler index as well as its texture index, backed by a small array
+6. Give each material its own sampler index as well as its texture index, backed by a small array
    of samplers. Which glTF material property would make this worth doing?
-6. The material buffer is uploaded once and never written again. What would have to change — in the
+7. The material buffer is uploaded once and never written again. What would have to change — in the
    buffer, in its memory type, and in the synchronisation — if a material's colour could be edited
    while the model was on screen?
 

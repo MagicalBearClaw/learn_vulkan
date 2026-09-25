@@ -1,6 +1,6 @@
 ---
 title: Mesh
-description: A mesh stops being a pile of vertices and becomes an object that owns its buffers and its material - including the textures that were inside the model file all along.
+description: A mesh stops being a pile of vertices and becomes an object that owns its buffers and its material - including the textures that were inside the model file all along, and the UV flip that does not look like a bug.
 sidebar:
   order: 2
 ---
@@ -24,7 +24,7 @@ takes them apart.
 3.1 stated the structure and then ignored it. It is worth restating, because this chapter is
 built on it:
 
-**A mesh is a run of vertices sharing one material.** Not one object, not one part, not one
+A **mesh** is a run of vertices sharing one material. Not one object, not one part, not one
 thing you could point at. If a helmet's visor is glass and its shell is metal, that is two
 meshes, because it is two materials — even though it is obviously one helmet.
 
@@ -60,30 +60,77 @@ struct Material {
 };
 ```
 
+The **base colour factor** is glTF's per-material multiplier: a constant `vec4` that the base
+colour texture is multiplied by. A material can have a texture, a factor, or both — and if it
+has only a factor, the shader still wants something to sample, which is what the white texture
+below is for.
+
 `set` is filled in after loading rather than during it, and the reason is a pleasant little
 constraint: a descriptor pool has to be told at creation how many sets it will ever hand out,
 and that number is not known until the file has been read. The pool is sized from the model.
 
-## One `base` disappears
-
-3.1's inner loop had a line that needed a paragraph of explanation — every index shifted up by
-the number of vertices already in the shared buffer:
-
-```cpp
-const auto base = static_cast<uint32_t>(model.vertices.size());
-// ...
-model.indices.push_back(base + face.mIndices[i]);
-```
-
-It is gone. Each mesh now owns its own index buffer, so its indices are used exactly as the
-file gives them, numbered from zero into its own vertices:
+And a `Model` is now a pair of lists rather than a pair of buffers:
 
 ```cpp title="code/src/3.model_loading/mesh/main.cpp"
-indices.push_back(face.mIndices[i]);
+struct Model {
+    std::vector<Mesh> meshes;
+    std::vector<Material> materials;
+    glm::vec3 min{};
+    glm::vec3 max{};
+
+    [[nodiscard]] glm::vec3 centre() const { return (min + max) * 0.5F; }
+    [[nodiscard]] float radius() const { return glm::length(max - min) * 0.5F; }
+};
 ```
 
-That is the shape of this whole chapter: separating the meshes does not add machinery, it
-removes some. The bookkeeping that concatenation required was the price of the shortcut.
+The bounding box stays where 3.1 put it, because the camera still needs to know how big the
+whole thing is, whatever it is made of.
+
+## What the file gains over 3.1
+
+The headers pick up Assimp's material header, stb, and three standard ones:
+
+```cpp title="code/src/3.model_loading/mesh/main.cpp"
+#include <assimp/material.h>
+#include <assimp/postprocess.h>
+#include <assimp/scene.h>
+#include <assimp/Importer.hpp>
+
+#define STB_IMAGE_STATIC
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb_image.h>
+```
+
+`assimp/material.h` is where `aiTextureType_BASE_COLOR` and the `AI_MATKEY_*` property keys
+live. The `STB_IMAGE_STATIC` dance is 3.1's, for 3.1's reason: Assimp's static library exports
+its own copy of every `stbi_*` symbol, so the copy compiled here has to have internal linkage
+or the chapter will not link. This is the third translation unit in the project to do it.
+
+```cpp title="code/src/3.model_loading/mesh/main.cpp"
+#include <format>
+#include <memory>
+```
+
+`<format>` for the error and log messages that now name a mesh, and `<memory>` for the
+`unique_ptr` that owns decoded pixels.
+
+`kImportFlags` and `to_glm` are 3.1's, unchanged and still needed.
+
+## A texture for every material, whether or not there is one
+
+```cpp title="code/src/3.model_loading/mesh/main.cpp"
+[[nodiscard]] vkc::Image white_texture(vkc::Context& context) {
+    constexpr std::array<uint8_t, 4> white{255, 255, 255, 255};
+    return vkc::create_texture(context, white.data(), VkExtent2D{1, 1},
+                               VK_FORMAT_R8G8B8A8_SRGB);
+}
+```
+
+A single opaque white texel: the **fallback texture**. Every material gets a base colour
+texture whether the file supplied one or not. White is the identity for a multiply, so a
+material with no map shows its base colour factor and nothing else, the shader has one code
+path, and the pipeline has one descriptor set layout. A second *shape* of material would mean
+a second pipeline, and that is a far bigger cost than four bytes.
 
 ## The textures are inside the file
 
@@ -91,7 +138,8 @@ Here is the part with no real OpenGL-tutorial equivalent, because most of them l
 whose textures are `.png` files sitting in the same folder.
 
 `DamagedHelmet.glb` has no folder. It is one file, and its five JPEGs are packed into the
-binary chunk along with the vertices. Assimp hands them back as `aiTexture`s, and the material
+binary chunk along with the vertices. These are **embedded textures**: images that live inside
+the model file rather than beside it. Assimp hands them back as `aiTexture`s, and the material
 refers to them with a path that is not a path:
 
 ```
@@ -112,40 +160,96 @@ reported both as `aiTextureType_BASE_COLOR`, which is what the format calls it, 
 one the format actually defines is the one to ask for, because the day they stop agreeing is
 the day the compatibility alias is the wrong answer.
 
+So the loader has three cases to handle, and the signature says so:
+
+```cpp title="code/src/3.model_loading/mesh/main.cpp"
+[[nodiscard]] vkc::Image load_base_colour(vkc::Context& context, const aiScene* scene,
+                                          const aiMaterial* material,
+                                          const std::filesystem::path& model_path) {
+    aiString texture_path;
+    if (material->GetTexture(aiTextureType_BASE_COLOR, 0, &texture_path) != AI_SUCCESS) {
+        return white_texture(context);
+    }
+```
+
+`GetTexture` writes into an `aiString` and returns an `aiReturn`. **`AI_SUCCESS`** is the one
+value that means it worked; anything else means the material has no such texture, and here
+that is not an error — it is the white fallback.
+
+```cpp title="code/src/3.model_loading/mesh/main.cpp"
+    const aiTexture* embedded = scene->GetEmbeddedTexture(texture_path.C_Str());
+    if (embedded == nullptr) {
+        return vkc::load_texture(context, model_path.parent_path() / texture_path.C_Str(),
+                                 VK_FORMAT_R8G8B8A8_SRGB);
+    }
+```
+
+`nullptr` means the string really was a filename. Paths in a model file are relative to **the
+model**, not to the working directory, which is why this joins with `parent_path()` rather than
+using the string as given. The FlightHelmet in the next chapter takes exactly this branch.
+
 ### An aiTexture is usually not an image
 
 The struct is a small trap:
 
 ```cpp title="code/src/3.model_loading/mesh/main.cpp"
-if (embedded->mHeight != 0) {
-    throw std::runtime_error(/* an uncompressed aiTexel array */);
-}
+    if (embedded->mHeight != 0) {
+        throw std::runtime_error(
+            std::format("Embedded texture '{}' is an uncompressed aiTexel array, which "
+                        "this chapter does not decode.",
+                        texture_path.C_Str()));
+    }
 ```
 
 `aiTexture` has `mWidth` and `mHeight` and they mean what you expect **only** when `mHeight`
-is non-zero. When `mHeight` is `0` — which is every glTF ever — the texture is a compressed
-file that Assimp did not decode, `mWidth` is its size **in bytes**, and `achFormatHint` says
-what it is (`"jpg"` here). Reading `mWidth` as a width gives you 935 629 pixels across.
+is non-zero, in which case `pcData` is an array of `aiTexel` — Assimp's four-byte pixel. When
+`mHeight` is `0` — which is every glTF ever — the texture is a compressed file that Assimp did
+not decode, `mWidth` is its size **in bytes**, and `achFormatHint` is the **compressed texture
+hint**, a short string naming the format. For this model it is `"jpg"` and `mWidth` is 935 629.
+Reading that as a width gives you an image 935 629 pixels across.
+
+The uncompressed branch throws rather than being implemented, because no format this series
+reads produces one and a code path that has never run is worse than an honest refusal.
 
 So the decode is ours:
 
 ```cpp title="code/src/3.model_loading/mesh/main.cpp"
-const std::unique_ptr<stbi_uc, void (*)(void*)> pixels(
-    stbi_load_from_memory(reinterpret_cast<const stbi_uc*>(embedded->pcData),
-                          static_cast<int>(embedded->mWidth), &width, &height,
-                          &channels, STBI_rgb_alpha),
-    stbi_image_free);
+    int width = 0;
+    int height = 0;
+    int channels = 0;
+    const std::unique_ptr<stbi_uc, void (*)(void*)> pixels(
+        stbi_load_from_memory(reinterpret_cast<const stbi_uc*>(embedded->pcData),
+                              static_cast<int>(embedded->mWidth), &width, &height,
+                              &channels, STBI_rgb_alpha),
+        stbi_image_free);
+    if (pixels == nullptr) {
+        throw std::runtime_error(std::format("Could not decode embedded texture '{}': {}",
+                                             texture_path.C_Str(),
+                                             stbi_failure_reason()));
+    }
 ```
 
 `stbi_load_from_memory` is `stbi_load` with the file already read — the same decoder chapter
-1.11 used, entered one step later. And from there the chapter is 1.11 again, exactly:
+1.11 used, entered one step later. `STBI_rgb_alpha` forces four channels out regardless of what
+went in, which is what keeps one `VK_FORMAT_R8G8B8A8_SRGB` working for every image.
+
+The `unique_ptr` with a function-pointer deleter is how stb's `malloc`-shaped ownership becomes
+RAII: `stbi_image_free` is the deleter, so the pixels are released on every path out of the
+function, including the two that throw below.
 
 ```cpp title="code/src/3.model_loading/mesh/main.cpp"
-return vkc::create_texture(context, pixels.get(),
-                           VkExtent2D{static_cast<uint32_t>(width),
-                                      static_cast<uint32_t>(height)},
-                           VK_FORMAT_R8G8B8A8_SRGB);
+    spdlog::info("    base colour \"{}\": {}x{} {} ({} KiB compressed)",
+                 texture_path.C_Str(), width, height, embedded->achFormatHint,
+                 embedded->mWidth / 1024);
+
+    return vkc::create_texture(context, pixels.get(),
+                               VkExtent2D{static_cast<uint32_t>(width),
+                                          static_cast<uint32_t>(height)},
+                               VK_FORMAT_R8G8B8A8_SRGB);
+}
 ```
+
+And from there the chapter is 1.11 again, exactly.
 
 :::note[What moved in `vkcommon`]
 `vkc::create_texture` is new, and it is not new code. It is the second half of 1.11's
@@ -158,10 +262,6 @@ No new concept entered the shared library. A chapter that has read 1.11 has alre
 line of it.
 :::
 
-The `STB_IMAGE_STATIC` dance from 3.1 applies to this file too, and for the same reason:
-Assimp's static library exports its own `stbi_*` symbols, so the copy compiled here has to be
-private or the chapter will not link.
-
 ## Flipping the UVs, measured
 
 3.1 said not to pass `aiProcess_FlipUVs`, on the grounds that glTF and Vulkan agree that
@@ -171,11 +271,48 @@ one can, so the flag went in and the sample was run.
 
 **It does not look broken.** That is the finding, and it is worse than the alternative.
 
-The intuition — that a flipped texture appears upside down — comes from imagining a model's UVs
-as one sheet wrapped around it. They are not. They are dozens of small islands scattered across
-the atlas, packed to waste as little space as possible, in no particular arrangement. Flipping
-`v` does not mirror each island in place. It lands every island somewhere else entirely, and
-whatever island happens to live there donates its paint.
+### Why, as geometry
+
+The **texture coordinate origin** is a convention, and there are only two. OpenGL puts `(0,0)`
+at the bottom-left of the image; glTF and Vulkan put it at the top-left. Converting between
+them is one subtraction:
+
+```
+   v'  =  1 − v
+```
+
+That is a **reflection** about the line `v = 0.5`. Reflections are involutions — apply it twice
+and you are back where you started — which is exactly why doing it in a renderer that did not
+need it is not a neutral act.
+
+Now the part the intuition gets wrong. Imagine a model's UVs as one sheet wrapped around it,
+and reflecting the sheet turns the picture upside down: annoying, obvious, fixed in a second.
+Real UVs are not one sheet. They are a **texture atlas** — one image holding many unrelated
+patches — carved into **UV islands**, each island a connected run of triangles unwrapped flat
+and packed in wherever it fits:
+
+```
+   the atlas, v = 0 at the top                after  v → 1 − v
+
+   ┌───────────────────────────┐              ┌───────────────────────────┐
+   │  ┌─────┐   ┌──┐           │              │       ┌──────┐   ┌────┐   │
+   │  │dome │   │HUD│          │   v = 0.25   │       │ vent │   │ rim│   │
+   │  └─────┘   └──┘           │              │       └──────┘   └────┘   │
+   │        ┌──────┐   ┌────┐  │   v = 0.75   │  ┌─────┐   ┌──┐           │
+   │        │ vent │   │ rim│  │              │  │dome │   │HUD│          │
+   │        └──────┘   └────┘  │              │  └─────┘   └──┘           │
+   └───────────────────────────┘              └───────────────────────────┘
+```
+
+The reflection is about the atlas's midline, not about each island's own midline. An island at
+`v ∈ [0.1, 0.3]` lands at `v ∈ [0.7, 0.9]` — the wrong place entirely, and whatever island
+already lives there donates its paint. Nothing is upside down. Every island is simply somewhere
+else.
+
+An island is only mirrored in place if it happens to straddle `v = 0.5` symmetrically, which is
+a coincidence and not a design.
+
+### What that looks like
 
 The result renders. It is still recognisably a helmet, lit correctly, with clean edges and
 sharp detail everywhere, and every panel wearing a different panel's surface. Side by side with
@@ -187,9 +324,169 @@ because the smooth upper half of the atlas ends up on the largest, most visible 
 There is no validation message for this, no warning, and no crash. The only way to catch it is
 to know which way your format counts and to look at something you can recognise.
 
-## What the sample actually loads
+## The loader
 
-Running it:
+`load_model` now takes a `Context`, because what it returns is not data any more — it is
+buffers and images that exist on the device:
+
+```cpp title="code/src/3.model_loading/mesh/main.cpp"
+[[nodiscard]] Model load_model(vkc::Context& context,
+                               const std::filesystem::path& path) {
+```
+
+The existence check, the `ReadFile`, the three-way failure test and the first log line are
+3.1's, word for word, and so is the backwards-seeded bounding box:
+
+```cpp title="code/src/3.model_loading/mesh/main.cpp"
+    Model model;
+    model.min = glm::vec3(std::numeric_limits<float>::max());
+    model.max = glm::vec3(std::numeric_limits<float>::lowest());
+```
+
+Materials are built first, so that every mesh's material index already points at something:
+
+```cpp title="code/src/3.model_loading/mesh/main.cpp"
+    model.materials.reserve(scene->mNumMaterials);
+    for (unsigned int i = 0; i < scene->mNumMaterials; ++i) {
+        const aiMaterial* source = scene->mMaterials[i];
+
+        aiColor4D factor(1.0F, 1.0F, 1.0F, 1.0F);
+        source->Get(AI_MATKEY_BASE_COLOR, factor);
+
+        spdlog::info("  material {} \"{}\"", i, source->GetName().C_Str());
+
+        model.materials.push_back(Material{
+            .base_colour = load_base_colour(context, scene, source, path),
+            .base_colour_factor = {factor.r, factor.g, factor.b, factor.a},
+            .set = VK_NULL_HANDLE,
+            .name = source->GetName().C_Str(),
+        });
+    }
+```
+
+**`aiColor4D`** is Assimp's four-float colour, and **`AI_MATKEY_BASE_COLOR`** is the property
+key naming glTF's base colour factor. `Get` is a template: the key decides the type, and the
+return value is ignored here on purpose — `factor` is initialised to opaque white first, so a
+material that does not define the key keeps the identity for a multiply. That is the same
+argument as the white texture, made about a constant rather than an image.
+
+Assimp's material count includes the default material it synthesises for meshes that name none,
+and building a `Material` for it costs one white texel and removes a special case.
+
+Then meshes, one at a time, each into its own vectors:
+
+```cpp title="code/src/3.model_loading/mesh/main.cpp"
+    model.meshes.reserve(scene->mNumMeshes);
+    for (unsigned int m = 0; m < scene->mNumMeshes; ++m) {
+        const aiMesh* source = scene->mMeshes[m];
+
+        std::vector<Vertex> vertices;
+        vertices.reserve(source->mNumVertices);
+        for (unsigned int v = 0; v < source->mNumVertices; ++v) {
+            Vertex vertex{};
+            vertex.position = to_glm(source->mVertices[v]);
+            vertex.normal = source->HasNormals() ? to_glm(source->mNormals[v])
+                                                 : glm::vec3(0.0F, 1.0F, 0.0F);
+            vertex.uv = source->HasTextureCoords(0)
+                            ? glm::vec2(source->mTextureCoords[0][v].x,
+                                        source->mTextureCoords[0][v].y)
+                            : glm::vec2(0.0F);
+
+            model.min = glm::min(model.min, vertex.position);
+            model.max = glm::max(model.max, vertex.position);
+            vertices.push_back(vertex);
+        }
+```
+
+The bounding box still accumulates across *all* meshes, because it describes the model and the
+camera looks at the model.
+
+### One `base` disappears
+
+3.1's inner loop had a line that needed a paragraph of explanation — every index shifted up by
+the number of vertices already in the shared buffer:
+
+```cpp
+const auto base = static_cast<uint32_t>(model.vertices.size());
+// ...
+model.indices.push_back(base + face.mIndices[i]);
+```
+
+It is gone:
+
+```cpp title="code/src/3.model_loading/mesh/main.cpp"
+        std::vector<uint32_t> indices;
+        indices.reserve(static_cast<size_t>(source->mNumFaces) * 3);
+        for (unsigned int f = 0; f < source->mNumFaces; ++f) {
+            const aiFace& face = source->mFaces[f];
+            for (unsigned int i = 0; i < face.mNumIndices; ++i) {
+                indices.push_back(face.mIndices[i]);
+            }
+        }
+```
+
+Each mesh now owns its own index buffer, so its indices are used exactly as the file gives
+them, numbered from zero into its own vertices. That is the shape of this whole chapter:
+separating the meshes does not add machinery, it removes some. The bookkeeping that
+concatenation required was the price of the shortcut.
+
+The `* 3` in the `reserve` is an estimate that `aiProcess_Triangulate` makes exact, and the
+loop still reads `mNumIndices` rather than trusting it.
+
+Refuse an empty mesh, then upload:
+
+```cpp title="code/src/3.model_loading/mesh/main.cpp"
+        if (vertices.empty() || indices.empty()) {
+            throw std::runtime_error(
+                std::format("Mesh {} of {} has no geometry", m, path.string()));
+        }
+
+        Mesh mesh{
+            .vertex_buffer = vkc::upload_to_device_local(
+                context, vertices.data(), vertices.size() * sizeof(Vertex),
+                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT),
+            .index_buffer = vkc::upload_to_device_local(
+                context, indices.data(), indices.size() * sizeof(uint32_t),
+                VK_BUFFER_USAGE_INDEX_BUFFER_BIT),
+            .index_count = static_cast<uint32_t>(indices.size()),
+            .material = source->mMaterialIndex,
+            .name = source->mName.C_Str(),
+        };
+```
+
+The two `vkc::Buffer`s are constructed straight into the aggregate, and `Mesh` therefore has to
+be movable and not copyable — which it is, because `vkc::Buffer` has been since 1.8.
+
+Debug names, this time built per mesh rather than written as literals:
+
+```cpp title="code/src/3.model_loading/mesh/main.cpp"
+        context.name(mesh.vertex_buffer.handle(), VK_OBJECT_TYPE_BUFFER,
+                     std::format("{} vertices", mesh.name).c_str());
+        context.name(mesh.index_buffer.handle(), VK_OBJECT_TYPE_BUFFER,
+                     std::format("{} indices", mesh.name).c_str());
+
+        spdlog::info("  mesh {} \"{}\": {} vertices, {} indices, material {}", m,
+                     mesh.name, vertices.size(), indices.size(), mesh.material);
+
+        model.meshes.push_back(std::move(mesh));
+    }
+```
+
+`std::move` is load-bearing: `Mesh` holds two buffers that own device memory, and copying it
+would be a compile error rather than a leak — which is the good kind of type.
+
+```cpp title="code/src/3.model_loading/mesh/main.cpp"
+    if (model.meshes.empty()) {
+        throw std::runtime_error("Model has no meshes: " + path.string());
+    }
+
+    spdlog::info("  bounds ({:.2f} {:.2f} {:.2f}) to ({:.2f} {:.2f} {:.2f})", model.min.x,
+                 model.min.y, model.min.z, model.max.x, model.max.y, model.max.z);
+    return model;
+}
+```
+
+## What the sample actually loads
 
 ```
 DamagedHelmet.glb: 1 mesh(es), 2 material(s), 5 embedded texture(s)
@@ -204,27 +501,93 @@ Same geometry as 3.1, to the vertex — the loader changed, the model did not. T
 that output are worth stopping on.
 
 **Material 1 has no name and no textures.** This is the default material 3.1 mentioned:
-Assimp synthesises one so that a mesh referencing nothing still has somewhere to point.
-Nothing here uses it, and it still gets a `Material`, a descriptor set and a texture, because
-a special case that costs one texel is not a special case worth writing:
-
-```cpp title="code/src/3.model_loading/mesh/main.cpp"
-[[nodiscard]] vkc::Image white_texture(vkc::Context& context) {
-    constexpr std::array<uint8_t, 4> white{255, 255, 255, 255};
-    return vkc::create_texture(context, white.data(), VkExtent2D{1, 1},
-                               VK_FORMAT_R8G8B8A8_SRGB);
-}
-```
-
-Every material gets a base colour texture whether the file supplied one or not. White is the
-identity for a multiply, so a material with no map shows its base colour factor and nothing
-else, the shader has one code path, and the pipeline has one descriptor set layout. A second
-*shape* of material would mean a second pipeline.
+Assimp synthesises one so that a mesh referencing nothing still has somewhere to point. Nothing
+here uses it, and it still gets a `Material`, a descriptor set and a white texture, because a
+special case that costs one texel is not a special case worth writing.
 
 **Five embedded textures, one read.** The other four are a metallic-roughness map, a normal
 map, an occlusion map and an emissive map. This chapter reads none of them: normal mapping is
 5.5, and metallic-roughness is the whole subject of Part 6. They are listed here so that the
 gap is deliberate rather than invisible.
+
+`913 KiB` is `935 629 / 1024` with integer division — the compressed JPEG, not the 16 MiB of
+RGBA it decodes to.
+
+## The shading block, unchanged
+
+`Globals` and `PushConstants` are 3.1's, byte for byte, and are repeated here only because the
+file is standalone:
+
+```cpp title="code/src/3.model_loading/mesh/main.cpp"
+struct Globals {
+    glm::mat4 view;            // 0
+    glm::mat4 projection;      // 64
+    glm::vec4 view_position;   // 128
+    glm::vec4 key_direction;   // 144
+    glm::vec4 key_colour;      // 160
+    glm::vec4 fill_direction;  // 176
+    glm::vec4 fill_colour;     // 192
+    glm::vec4 ambient;         // 208, w is the shininess
+};
+```
+
+`push.colour` has changed *meaning* without changing shape: it was the flat albedo the sample
+picked, and it now carries the material's base colour factor.
+
+The lighting constants are 3.1's too, unchanged on purpose, so that the only visible difference
+between the two chapters is where the surface colour comes from.
+
+## The application
+
+```cpp title="code/src/3.model_loading/mesh/main.cpp"
+class MeshApp : public vkc::App {
+public:
+    using vkc::App::App;
+
+protected:
+    void on_start() override {
+        model_ = load_model(context(),
+                            vkc::asset_path("models/damaged_helmet/DamagedHelmet.glb"));
+
+        sampler_ = vkc::Sampler(context(), vkc::SamplerDesc{});
+
+        model_matrix_ = glm::rotate(glm::mat4(1.0F), glm::radians(215.0F),
+                                    glm::vec3(0.0F, 1.0F, 0.0F)) *
+                        glm::translate(glm::mat4(1.0F), -model_.centre());
+        camera_.position = {0.0F, 0.0F, model_.radius() * 2.6F};
+```
+
+**One sampler for every material.** A sampler from 1.11 says *how* to read a texture — filter,
+address mode, anisotropy — not *which* one. Those settings are the same for every material in
+this model, so a scene needs a handful of samplers and not one per texture. The combined image
+sampler descriptor pairs this one sampler with each material's own view.
+
+The model matrix and the camera come from the bounding box exactly as in 3.1.
+
+Teardown gains the sampler, the second layout, and the two vectors:
+
+```cpp title="code/src/3.model_loading/mesh/main.cpp"
+    void on_shutdown() override {
+        const VkDevice device = context().device();
+
+        vkDestroyPipeline(device, pipeline_, nullptr);
+        vkDestroyPipelineLayout(device, pipeline_layout_, nullptr);
+        vkDestroyDescriptorPool(device, descriptor_pool_, nullptr);
+        vkDestroyDescriptorSetLayout(device, material_set_layout_, nullptr);
+        vkDestroyDescriptorSetLayout(device, frame_set_layout_, nullptr);
+
+        for (vkc::Buffer& buffer : uniform_buffers_) {
+            buffer.destroy();
+        }
+        sampler_.destroy();
+        model_.meshes.clear();
+        model_.materials.clear();
+        depth_.destroy();
+    }
+```
+
+Clearing the vectors runs every `Buffer` and `Image` destructor in them. The descriptor sets
+those materials held need no freeing of their own: destroying the pool above already took them.
 
 ## Two sets, and one of them moves
 
@@ -235,42 +598,294 @@ The descriptor layout is 2.4's, arrived at from a different direction:
 | 0 | `Globals` — view, projection, the two lights | once per frame |
 | 1 | the material's base colour sampler | once per mesh |
 
+Set 0's layout is 3.1's:
+
+```cpp title="code/src/3.model_loading/mesh/main.cpp"
+        const VkDescriptorSetLayoutBinding frame_binding{
+            .binding = 0,
+            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+            .pImmutableSamplers = nullptr,
+        };
+        const VkDescriptorSetLayoutCreateInfo frame_layout_info{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .bindingCount = 1,
+            .pBindings = &frame_binding,
+        };
+        VK_CHECK(vkCreateDescriptorSetLayout(device, &frame_layout_info, nullptr,
+                                             &frame_set_layout_));
+```
+
+Set 1 is new, and it is one combined image sampler, fragment stage only:
+
+```cpp title="code/src/3.model_loading/mesh/main.cpp"
+        const VkDescriptorSetLayoutBinding material_binding{
+            .binding = 0,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+            .pImmutableSamplers = nullptr,
+        };
+        const VkDescriptorSetLayoutCreateInfo material_layout_info{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .bindingCount = 1,
+            .pBindings = &material_binding,
+        };
+        VK_CHECK(vkCreateDescriptorSetLayout(device, &material_layout_info, nullptr,
+                                             &material_set_layout_));
+```
+
+Every material has this same layout even where the file gave it no texture, which is the white
+texture earning its keep: the layout is baked into the pipeline, and a second shape of material
+would mean a second pipeline.
+
 The pool is the part that has genuinely changed, because for the first time in this series its
 size is not a constant:
 
 ```cpp title="code/src/3.model_loading/mesh/main.cpp"
-const auto material_count = static_cast<uint32_t>(model_.materials.size());
-const std::array<VkDescriptorPoolSize, 2> pool_sizes{{
-    {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, vkc::kFramesInFlight},
-    {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, material_count},
-}};
+        const auto material_count = static_cast<uint32_t>(model_.materials.size());
+        const std::array<VkDescriptorPoolSize, 2> pool_sizes{{
+            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, vkc::kFramesInFlight},
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, material_count},
+        }};
+        const VkDescriptorPoolCreateInfo pool_info{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .maxSets = vkc::kFramesInFlight + material_count,
+            .poolSizeCount = static_cast<uint32_t>(pool_sizes.size()),
+            .pPoolSizes = pool_sizes.data(),
+        };
+        VK_CHECK(vkCreateDescriptorPool(device, &pool_info, nullptr, &descriptor_pool_));
 ```
+
+Two numbers, and both are counted rather than chosen: `poolSizeCount` says how many *kinds* of
+descriptor the pool holds, and `maxSets` how many sets — two frame sets plus one per material.
 
 A pool cannot grow. Ask for too few and `vkAllocateDescriptorSets` returns
 `VK_ERROR_OUT_OF_POOL_MEMORY`, which is one of the more honest error names in the API. Sizing
 it from the file is the first hint of something Part 4 makes explicit: in Vulkan, how much of
 a resource a scene needs is a question you are expected to answer, not discover.
 
-And the frame loop stops being a single draw:
+The frame sets are allocated and written exactly as in 3.1:
 
 ```cpp title="code/src/3.model_loading/mesh/main.cpp"
-for (const Mesh& mesh : model_.meshes) {
-    const Material& material = model_.materials[mesh.material];
+        const std::array<VkDescriptorSetLayout, vkc::kFramesInFlight> frame_layouts{
+            frame_set_layout_, frame_set_layout_};
+        const VkDescriptorSetAllocateInfo frame_alloc{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .pNext = nullptr,
+            .descriptorPool = descriptor_pool_,
+            .descriptorSetCount = vkc::kFramesInFlight,
+            .pSetLayouts = frame_layouts.data(),
+        };
+        VK_CHECK(vkAllocateDescriptorSets(device, &frame_alloc, frame_sets_.data()));
+```
 
-    vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            pipeline_layout_, 1, 1, &material.set, 0, nullptr);
-    // ... bind this mesh's two buffers, push its constants ...
-    vkCmdDrawIndexed(frame.cmd, mesh.index_count, 1, 0, 0, 0);
+And the material sets in a loop — one allocation and one write each:
+
+```cpp title="code/src/3.model_loading/mesh/main.cpp"
+        for (Material& material : model_.materials) {
+            const VkDescriptorSetAllocateInfo alloc{
+                .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                .pNext = nullptr,
+                .descriptorPool = descriptor_pool_,
+                .descriptorSetCount = 1,
+                .pSetLayouts = &material_set_layout_,
+            };
+            VK_CHECK(vkAllocateDescriptorSets(device, &alloc, &material.set));
+
+            const VkDescriptorImageInfo image_info{
+                .sampler = sampler_.handle(),
+                .imageView = material.base_colour.view(),
+                .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            };
+            const VkWriteDescriptorSet write{
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .pNext = nullptr,
+                .dstSet = material.set,
+                .dstBinding = 0,
+                .dstArrayElement = 0,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = &image_info,
+                .pBufferInfo = nullptr,
+                .pTexelBufferView = nullptr,
+            };
+            vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+
+            context().name(material.set, VK_OBJECT_TYPE_DESCRIPTOR_SET,
+                           std::format("material {}", material.name).c_str());
+        }
+    }
+```
+
+The one sampler handle appears in every `image_info` while the view differs per material —
+which is the combined image sampler doing what its name says, pairing the two at bind time.
+
+This is the shape every renderer ends up with, and 3.4 is where it gets replaced by a single
+set holding every texture at once.
+
+## The frame loop
+
+```cpp title="code/src/3.model_loading/mesh/main.cpp"
+        for (const Mesh& mesh : model_.meshes) {
+            const Material& material = model_.materials[mesh.material];
+
+            vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                    pipeline_layout_, 1, 1, &material.set, 0, nullptr);
+
+            const VkDeviceSize offset = 0;
+            const VkBuffer vertices = mesh.vertex_buffer.handle();
+            vkCmdBindVertexBuffers(frame.cmd, 0, 1, &vertices, &offset);
+            vkCmdBindIndexBuffer(frame.cmd, mesh.index_buffer.handle(), 0,
+                                 VK_INDEX_TYPE_UINT32);
+
+            const PushConstants push{
+                .model = model_matrix_,
+                .normal_matrix = normal_matrix_of(model_matrix_),
+                .colour = material.base_colour_factor,
+            };
+            vkCmdPushConstants(frame.cmd, pipeline_layout_,
+                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                               0, sizeof(push), &push);
+
+            vkCmdDrawIndexed(frame.cmd, mesh.index_count, 1, 0, 0, 0);
+        }
+```
+
+Set 0 is bound once, above the loop, and never touched again. Set 1 changes per mesh — note the
+`1` in `vkCmdBindDescriptorSets`'s `firstSet` argument, which is what makes this a rebind of
+set 1 alone and leaves set 0 where it was. That split — per-frame data in a low set number,
+per-material data in a higher one — is the reason Vulkan numbers descriptor sets at all.
+
+With one mesh, this loop runs once and is indistinguishable from 3.1's single draw. That is
+fine. The loop is not here because this model needs it; it is here because 3.3 points it at a
+model with six meshes and seven materials, and nothing about it will have to change.
+
+## The pipeline
+
+Three attributes for three fields. 3.1 declared two and left `uv` out because nothing sampled
+it; the fragment shader reads it now, so it is described:
+
+```cpp title="code/src/3.model_loading/mesh/main.cpp"
+        const std::array<VkVertexInputAttributeDescription, 3> attributes{{
+            {
+                .location = 0,
+                .binding = 0,
+                .format = VK_FORMAT_R32G32B32_SFLOAT,
+                .offset = offsetof(Vertex, position),
+            },
+            {
+                .location = 1,
+                .binding = 0,
+                .format = VK_FORMAT_R32G32B32_SFLOAT,
+                .offset = offsetof(Vertex, normal),
+            },
+            {
+                .location = 2,
+                .binding = 0,
+                .format = VK_FORMAT_R32G32_SFLOAT,
+                .offset = offsetof(Vertex, uv),
+            },
+        }};
+```
+
+`VK_FORMAT_R32G32_SFLOAT` and not `R32G32B32`, because a UV is two floats. The format describes
+the attribute, not the vertex.
+
+The layout now names two set layouts, in set-number order:
+
+```cpp title="code/src/3.model_loading/mesh/main.cpp"
+        const std::array<VkDescriptorSetLayout, 2> set_layouts{frame_set_layout_,
+                                                               material_set_layout_};
+
+        const VkPipelineLayoutCreateInfo layout_info{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .setLayoutCount = static_cast<uint32_t>(set_layouts.size()),
+            .pSetLayouts = set_layouts.data(),
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &push_range,
+        };
+```
+
+The array index *is* the set number — element 0 is set 0 — which is 2.3's pipeline-layout
+compatibility rule showing up as an ordering requirement rather than as prose.
+
+The build differs from 3.1 in the shader name alone:
+
+```cpp title="code/src/3.model_loading/mesh/main.cpp"
+        const VkShaderModule shader =
+            vkc::load_shader(device, LVK_CHAPTER_ID, "mesh.slang");
+```
+
+```cpp title="code/src/3.model_loading/mesh/main.cpp"
+        context().name(pipeline_, VK_OBJECT_TYPE_PIPELINE, "mesh pipeline");
+```
+
+And the members gain the model, the sampler and the second layout:
+
+```cpp title="code/src/3.model_loading/mesh/main.cpp"
+    Model model_;
+    vkc::Sampler sampler_;
+```
+
+```cpp title="code/src/3.model_loading/mesh/main.cpp"
+    VkDescriptorSetLayout material_set_layout_ = VK_NULL_HANDLE;
+```
+
+`vertex_buffer_`, `index_buffer_` and `index_count_` are gone — the meshes own those now.
+
+```cpp title="code/src/3.model_loading/mesh/main.cpp"
+int main(int argc, char** argv) {
+    try {
+        vkc::App::Options options{};
+        options.title = "LearnVulkan 3.2 - Mesh";
+        MeshApp app(vkc::App::parse_args(argc, argv, options));
+        return app.run();
+    } catch (const std::exception& error) {
+        spdlog::error("{}", error.what());
+        return EXIT_FAILURE;
+    }
 }
 ```
 
-Set 0 is bound once, above the loop, and never touched again. Set 1 changes per mesh. That
-split — per-frame data in a low set number, per-material data in a higher one — is the reason
-Vulkan numbers descriptor sets at all, and binding set 1 does not disturb set 0.
+## The shader
 
-With one mesh, this loop runs once and is indistinguishable from 3.1's single draw. That is
-fine. The loop is not here because this model needs it; it is here because it is what 3.3
-points at a model with six meshes and six materials, and nothing about it will have to change.
+The vertex stage gains a `uv`, in and out:
+
+```hlsl title="code/src/3.model_loading/mesh/mesh.slang"
+struct VSInput {
+    [[vk::location(0)]] float3 position;
+    [[vk::location(1)]] float3 normal;
+    [[vk::location(2)]] float2 uv;
+};
+
+struct VSOutput {
+    float4 position : SV_Position;
+    [[vk::location(0)]] float3 world_position;
+    [[vk::location(1)]] float3 normal;
+    [[vk::location(2)]] float2 uv;
+};
+```
+
+Set 1's one binding, declared:
+
+```hlsl title="code/src/3.model_loading/mesh/mesh.slang"
+[[vk::binding(0, 1)]] Sampler2D base_colour_map;
+```
+
+The second number in `vk::binding` is the **set**, so this is set 1, binding 0 — matching
+`material_set_layout_` exactly. glTF calls this the base colour texture and 2.4 called it the
+diffuse map; for a shading model like this one they are the same thing, the surface's own
+colour before any light touches it.
 
 ## One number that is not from the file
 
@@ -280,15 +895,63 @@ The shader gained a constant, and it deserves an admission:
 static const float kSpecularStrength = 0.25;
 ```
 
+```hlsl title="code/src/3.model_loading/mesh/mesh.slang"
+    float3 specular = light_colour * specular_amount * kSpecularStrength;
+```
+
 2.4 read that number out of a specular map. A glTF material has no such map and no shininess
-either — `AI_MATKEY_SHININESS` reads back as `0.0` — because glTF describes a surface with
-roughness and metalness, which Part 6 is where this series learns to use.
+either — `AI_MATKEY_SHININESS` reads back as `0.0`, checked rather than assumed — because glTF
+describes a surface with roughness and metalness, which Part 6 is where this series learns to
+use.
 
 It matters more than it looks. 3.1's lighting was tuned against a flat mid-grey albedo, where
 a full-strength highlight reads as shine. Against this model's real base colour the same
 highlight swamps the texture and the helmet turns to white plastic, which is a strange way to
 end a chapter about finally having a texture. Turning the specular down is the smallest honest
 fix; Part 6 is the real one.
+
+The two stage functions change by one line each — the vertex stage passes the UVs through, and
+the fragment stage samples with them:
+
+```hlsl title="code/src/3.model_loading/mesh/mesh.slang"
+    output.uv = input.uv;
+```
+
+```hlsl title="code/src/3.model_loading/mesh/mesh.slang"
+    float3 albedo = base_colour_map.Sample(input.uv).rgb * push.colour.rgb;
+```
+
+The UVs were in the vertex buffer all along; nothing was reading them. And the sample happens
+**before any branch**, as 1.11 explained: `Sample()` picks its mip level from screen-space
+derivatives, and those are only well defined when every fragment in the 2×2 quad reaches that
+line.
+
+The multiply by `push.colour.rgb` is the base colour factor applied — texture times constant,
+which is why a material with only a factor needs a white texture and a material with only a
+texture needs a white factor.
+
+## Building it
+
+```cmake title="code/src/3.model_loading/mesh/CMakeLists.txt"
+add_chapter(3.2.mesh
+    SOURCES main.cpp
+    SHADERS mesh.slang
+    LIBS assimp::assimp
+)
+```
+
+## Words introduced in this chapter
+
+| | |
+|---|---|
+| **mesh** | a run of vertices sharing one material — the unit a single draw call can consume, which is why the type exists |
+| **embedded texture** | an image packed inside the model file rather than stored beside it, named `"*N"` instead of by path |
+| **compressed texture hint** | `achFormatHint`, the short string naming an embedded texture's format when Assimp has not decoded it |
+| **fallback texture** | a single white texel handed to materials with no map, so that one shader and one layout serve every material |
+| **texture atlas** | one image holding many unrelated patches of surface, which is what a model's texture almost always is |
+| **UV island** | one connected patch within the atlas — the reason flipping `v` shuffles the paint instead of turning it upside down |
+| **texture coordinate origin** | which corner `(0,0)` means: bottom-left for OpenGL, top-left for glTF and Vulkan |
+| **base colour factor** | glTF's per-material constant multiplier on the base colour texture |
 
 ## What changed since 3.1
 
@@ -309,26 +972,30 @@ That is 3.3.
 
 ## Exercises
 
-1. Point the loader at `assets/models/flight_helmet/FlightHelmet.gltf`. Six meshes, six
-   materials, and textures in files beside the model rather than embedded — which the loader
-   already handles, in the `embedded == nullptr` branch. It draws correctly, and 3.3 explains
-   the slightly uncomfortable reason why: this model's node transforms are all identity, so
-   `PreTransformVertices` has nothing to bake and its absence would change nothing.
+1. Point the loader at `assets/models/flight_helmet/FlightHelmet.gltf`. Six meshes, seven
+   materials — six from the file and one default — and textures in files beside the model
+   rather than embedded, which the loader already handles in the `embedded == nullptr` branch.
+   It draws correctly, and 3.3 explains the slightly uncomfortable reason why: this model's node
+   transforms are all identity, so `aiProcess_PreTransformVertices` has nothing to bake and its
+   absence would change nothing.
 2. Put `aiProcess_FlipUVs` back and look carefully before deciding whether it is broken. Then
    find the visor. This is the most valuable five minutes in the chapter.
-3. Delete the `white_texture` fallback and let a material with no base colour map leave its
+3. Print the `v` range of every UV in the mesh, bucketed into tenths. You should see clusters
+   rather than a uniform spread — those are the islands — and you can then predict which
+   bucket's paint lands where under `v → 1 − v` before running it.
+4. Delete the `white_texture` fallback and let a material with no base colour map leave its
    descriptor unwritten. Run it with the validation layers on and read what they say — this is
    the cheapest way to see why a bound-but-never-written descriptor is a different class of
    bug from a null pointer.
-4. Print every texture type the material reports, with its `"*N"` path, and compare the numbers
+5. Print every texture type the material reports, with its `"*N"` path, and compare the numbers
    against the `.glb`'s own JSON — the file is readable with `python3 -c "import json, struct"`
    and twenty lines. Do the indices line up for every map?
-5. Size the descriptor pool to one set instead of `material_count` and read the error. Then
+6. Size the descriptor pool to one set instead of `material_count` and read the error. Then
    decide where a real renderer should get that number from, given that it must be known before
    any model is loaded.
-6. Give `Mesh` its own `glm::mat4 transform` and push that instead of the shared model matrix.
-   Nothing will move, because `PreTransformVertices` has already baked every transform into the
-   vertices — which is precisely the machinery 3.3 replaces.
+7. Give `Mesh` its own `glm::mat4 transform` and push that instead of the shared model matrix.
+   Nothing will move, because `aiProcess_PreTransformVertices` has already baked every transform
+   into the vertices — which is precisely the machinery 3.3 replaces.
 
 Next: 3.3, where the node hierarchy stops being baked away and a model becomes a tree rather
 than a list.

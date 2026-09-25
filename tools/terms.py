@@ -12,8 +12,9 @@ works out where each one first appears, and checks that chapter's article mentio
     python3 tools/terms.py --part 1
     python3 tools/terms.py --chapter 1.7 -v
     python3 tools/terms.py --part 1 --constants    # include the soft tier
+    python3 tools/terms.py --part 3 --library      # include Assimp's names
 
-Two tiers, because they need different standards:
+Three tiers, because they need different standards:
 
   * Types (`VkFoo`) and functions (`vkFoo`) are the hard gate. Each one is a distinct
     object or operation with its own semantics; meeting one unexplained is a real gap.
@@ -23,7 +24,21 @@ Two tiers, because they need different standards:
     blend factors were explained -- so gating on them individually produces noise
     rather than signal. `allowlist.json` records the families deemed self-evident.
 
-Exit status is non-zero when the hard tier fails, so this is usable as a check.
+  * Assimp's names (`aiFoo`, `AI_FOO`) are reported only with --library, because only
+    Part 3 has any. That part is the one place where the new vocabulary a chapter
+    teaches belongs to a third-party library rather than to Vulkan, so the other two
+    tiers are blind exactly where the reader needs them most: Part 3 introduces no new
+    Vulkan type or function at all, and both tiers pass it while five Assimp names sit
+    in the samples unexplained.
+
+    Matching is literal, for the reason the constant tier is: `aiString` and `aiColor4D`
+    have no natural English form that would not also match ordinary prose about strings
+    and colours. Post-processing flags keep their suffix (`aiProcess_Triangulate`, not
+    `aiProcess`) because in Assimp the flags *are* the library, and each is a separate
+    pass over the data that a reader has to choose deliberately.
+
+Exit status is non-zero when a hard tier fails, so this is usable as a check. The
+library tier is hard when it is asked for.
 """
 
 from __future__ import annotations
@@ -46,6 +61,7 @@ FENCE = re.compile(r"^\s*(```|~~~)")
 TYPE = re.compile(r"\bVk[A-Z][A-Za-z0-9]*")
 FUNCTION = re.compile(r"\bvk[A-Z][A-Za-z0-9]*")
 CONSTANT = re.compile(r"\bVK_[A-Z0-9_]+")
+LIBRARY = re.compile(r"\bai[A-Z][A-Za-z0-9_]*|\bAI_[A-Z0-9_]+")
 
 CAMEL = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*")
 
@@ -136,6 +152,8 @@ def main() -> int:
     parser.add_argument("--chapter", help="chapter id prefix, e.g. 1.7")
     parser.add_argument("--constants", action="store_true",
                         help="also report enum constants (soft tier)")
+    parser.add_argument("--library", action="store_true",
+                        help="also gate Assimp's names (Part 3 only)")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="list every unexplained name")
     args = parser.parse_args()
@@ -154,12 +172,14 @@ def main() -> int:
         text = sample_text(CODE / chapter["sample"])
         names = set(TYPE.findall(text)) | set(FUNCTION.findall(text))
         constants = set(CONSTANT.findall(text))
+        library = set(LIBRARY.findall(text))
         # VK_ constants match the type pattern too; keep the tiers disjoint.
         names -= constants
 
         new_names = sorted(names - seen)
         new_constants = sorted(constants - seen)
-        seen |= names | constants
+        new_library = sorted(library - seen)
+        seen |= names | constants | library
 
         article = DOCS / chapter["article"]
         explained = prose(article) if article.exists() else ""
@@ -172,8 +192,11 @@ def main() -> int:
             c for c in new_constants
             if c not in explained and c not in allowed and not c.startswith(families)
         ]
+        # Literal too, and for the same reason: see the tier note in the docstring.
+        missing_library = [n for n in new_library
+                           if n not in explained and n not in allowed]
         rows.append((chapter["id"], new_names, missing, new_constants,
-                     missing_constants))
+                     missing_constants, new_library, missing_library))
 
     if args.part:
         rows = [r for r in rows if r[0].startswith(f"{args.part}.")]
@@ -187,19 +210,24 @@ def main() -> int:
     header = f"{'chapter':24}{'new':>6}{'unexplained':>13}"
     if args.constants:
         header += f"{'consts':>8}{'unexplained':>13}"
+    if args.library:
+        header += f"{'assimp':>8}{'unexplained':>13}"
     print(header)
 
     failures = 0
-    for cid, new_names, missing, new_constants, missing_constants in rows:
+    for (cid, new_names, missing, new_constants, missing_constants,
+         new_library, missing_library) in rows:
         line = f"{cid:24}{len(new_names):6}{len(missing):13}"
         if args.constants:
             line += f"{len(new_constants):8}{len(missing_constants):13}"
+        if args.library:
+            line += f"{len(new_library):8}{len(missing_library):13}"
         print(line)
-        if missing:
+        if missing or (args.library and missing_library):
             failures += 1
 
     if args.verbose:
-        for cid, _, missing, _, missing_constants in rows:
+        for cid, _, missing, _, missing_constants, _, missing_library in rows:
             if missing:
                 print(f"\n{cid} types/functions:")
                 for name in missing:
@@ -208,13 +236,17 @@ def main() -> int:
                 print(f"\n{cid} constants:")
                 for name in missing_constants:
                     print(f"    {name}")
+            if args.library and missing_library:
+                print(f"\n{cid} assimp:")
+                for name in missing_library:
+                    print(f"    {name}")
 
     if failures:
-        print(f"\n{failures} chapter(s) use a Vulkan type or function the article "
-              f"never mentions in prose.")
+        print(f"\n{failures} chapter(s) use a name the article never mentions in "
+              f"prose.")
         return 1
-    print("\nevery type and function is named in the prose of the chapter that "
-          "introduces it.")
+    print("\nevery name in the hard tiers is explained in the prose of the chapter "
+          "that introduces it.")
     return 0
 
 

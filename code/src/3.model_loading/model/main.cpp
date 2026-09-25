@@ -12,7 +12,7 @@
 //
 // The measurable consequence is smaller than it sounds and larger than it looks. Drop the
 // flag without walking the tree and DamagedHelmet -- one mesh, one node -- lies on its
-// back, because that node carries a -90 degree rotation about X. FlightHelmet, six meshes
+// back, because that node carries a +90 degree rotation about X. FlightHelmet, six meshes
 // and six nodes, does not move at all: every one of its transforms is identity. Both
 // facts are in this chapter's log output, and both are the point.
 
