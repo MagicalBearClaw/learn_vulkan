@@ -28,7 +28,7 @@ struct ImageDesc {
     // Asks for VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT and makes the bundled view a
     // VK_IMAGE_VIEW_TYPE_CUBE, so the image is sampled by direction rather than by a
     // uv pair. Requires array_layers == 6, in the order the specification fixes:
-    // +X, -X, +Y, -Y, +Z, -Z. Chapter 4.4 builds one of these by hand and explains
+    // +X, -X, +Y, -Y, +Z, -Z. Chapter 4.4 is the first to use one and explains
     // every field of it.
     bool cube = false;
 };
@@ -103,7 +103,7 @@ private:
 // in SHADER_READ_ONLY_OPTIMAL. The files must be given in the order the specification
 // fixes -- +X, -X, +Y, -Y, +Z, -Z -- because the array layer *is* the face.
 //
-// Chapter 4.4 writes this out in full and explains why the image needs
+// Chapter 4.4 is the first caller, and explains why the image needs
 // CUBE_COMPATIBLE, why the view type is CUBE, and why every face is uploaded from one
 // staging buffer with one copy region each.
 [[nodiscard]] Image load_cubemap(Context& context,

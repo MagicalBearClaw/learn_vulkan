@@ -1626,7 +1626,8 @@ Five pipeline handles and two booleans. The booleans are the chapter: everything
 between is state, and none of it is code.
 
 :::note[What moved into vkcommon]
-Three setters on `PipelineBuilder`, all of them pass-throughs:
+Nothing. The three `PipelineBuilder` setters this chapter calls have been in `vkcommon`
+since 1.7, which wrote them out and said they would wait for this chapter:
 
 ```cpp title="code/common/scaffold/include/vkc/pipeline.hpp"
 PipelineBuilder& depth_bias(float constant_factor, float slope_factor);
@@ -1634,13 +1635,12 @@ PipelineBuilder& stencil_attachment(VkFormat format);
 PipelineBuilder& stencil_test(VkStencilOpState front, VkStencilOpState back);
 ```
 
-The two `VkStencilOpState` structs are still written out field by field in this chapter's
-`main.cpp`, as 1.9 did with its specialisation entries. The builder carries them; it does
-not decide anything.
+They are pass-throughs: the two `VkStencilOpState` structs are still written out field by
+field in this chapter's `main.cpp`, and the builder carries them without deciding anything.
 
-The depth-stencil *buffer* stayed here rather than moving. vkcommon's
-`create_depth_buffer()` is 1.13's, produces a depth-only image, and every chapter from 1.13
-to 3.4 still wants exactly that.
+The depth-stencil *buffer* is written here rather than taken from `vkcommon`, because
+vkcommon's `create_depth_buffer()` is 1.13's, produces a depth-only image, and every chapter
+from 1.13 to 3.4 still wants exactly that.
 :::
 
 ## What changed since 3.4
@@ -1649,7 +1649,7 @@ to 3.4 still wants exactly that.
 - an image whose aspect mask, view and layout all name depth *and* stencil
 - a third attachment in `VkRenderingInfo`, pointing at the same view as the second
 - five pipelines that differ only in depth and stencil state, sharing two fragment shaders
-- `depth_bias`, `stencil_attachment` and `stencil_test` on `PipelineBuilder`
+- the first calls to 1.7's `depth_bias`, `stencil_attachment` and `stencil_test`
 - Part 4 opens with 26 chapters in the build
 
 ## Words introduced in this chapter

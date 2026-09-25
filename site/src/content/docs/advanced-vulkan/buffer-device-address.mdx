@@ -1,6 +1,6 @@
 ---
 title: "Buffer Device Address"
-description: A buffer can have a plain 64-bit address, and a shader can dereference it. Descriptors stop being how data is found, vertex fetch becomes four lines of shader, and a frame's data becomes one bump allocation.
+description: A buffer can have a plain 64-bit address, and a shader can dereference it. Descriptors stop being how data is found, vertex fetch becomes one line of shader, and a frame's data becomes one bump allocation.
 sidebar:
   order: 5
 ---
@@ -20,25 +20,101 @@ named by the pipeline. Six objects standing between a shader and some bytes.
 Chapter 4.4 paid that price seven times a frame. It drew the scene once for the screen
 and once into each of six cube faces, and those seven passes differ only in two
 matrices — so it needed seven uniform buffers, doubled for frames in flight, and
-fourteen descriptor sets to point at them. Fourteen sets to say fourteen numbers'
-worth of difference.
+fourteen descriptor sets to point at them.
 
 There is another way, and it has been sitting in the device features since chapter 1.3.
-A buffer can be asked for its **address**: an ordinary 64-bit number naming where it
+A buffer can be asked for its **device address**: an ordinary 64-bit number naming where it
 starts in the GPU's address space. Put that number in a push constant, and the shader
-dereferences it. No descriptor, no set, no pool, no layout, nothing to keep in step.
+dereferences it. No descriptor, no set, no pool, no layout, nothing to keep in step. The
+feature is called **buffer device address**.
 
 - <kbd>1</kbd> sway the ferns, to show the per-frame data is genuinely per-frame
 - <kbd>2</kbd> report what this frame put in the arena, and at which addresses
 
+The scene is 4.4's. The environment map is 4.4's too — the ferns, crates, sky, the six face
+passes, `create_face_views`, `create_cubemaps` and `make_sphere` are all carried over
+unchanged, and so are the cube faces' two windings. What this chapter rewrites is every
+place a buffer meets a shader. The build file names the two shaders:
+
+```cmake title="code/src/4.advanced_vulkan/buffer_device_address/CMakeLists.txt"
+add_chapter(4.5.buffer_device_address
+    SOURCES main.cpp
+    SHADERS scene.slang environment.slang
+)
+```
+
+and the includes add `<cmath>` for the sway's `std::sin`, and `<format>` and `<stdexcept>`
+for the one error this chapter can raise:
+
+```cpp title="code/src/4.advanced_vulkan/buffer_device_address/main.cpp"
+#include <vkc/app.hpp>
+#include <vkc/buffer.hpp>
+#include <vkc/camera.hpp>
+#include <vkc/check.hpp>
+#include <vkc/frame.hpp>
+#include <vkc/image.hpp>
+#include <vkc/paths.hpp>
+#include <vkc/pipeline.hpp>
+
+#include <SDL3/SDL.h>
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_inverse.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <spdlog/spdlog.h>
+
+#include <array>
+#include <cmath>
+#include <cstddef>
+#include <cstdlib>
+#include <cstring>
+#include <exception>
+#include <filesystem>
+#include <format>
+#include <numbers>
+#include <span>
+#include <stdexcept>
+#include <vector>
+```
+
+One piece of 4.4's scene data changes shape. The six face cameras lose their names — nothing
+in this chapter logs them — so the table is forward and up alone, the same twelve vectors
+4.4 checked against the specification's face-selection table:
+
+```cpp title="code/src/4.advanced_vulkan/buffer_device_address/main.cpp"
+struct CubeFace {
+    glm::vec3 forward;
+    glm::vec3 up;
+};
+constexpr std::array<CubeFace, 6> kCubeFaces{{
+    {{1.0F, 0.0F, 0.0F}, {0.0F, -1.0F, 0.0F}},
+    {{-1.0F, 0.0F, 0.0F}, {0.0F, -1.0F, 0.0F}},
+    {{0.0F, 1.0F, 0.0F}, {0.0F, 0.0F, 1.0F}},
+    {{0.0F, -1.0F, 0.0F}, {0.0F, 0.0F, -1.0F}},
+    {{0.0F, 0.0F, 1.0F}, {0.0F, -1.0F, 0.0F}},
+    {{0.0F, 0.0F, -1.0F}, {0.0F, -1.0F, 0.0F}},
+}};
+```
+
 ## A buffer can have an address
 
 Two things have to be true first. The device must have been created with
-`VkPhysicalDeviceVulkan12Features::bufferDeviceAddress`, which `vkcommon` has asked for
-since Part 1, and the buffer must have been created with
-`VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT`. Then:
+`VkPhysicalDeviceVulkan12Features::bufferDeviceAddress`, which you enabled in 1.3, and the
+buffer must have been created with `VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT`. Then:
 
 ```cpp title="code/src/4.advanced_vulkan/buffer_device_address/main.cpp"
+// ---------------------------------------------------------------------------
+// Addresses
+// ---------------------------------------------------------------------------
+
+// The three lines this chapter is about.
+//
+// The address is a property of the buffer and does not change for as long as the buffer
+// lives, so this is worth calling once and keeping rather than calling per frame. It is
+// also legal to call only because the buffer asked for
+// VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT at creation and the device was created with
+// VkPhysicalDeviceVulkan12Features::bufferDeviceAddress -- the validation layers say so
+// plainly if either is missing, which is the best possible outcome for a feature whose
+// failure mode is otherwise a wild pointer.
 [[nodiscard]] VkDeviceAddress buffer_address(VkDevice device, VkBuffer buffer) {
     const VkBufferDeviceAddressInfo info{
         .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
@@ -49,9 +125,10 @@ since Part 1, and the buffer must have been created with
 }
 ```
 
-That is the whole API. `VkDeviceAddress` is a `uint64_t`, the value is a real address in
-the GPU's virtual address space, and it does not change for as long as the buffer lives
-— so this is worth calling once when the buffer is created rather than once per frame.
+That is the whole API. `vkGetBufferDeviceAddress` takes a `VkBufferDeviceAddressInfo` naming
+the buffer and returns a `VkDeviceAddress`, which is a `uint64_t`. The value is a real address
+in the GPU's virtual address space, and it does not change for as long as the buffer lives —
+so it is worth calling once when the buffer is created rather than once per frame.
 
 Press <kbd>2</kbd> and the sample prints the addresses it is working with:
 
@@ -73,9 +150,58 @@ occasionally more than you wanted to know.
 
 ## The shader dereferences it
 
-Slang spells a pointer the way C++ does.
+Here is the scene shader, from the top. Slang spells a **pointer** the way C++ does, and
+the structs it points at are declared first:
 
 ```slang title="code/src/4.advanced_vulkan/buffer_device_address/scene.slang"
+// 4.5 The scene shader, with every buffer it reads reached through a pointer.
+//
+// Compare this with 4.4's version. The lighting is identical, the outputs are identical,
+// and the first twenty lines are completely different: there is no ConstantBuffer, no
+// binding for per-frame data, and no vertex input struct. Everything the shader needs
+// arrives as an address in the push constant and is dereferenced here.
+
+// The vertex, as the shader sees it -- and this declaration is now load-bearing in a way
+// it never was. A [[vk::location(0)]] float3 used to be a request that the hardware
+// convert whatever the vertex attribute description described into a float3. There is no
+// conversion step left: these bytes are read straight out of memory, so this struct has
+// to match the C++ one exactly.
+//
+// It does, and not by luck. Slang lays a struct behind a pointer out the way a C++
+// compiler would: float3 occupies twelve bytes and the next member starts right after
+// it. That is what makes `struct Vertex` here and `struct Vertex` in main.cpp the same
+// thirty-two bytes. A uniform buffer would have obeyed std140 instead, rounded each
+// float3 up to sixteen, and silently disagreed.
+struct Vertex {
+    float3 position;
+    float3 normal;
+    float2 uv;
+};
+
+// 4.4's Globals, unchanged. It was a ConstantBuffer then and is a pointer target now,
+// which needed no edit at all: a layout that satisfied std140 also satisfies this.
+struct Globals {
+    float4x4 view;
+    float4x4 projection;
+    float4x4 view_rotation;
+    float4 view_position;
+    float4 sun_direction;
+    float4 sun_colour;
+    float4 ambient;  // rgb ambient, w shininess
+};
+
+// 4.4's push-constant block, which has moved into memory. float3x3 rather than the three
+// padded float4 it needed as a uniform: thirty-six bytes, matching a glm::mat3 exactly.
+struct DrawData {
+    float4x4 model;
+    float3x3 normal_matrix;
+    float4 colour;
+};
+
+// The three pointers and the index. A pointer in Slang is written exactly as it is in
+// C++, and compiles to SPIR-V's PhysicalStorageBuffer storage class -- the module
+// declares the PhysicalStorageBufferAddresses capability and a 64-bit addressing model
+// because of these four lines.
 struct PushConstants {
     Globals* globals;
     DrawData* draws;
@@ -83,20 +209,54 @@ struct PushConstants {
     uint draw_index;
 };
 [[vk::push_constant]] PushConstants push;
+
+// The one descriptor left in the sample. An image cannot be reached by address.
+[[vk::binding(0, 0)]] Sampler2D base_colour_map;
 ```
 
-and dereferences it the way C++ does, with `*p`, `p->field`, `p.field` and `p[i]` all
-meaning what you expect:
+`Globals* globals` is a pointer to a `Globals`: a 64-bit address, dereferenced with
+`p->field`, `p.field` (Slang accepts both) or `p[i]`. The push block is now three addresses
+and an index. The single remaining descriptor is the texture, bound at set 0 — the frame
+set is gone, so the textures moved down a slot.
 
-```slang
-Vertex vertex = push.vertices[vertex_id];
-DrawData draw = push.draws[push.draw_index];
-...
-output.position = mul(push.globals.projection, mul(push.globals.view, world));
+The vertex stage reads everything it needs through those addresses:
+
+```slang title="code/src/4.advanced_vulkan/buffer_device_address/scene.slang"
+struct VSOutput {
+    float4 position : SV_Position;
+    [[vk::location(0)]] float3 world_position;
+    [[vk::location(1)]] float3 normal;
+    [[vk::location(2)]] float2 uv;
+};
+
+static const float kSpecularStrength = 0.2;
+static const float kCutoutThreshold = 0.5;
+
+[shader("vertex")]
+VSOutput vertexMain(uint vertex_id : SV_VulkanVertexID) {
+    // Vertex fetch, written out. SV_VulkanVertexID is the index the index buffer
+    // produced, and the index buffer is still bound through the command buffer -- index
+    // fetch is fixed-function hardware that runs before any shader. Vertex fetch is not,
+    // any more; it is this line.
+    Vertex vertex = push.vertices[vertex_id];
+    DrawData draw = push.draws[push.draw_index];
+
+    VSOutput output;
+    float4 world = mul(draw.model, float4(vertex.position, 1.0));
+    output.world_position = world.xyz;
+    output.position = mul(push.globals.projection, mul(push.globals.view, world));
+    output.normal = mul(draw.normal_matrix, vertex.normal);
+    output.uv = vertex.uv;
+    return output;
+}
 ```
 
-Those four lines are why the module comes out of Slang declaring a different memory
-model from every other shader in this series:
+`push.vertices[vertex_id]` is pointer indexing: the address of element 0, plus `vertex_id`
+times `sizeof(Vertex)`, loaded. `push.draws[push.draw_index]` is the same for this object's
+row of per-object data.
+
+Those pointers are why the module comes out of Slang declaring a different memory model from
+every other shader in this series:
 
 ```text
 OpCapability PhysicalStorageBufferAddresses
@@ -106,18 +266,62 @@ OpMemoryModel PhysicalStorageBuffer64 GLSL450
 ```
 
 A pointer is not a Vulkan concept that SPIR-V borrows. It is a SPIR-V storage class —
-`PhysicalStorageBuffer` — and `vkGetBufferDeviceAddress` is the one function that
+**`PhysicalStorageBuffer`** — and `vkGetBufferDeviceAddress` is the one function that
 connects it to an object you created.
 
+The fragment stage is 4.4's, reading through `push.globals` instead of a bound block, and
+taking its tint from this object's `DrawData` rather than from the push constant:
+
+```slang title="code/src/4.advanced_vulkan/buffer_device_address/scene.slang"
+float3 shade(VSOutput input, float3 albedo, bool two_sided) {
+    float3 normal = normalize(input.normal);
+    // Reading two fields out of a 256-byte struct through a pointer, rather than binding
+    // the whole struct and reading two fields out of it. The generated code is the same
+    // shape either way: an address, an offset, a load.
+    float3 to_eye = normalize(push.globals.view_position.xyz - input.world_position);
+    if (two_sided && dot(normal, to_eye) < 0.0) {
+        normal = -normal;
+    }
+
+    float3 to_sun = normalize(-push.globals.sun_direction.xyz);
+
+    float diffuse_amount = max(dot(normal, to_sun), 0.0);
+    float3 diffuse = push.globals.sun_colour.rgb * diffuse_amount * albedo;
+
+    float3 reflected = reflect(-to_sun, normal);
+    float specular_amount =
+        pow(max(dot(to_eye, reflected), 0.0), push.globals.ambient.w);
+    float3 specular = push.globals.sun_colour.rgb * specular_amount * kSpecularStrength;
+
+    return push.globals.ambient.rgb * albedo + diffuse + specular;
+}
+
+[shader("fragment")]
+float4 fragmentMain(VSOutput input) : SV_Target {
+    float3 tint = push.draws[push.draw_index].colour.rgb;
+    float3 albedo = base_colour_map.Sample(input.uv).rgb * tint;
+    return float4(shade(input, albedo, false), 1.0);
+}
+
+[shader("fragment")]
+float4 cutoutFragmentMain(VSOutput input) : SV_Target {
+    float4 sampled = base_colour_map.Sample(input.uv);
+    if (sampled.a < kCutoutThreshold) {
+        discard;
+    }
+    float3 tint = push.draws[push.draw_index].colour.rgb;
+    return float4(shade(input, sampled.rgb * tint, true), 1.0);
+}
+```
+
 Note what is now *absent* from the pipeline layout. There is no descriptor set for
-per-frame data and no binding number for it, so there is nothing to keep in step
-between the shader and the C++. The only thing the two sides must agree on is the shape
-of the structs — which is the next section, and it is where this chapter's one real
-trap lives.
+per-frame data and no binding number for it, so there is nothing to keep in step between the
+shader and the C++. The only thing the two sides must agree on is the shape of the structs —
+which is the next section, and it is where this chapter's one real trap lives.
 
 ## Natural layout is scalar layout, and scalar layout is a feature
 
-The first run of this sample did not draw anything. It printed this, twice:
+When this sample was first written, its first run drew nothing and printed this, twice:
 
 ```text
 vkCreateShaderModule(): pCreateInfo->pCode (spirv-val produced an error):
@@ -127,40 +331,72 @@ straddling vector at offset 12
   %Vertex_natural = OpTypeStruct %v3float %v3float %v2float
 ```
 
-The struct it is complaining about is the vertex, and it is the most ordinary struct in
-the entire project:
+The struct it is complaining about is the vertex, and it is the most ordinary struct in the
+entire project:
 
-```slang
+```cpp title="code/src/4.advanced_vulkan/buffer_device_address/main.cpp"
+// 4.4's vertex, unchanged -- and now read by the shader rather than fed to it. The
+// layout matters in a way it never did before: a vertex attribute description used to
+// translate between these bytes and the shader's idea of them, and there is no
+// translation layer left. See the note on `struct Vertex` in scene.slang.
 struct Vertex {
-    float3 position;
-    float3 normal;
-    float2 uv;
+    glm::vec3 position;
+    glm::vec3 normal;
+    glm::vec2 uv;
 };
+static_assert(sizeof(Vertex) == 32);
 ```
 
 `position` occupies bytes 0 to 12. `normal` therefore starts at byte 12 and ends at byte
-24 — and in doing so it crosses the 16-byte boundary in the middle. The default layout
-rules for a block forbid that. They are the rules a uniform or storage block has always
-followed, and they exist because the hardware that fetches a `vec3` would rather not
-fetch it in two pieces.
+24 — and in doing so it crosses the 16-byte boundary in the middle. That is a
+**straddling vector**, and the default layout rules for a block forbid it: a vector may not
+cross a 16-byte boundary unless it starts on one. They are the rules a uniform or storage
+block has always followed, and they exist because the hardware that fetches a `vec3` would
+rather not fetch it in two pieces.
 
-The fix is a device feature, and it is one line:
+The fix is a device feature, and you already have it. Chapter 1.3 enabled it, with a comment
+saying this chapter would be the first to need it:
 
-```cpp title="code/common/scaffold/src/context.cpp"
+```cpp title="code/common/scaffold/src/device.cpp"
 features12.scalarBlockLayout = VK_TRUE;
 ```
 
-With `scalarBlockLayout`, a member is aligned to its own size and nothing more — which
-is exactly what a C++ compiler does. That single fact is what makes this chapter's data
-sharing work at all, and it is worth stating plainly:
+With **scalar block layout**, a member is aligned to the size of its components and nothing
+more — four bytes for anything built from `float` — which is exactly what a C++ compiler
+does. That single fact is what makes this chapter's data sharing work, and it is worth
+stating plainly:
 
 :::note[A struct behind a pointer is laid out like a C++ struct]
-This is the difference that makes addresses pleasant rather than merely possible. A
-uniform block obeys std140, where a three-float column is rounded up to sixteen bytes,
-so chapter 4.4's C++ had to pad its normal matrix by hand into three `glm::vec4`. Here
-it does not:
+A uniform block obeys std140, and a storage block std430; in both, a three-float column
+is aligned to sixteen bytes, so chapter 4.4's C++ had to pad its normal matrix by hand into
+three `glm::vec4`. Scalar layout does not. Work `DrawData` through both rules:
 
-```cpp
+```
+                          std430                  scalar
+   float4x4 model         0   .. 64               0   .. 64
+   float3x3 normal        64  .. 112  (3 × 16)    64  .. 100  (3 × 12)
+   float4   colour        112 .. 128              100 .. 116
+   size                   128                     116
+```
+
+A `glm::mat3` is 36 bytes with 4-byte alignment, so the C++ struct is the right-hand column
+exactly:
+
+```cpp title="code/src/4.advanced_vulkan/buffer_device_address/main.cpp"
+// One object's share of the frame. This is 4.4's push-constant block, moved out of the
+// command buffer and into memory: the same three fields, written once per frame per
+// object instead of re-pushed for every one of the seven passes that draws it.
+//
+// The normal matrix is a glm::mat3 here and was three glm::vec4 in 4.4. That is not a
+// tidy-up, it is the layout rule changing. A uniform block obeys std140, where a
+// three-float column is rounded up to sixteen bytes, so the C++ side had to pad by hand
+// to match. A struct reached through a pointer is laid out the way Slang lays out a
+// struct -- tightly, exactly as a C++ compiler would -- so a 36-byte glm::mat3 and a
+// 36-byte float3x3 are the same 36 bytes and the padding simply stops existing.
+//
+// The static_asserts are the check. If glm ever aligned its vectors differently, or
+// Slang changed its mind about packing, this stops compiling rather than rendering
+// something subtly wrong.
 struct DrawData {
     glm::mat4 model;           // 0
     glm::mat3 normal_matrix;   // 64
@@ -171,134 +407,1072 @@ static_assert(offsetof(DrawData, colour) == 100);
 static_assert(sizeof(DrawData) == 116);
 ```
 
-A `glm::mat3` is 36 bytes. A Slang `float3x3` behind a pointer is 36 bytes. The padding
-stops existing, and 116 is not a number you would ever see in a uniform buffer.
+The padding stops existing, and 116 is not a number you would ever see in a uniform buffer.
 
 The `static_assert`s are the check, and they are not decoration. Nothing at run time
-compares the C++ struct against the Slang one — there is no descriptor to describe it
-and no validation layer that can see both sides. If the two ever disagree, the shader
-reads the wrong bytes and draws something plausible. Assert the offsets you rely on, so
-that a disagreement stops the build instead of shipping.
+compares the C++ struct against the Slang one — there is no descriptor to describe it and no
+validation layer that can see both sides. If the two ever disagree, the shader reads the
+wrong bytes and draws something plausible. Assert the offsets you rely on, so that a
+disagreement stops the build instead of shipping.
 :::
+
+`Globals` needed no edit at all. Every member is a `mat4` or a `vec4`, which sit on 16-byte
+boundaries under every rule, so a layout that satisfied std140 also satisfies scalar:
+
+```cpp title="code/src/4.advanced_vulkan/buffer_device_address/main.cpp"
+// ---------------------------------------------------------------------------
+// What the shaders read through a pointer
+// ---------------------------------------------------------------------------
+
+// Byte for byte 4.4's uniform block, and no longer a uniform block. Nothing about the
+// contents changed, because nothing needed to: a struct that satisfied std140 also
+// satisfies the plainer rule a pointer follows.
+struct Globals {
+    glm::mat4 view;           // 0
+    glm::mat4 projection;     // 64
+    glm::mat4 view_rotation;  // 128
+    glm::vec4 view_position;  // 192
+    glm::vec4 sun_direction;  // 208
+    glm::vec4 sun_colour;     // 224
+    glm::vec4 ambient;        // 240, w is the specular exponent
+};
+static_assert(sizeof(Globals) == 256);
+```
+
+And the push block, which is three addresses and an index:
+
+```cpp title="code/src/4.advanced_vulkan/buffer_device_address/main.cpp"
+// The whole of what a draw call says now. Three addresses and an index, against 4.4's
+// 128 bytes of matrices -- and unlike those matrices, none of this has to be rebuilt
+// for each of the seven passes, because the addresses do not change between them.
+//
+// VkDeviceAddress is a uint64_t. Nothing in the type system distinguishes an address
+// into the globals from an address into the vertices, which is the honest cost of this
+// technique and the reason the three fields are named as carefully as they are.
+struct PushConstants {
+    VkDeviceAddress globals;   // 0
+    VkDeviceAddress draws;     // 8
+    VkDeviceAddress vertices;  // 16
+    uint32_t draw_index;       // 24
+};
+static_assert(offsetof(PushConstants, draw_index) == 24);
+static_assert(sizeof(PushConstants) == 32);
+
+// Where each object's DrawData sits in the array the frame writes. The order is fixed by
+// write_draws() below and nothing else may reorder it.
+constexpr uint32_t kFloorDraw = 0;
+constexpr uint32_t kFirstCrateDraw = kFloorDraw + 1;
+constexpr uint32_t kFirstFernDraw =
+    kFirstCrateDraw + static_cast<uint32_t>(kCrates.size());
+constexpr uint32_t kSphereDraw = kFirstFernDraw + static_cast<uint32_t>(kFerns.size());
+constexpr uint32_t kDrawCount = kSphereDraw + 1;
+```
+
+Three 8-byte addresses at 0, 8 and 16, and a 4-byte index at 24. That is 28 bytes, and
+`sizeof` says 32 because a struct is padded to a multiple of its largest member's
+alignment — 8, for the `uint64_t`s — so that an array of them would keep every address
+aligned. The `kFloorDraw` … `kDrawCount` constants fix each object's row in the per-object
+array; the sky borrows row 0 and never reads it.
 
 ## The frame arena
 
 With the layout settled, the per-frame buffers can collapse into one allocation.
 
-`FrameArena` is a mapped buffer and a cursor. Each frame resets it and writes into it
-from the top, and each write returns the address the bytes landed at:
+`FrameArena` is a mapped buffer and a cursor. Each frame resets it and writes into it from
+the top, and each write returns the address the bytes landed at. That shape — hand out the
+next free bytes, and free everything at once by resetting the cursor — is a
+**bump allocator**, and one per frame in flight is a **frame arena**:
 
 ```cpp title="code/src/4.advanced_vulkan/buffer_device_address/main.cpp"
-[[nodiscard]] VkDeviceAddress write(const void* data, VkDeviceSize bytes) {
-    constexpr VkDeviceSize kAlignment = 16;
-    const VkDeviceSize offset = (used_ + kAlignment - 1) & ~(kAlignment - 1);
-    if (offset + bytes > capacity_) {
-        throw std::runtime_error(...);
+// One frame's scratch memory: a mapped buffer and a cursor into it.
+//
+// Every frame writes its globals and its per-object data here from offset zero and hands
+// the shaders addresses inside it. There is one of these per frame in flight and they
+// are never synchronised against each other, because the frame that owns a slot has
+// already been waited on before it is reset -- the same argument that lets each frame
+// reuse its command buffer.
+//
+// Host-visible rather than device-local-plus-staging on purpose. This data is written
+// once by the CPU and read a handful of times by the GPU in the same frame; a copy would
+// cost a transfer, a barrier and a second allocation to save reads that are not the
+// bottleneck. Data that is read thousands of times, like the vertices below, is worth
+// staging. Data that changes every frame is usually not.
+class FrameArena {
+public:
+    void create(vkc::Context& context, VkDeviceSize bytes) {
+        buffer_ = vkc::Buffer(context.allocator(), bytes,
+                              VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                              VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                                  VMA_ALLOCATION_CREATE_MAPPED_BIT);
+        base_ = buffer_address(context.device(), buffer_.handle());
+        capacity_ = bytes;
+        used_ = 0;
     }
-    std::memcpy(static_cast<std::byte*>(buffer_.mapped()) + offset, data,
-                static_cast<size_t>(bytes));
-    used_ = offset + bytes;
-    return base_ + offset;
+
+    void destroy() noexcept { buffer_.destroy(); }
+
+    void reset() noexcept { used_ = 0; }
+
+    // Copies `bytes` into the arena and returns the address they landed at.
+    //
+    // Alignment is 16 because that is the alignment of the widest thing written here and
+    // costs nothing at this scale. The requirement is much weaker -- Slang emits loads
+    // decorated Aligned 4 for these structs -- but "the alignment of the type" is the
+    // rule that keeps being true when the types change.
+    [[nodiscard]] VkDeviceAddress write(const void* data, VkDeviceSize bytes) {
+        constexpr VkDeviceSize kAlignment = 16;
+        const VkDeviceSize offset = (used_ + kAlignment - 1) & ~(kAlignment - 1);
+        if (offset + bytes > capacity_) {
+            throw std::runtime_error(
+                std::format("Frame arena is full: {} bytes used, {} more wanted, {} "
+                            "total. Raise kArenaBytes.",
+                            offset, bytes, capacity_));
+        }
+        std::memcpy(static_cast<std::byte*>(buffer_.mapped()) + offset, data,
+                    static_cast<size_t>(bytes));
+        used_ = offset + bytes;
+        // Pointer arithmetic on the GPU's address space, done on the CPU. This is the
+        // entire suballocator: there is no Vulkan object for a range within a buffer,
+        // and there does not need to be one.
+        return base_ + offset;
+    }
+
+    [[nodiscard]] VkDeviceAddress base() const noexcept { return base_; }
+    [[nodiscard]] VkDeviceSize used() const noexcept { return used_; }
+    [[nodiscard]] VkDeviceSize capacity() const noexcept { return capacity_; }
+
+private:
+    vkc::Buffer buffer_;
+    VkDeviceAddress base_ = 0;
+    VkDeviceSize used_ = 0;
+    VkDeviceSize capacity_ = 0;
+};
+
+// 64 KiB, against the roughly 3 KiB a frame actually uses. Arena sizing is a guess that
+// wants to be generous: too small throws above, too large costs address space nobody is
+// competing for.
+constexpr VkDeviceSize kArenaBytes = 64 * 1024;
+```
+
+**The alignment rounding** is one line worth taking apart:
+
+```
+   offset  =  (used + a − 1)  &  ~(a − 1)          with a = 16
+```
+
+For a power of two `a`, the low `log₂ a` bits of a number are its remainder mod `a`, and
+`~(a − 1)` is a mask that clears exactly those bits — rounding *down* to a multiple of `a`.
+Adding `a − 1` first turns that into rounding *up*, except that a number already on a
+multiple is left alone. With `used = 1790`: `1790 + 15 = 1805`, and clearing the low four
+bits gives `1792`. With `used = 1792`: `1807` clears to `1792` again.
+
+**The last line is the entire suballocator.** There is no Vulkan object for "a range within
+a buffer" and there does not need to be one: a range within a buffer is an address, and
+addresses can be added to. Handing out pieces of one allocation this way is
+**suballocation**, and addresses make it free.
+
+Resetting the arena at the top of the frame needs no synchronisation, for the same reason
+the command buffer can be reused there. There is one arena per frame in flight, and the
+frame that owns this slot was waited on before the command buffer was handed over, so
+nothing on the GPU is still reading it.
+
+The arena is host-visible rather than device-local with a staging copy, which is the right
+trade for data like this and the wrong trade for the meshes. This data is written once by
+the CPU and read a handful of times by the GPU in the same frame; staging it would add a
+transfer, a barrier and a second allocation to optimise reads that are not the bottleneck.
+Vertices, read thousands of times per frame and written once ever, go the other way.
+
+The two arenas are created with the rest, and each object's `DrawData` is built by one
+helper:
+
+```cpp title="code/src/4.advanced_vulkan/buffer_device_address/main.cpp"
+    void create_depth_buffer(VkExtent2D extent) {
+        depth_ = vkc::create_depth_buffer(context(), depth_format_, extent);
+    }
+
+    void create_arenas() {
+        for (FrameArena& arena : arenas_) {
+            arena.create(context(), kArenaBytes);
+        }
+    }
+```
+
+```cpp title="code/src/4.advanced_vulkan/buffer_device_address/main.cpp"
+[[nodiscard]] DrawData draw_data_of(const glm::mat4& model, const glm::vec4& colour) {
+    return DrawData{
+        .model = model,
+        .normal_matrix = glm::inverseTranspose(glm::mat3(model)),
+        .colour = colour,
+    };
 }
 ```
 
-The last line is the entire suballocator. There is no Vulkan object for "a range within
-a buffer" and there does not need to be one: a range within a buffer is an address, and
-addresses can be added to.
+`glm::inverseTranspose(glm::mat3(model))` is 2.2's normal matrix, stored as the `mat3` it is
+rather than the three padded `vec4` a uniform needed.
 
-Resetting the arena at the top of the frame needs no synchronisation, for the same
-reason the command buffer can be reused there. There is one arena per frame in flight,
-and the frame that owns this slot was waited on before the command buffer was handed
-over, so nothing on the GPU is still reading it.
+### Filling it
 
-The arena is host-visible rather than device-local with a staging copy, which is the
-right trade for data like this and the wrong trade for the meshes. This data is written
-once by the CPU and read a handful of times by the GPU in the same frame; staging it
-would add a transfer, a barrier and a second allocation to optimise reads that are not
-the bottleneck. Vertices, read thousands of times per frame and written once ever, go
-the other way.
+`on_render` resets this frame's arena and fills it before recording a single draw:
+
+```cpp title="code/src/4.advanced_vulkan/buffer_device_address/main.cpp"
+    void on_render(const vkc::FrameInfo& frame) override {
+        camera_.update(delta_time());
+
+        // Everything the shaders will read this frame is written here, into this frame
+        // slot's arena, in the order the frame happens to want it. The arena is emptied
+        // first: the GPU finished with the last frame that used this slot before the
+        // command buffer was handed over, so there is nothing left in it to protect.
+        FrameArena& arena = arenas_[frame.frame_number % vkc::kFramesInFlight];
+        arena.reset();
+        pushes_ = 0;
+
+        write_globals(arena, frame.extent);
+        write_draws(arena);
+
+        render_cube_faces(frame);
+        render_screen(frame);
+
+        if (report_) {
+            report(arena);
+            report_ = false;
+        }
+    }
+```
+
+The seven sets of per-pass constants, one `write` each:
+
+```cpp title="code/src/4.advanced_vulkan/buffer_device_address/main.cpp"
+private:
+    // ---------------------------------------------------------------------------
+    // Filling the arena
+    // ---------------------------------------------------------------------------
+
+    // Seven sets of per-pass constants, one per cube face and one for the screen. In 4.4
+    // these lived in seven separate VkBuffers with seven descriptor sets pointing at
+    // them, times two for the frames in flight. Here they are seven consecutive structs
+    // in one allocation, and what the shader is given is where each one starts.
+    void write_globals(FrameArena& arena, VkExtent2D screen_extent) {
+        const auto write = [&](size_t pass, const glm::mat4& view,
+                               const glm::mat4& projection, const glm::vec3& eye) {
+            const Globals globals{
+                .view = view,
+                .projection = projection,
+                .view_rotation = glm::mat4(glm::mat3(view)),
+                .view_position = glm::vec4(eye, 1.0F),
+                .sun_direction = glm::vec4(glm::normalize(kSunDirection), 0.0F),
+                .sun_colour = glm::vec4(kSunColour, 1.0F),
+                .ambient = glm::vec4(kAmbient, kShininess),
+            };
+            globals_[pass] = arena.write(&globals, sizeof(globals));
+        };
+
+        for (size_t face = 0; face < kFacePassCount; ++face) {
+            const glm::mat4 view =
+                glm::lookAt(kMirrorCentre, kMirrorCentre + kCubeFaces[face].forward,
+                            kCubeFaces[face].up);
+            write(face, view, face_projection(), kMirrorCentre);
+        }
+
+        write(kScreenPass, camera_.view(), screen_projection(screen_extent),
+              camera_.position);
+    }
+```
+
+and every object's per-object data as one array, one `write` for all ten:
+
+```cpp title="code/src/4.advanced_vulkan/buffer_device_address/main.cpp"
+    // The per-object data, rebuilt from nothing every frame and written as one array.
+    //
+    // Rebuilding a static scene every frame looks wasteful and is the point: the cost of
+    // a frame's worth of this data is one memcpy into mapped memory, so there is no
+    // reason to distinguish the objects that moved from the ones that did not. Press 1
+    // and the ferns start swaying without a single line here changing shape.
+    void write_draws(FrameArena& arena) {
+        draws_.clear();
+
+        draws_.push_back(draw_data_of(glm::mat4(1.0F), kWhite));
+
+        for (const Placement& crate : kCrates) {
+            draws_.push_back(draw_data_of(
+                glm::translate(model_of(crate), glm::vec3(0.0F, 0.5F, 0.0F)), kWhite));
+        }
+
+        for (size_t i = 0; i < kFerns.size(); ++i) {
+            glm::mat4 model = model_of(kFerns[i]);
+            if (sway_) {
+                // Around the base of the quad, so the fern leans rather than slides.
+                const float phase = elapsed() * 1.6F + static_cast<float>(i);
+                model = glm::rotate(model, kSwayAngle * std::sin(phase),
+                                    glm::vec3(0.0F, 0.0F, 1.0F));
+            }
+            draws_.push_back(draw_data_of(model, kWhite));
+        }
+
+        draws_.push_back(
+            draw_data_of(glm::translate(glm::mat4(1.0F), kMirrorCentre), kWhite));
+
+        // One write for every object in the scene. The shader is handed the address of
+        // element zero and picks its own element out with the index in the push
+        // constant, which is why the order above is fixed by the kFloorDraw constants
+        // and not by convenience.
+        draws_address_ = arena.write(draws_.data(), draws_.size() * sizeof(DrawData));
+    }
+```
+
+The fern's sway rotates about the quad's local `z` axis on the *right* of its model matrix,
+so it happens in the quad's own frame, about its foot — the fern leans rather than slides.
+`std::sin(phase)` swings between −1 and 1, so the lean is `±kSwayAngle`:
+
+```cpp title="code/src/4.advanced_vulkan/buffer_device_address/main.cpp"
+// How far a fern leans at the ends of its sway, in radians. Small on purpose: the point
+// of the key is that per-object data is rebuilt from nothing every frame, not that the
+// ferns are interesting.
+constexpr float kSwayAngle = 0.07F;
+```
 
 Press <kbd>2</kbd> and the sample reports what the frame actually cost:
+
+```cpp title="code/src/4.advanced_vulkan/buffer_device_address/main.cpp"
+    // What the frame actually cost, printed rather than reasoned about.
+    void report(const FrameArena& arena) const {
+        spdlog::info("arena: {} of {} bytes used -- {} globals x {} B, {} draws x {} B",
+                     arena.used(), arena.capacity(), kPassCount, sizeof(Globals),
+                     draws_.size(), sizeof(DrawData));
+        spdlog::info("       {} push constants x {} B recorded into the command buffer",
+                     pushes_, sizeof(PushConstants));
+        spdlog::info("addresses: arena base 0x{:x}, globals[0] 0x{:x}, draws 0x{:x}",
+                     arena.base(), globals_[0], draws_address_);
+        spdlog::info("           cube vertices 0x{:x}, quad 0x{:x}, sphere 0x{:x}",
+                     cube_.vertex_address, quad_.vertex_address, sphere_.vertex_address);
+    }
+```
 
 ```text
 arena: 2952 of 65536 bytes used -- 7 globals x 256 B, 10 draws x 116 B
        71 push constants x 32 B recorded into the command buffer
 ```
 
+The arithmetic checks: seven `Globals` at 256 bytes is 1 792, already a multiple of 16, so
+the draws start at `0x700` with no gap; ten `DrawData` at 116 bytes is 1 160; together 2 952.
+The 71 pushes are ten draws in each of six faces plus the sky there (6 × 10 = 60), then ten
+draws, the sphere and the sky on screen (11).
+
 Seven sets of per-pass constants and ten objects, in 2,952 bytes, in one allocation, with
-zero descriptors. Chapter 4.4 spent fourteen `VkBuffer`s and fourteen `VkDescriptorSet`s
-on the same seven sets of constants, and pushed the same 71 draws' worth of push
-constants at 128 bytes each rather than 32 — 9,088 bytes of matrices copied into the
-command buffer per frame, against 2,272 bytes of addresses.
+zero descriptors. Chapter 4.4 spent fourteen `VkBuffer`s and fourteen `VkDescriptorSet`s on
+the same seven sets of constants, and pushed the same 71 draws' worth of push constants at
+128 bytes each rather than 32 — 9,088 bytes of matrices copied into the command buffer per
+frame, against 2,272 bytes of addresses.
 
-The 128 bytes became 32 because the model matrix stopped travelling in the push
-constant. It is written into the arena once per frame and read by however many passes
-want it; 4.4 re-pushed it for every object in every one of the seven passes.
+The 128 bytes became 32 because the model matrix stopped travelling in the push constant. It
+is written into the arena once per frame and read by however many passes want it; 4.4
+re-pushed it for every object in every one of the seven passes.
 
-Press <kbd>1</kbd> to see why this is called dynamic data. The ferns start swaying,
-because their model matrices are rebuilt from nothing every frame — and no buffer is
-created, no descriptor is written, and no code changes shape to allow it. Rebuilding a
-static scene's transforms every frame looks wasteful and is not: it is one `memcpy` into
-mapped memory, which is cheaper than the bookkeeping needed to work out which objects
-moved.
+Press <kbd>1</kbd> to see why this is called dynamic data. The ferns start swaying, because
+their model matrices are rebuilt from nothing every frame — and no buffer is created, no
+descriptor is written, and no code changes shape to allow it.
 
 ## The vertex buffer stops being a vertex buffer
 
-If a shader can read a struct out of memory, it can read a vertex out of memory. This
-sample does, for everything it draws:
+If a shader can read a struct out of memory, it can read a vertex out of memory. This sample
+does, for everything it draws — the vertex shaders above begin with
+`push.vertices[vertex_id]`. Fetching vertices yourself like that, instead of having the
+fixed-function vertex input stage do it, is **vertex pulling**.
 
-```slang title="code/src/4.advanced_vulkan/buffer_device_address/scene.slang"
-[shader("vertex")]
-VSOutput vertexMain(uint vertex_id : SV_VulkanVertexID) {
-    Vertex vertex = push.vertices[vertex_id];
-    DrawData draw = push.draws[push.draw_index];
-    ...
+A mesh is now a pointer and an index buffer:
+
+```cpp title="code/src/4.advanced_vulkan/buffer_device_address/main.cpp"
+// ---------------------------------------------------------------------------
+// Meshes
+// ---------------------------------------------------------------------------
+
+// A mesh is now a pointer and an index buffer.
+//
+// The index buffer is still bound with vkCmdBindIndexBuffer, and that is not an
+// oversight: index fetch is fixed-function hardware that reads the buffer before any
+// shader runs, so it has to be told through the command buffer. Vertex fetch used to be
+// fixed-function too -- that is what a vertex attribute description configured -- and
+// here it is not fixed-function any more. It is four lines of shader.
+struct Mesh {
+    vkc::Buffer vertices;
+    vkc::Buffer indices;
+    VkDeviceAddress vertex_address = 0;
+    uint32_t index_count = 0;
+
+    void destroy() noexcept {
+        indices.destroy();
+        vertices.destroy();
+    }
+};
+
+[[nodiscard]] Mesh upload_mesh(vkc::Context& context, std::span<const Vertex> vertices,
+                               std::span<const uint16_t> indices) {
+    Mesh mesh;
+    // No VK_BUFFER_USAGE_VERTEX_BUFFER_BIT. This buffer is never bound as a vertex
+    // buffer, so claiming it can be is a promise the sample does not keep; the usage
+    // flags are what the driver picks memory and alignment from, and they should say
+    // what is true. SHADER_DEVICE_ADDRESS is what it is for now.
+    mesh.vertices =
+        vkc::upload_to_device_local(context, vertices.data(), vertices.size_bytes(),
+                                    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+    mesh.indices = vkc::upload_to_device_local(context, indices.data(),
+                                               indices.size_bytes(),
+                                               VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+    mesh.vertex_address = buffer_address(context.device(), mesh.vertices.handle());
+    mesh.index_count = static_cast<uint32_t>(indices.size());
+    return mesh;
 }
 ```
 
 There is no `VSInput` struct, no `[[vk::location(0)]]` anywhere, and correspondingly no
 `vertex_input()` call on any pipeline builder in `create_pipelines()` and no
 `vkCmdBindVertexBuffers` call anywhere in `main.cpp`. Every pipeline is created with zero
-vertex bindings and zero attributes, because vertex fetch is no longer a fixed-function
-stage being configured. It is a load.
+vertex bindings and zero attributes, because vertex fetch is no longer a fixed-function stage
+being configured. It is a load.
 
 Three details are worth pausing on.
 
 **The index buffer is still bound**, with `vkCmdBindIndexBuffer`. That is not an
-inconsistency. Index fetch really is fixed-function hardware, running before any shader
+inconsistency. **Index fetch** really is fixed-function hardware, running before any shader
 to decide which vertices to run it on, so it has to be told through the command buffer.
 `SV_VulkanVertexID` is the index that hardware produced.
 
-**The vertex buffers no longer ask for `VK_BUFFER_USAGE_VERTEX_BUFFER_BIT`.** They ask
-for `VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT` instead, because usage flags are what
-the driver chooses memory type and alignment from, and they should say what is true.
+**The vertex buffers no longer ask for `VK_BUFFER_USAGE_VERTEX_BUFFER_BIT`.** They ask for
+`VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT` instead, because usage flags are what the driver
+chooses memory type and alignment from, and they should say what is true.
 
 **A validation problem disappeared.** Chapter 4.4 had to give each pipeline a hand-cut
-subspan of its attribute array, because the skybox reads only the position and the
-layers report every declared attribute a shader does not consume. Here the question
-cannot arise: the pipeline describes no vertex layout, and each shader reads the fields
-it wants. The skybox reads exactly one:
+subspan of its attribute array, because the skybox reads only the position and the layers
+report every declared attribute a shader does not consume. Here the question cannot arise:
+the pipeline describes no vertex layout, and each shader reads the fields it wants.
+
+The environment shader repeats the four struct declarations — Slang has no shared header
+between the two files yet, which 4.6 is about — and binds its cubemap at set 0:
 
 ```slang title="code/src/4.advanced_vulkan/buffer_device_address/environment.slang"
-float3 position = push.vertices[vertex_id].position;
+// 4.5 The sky and the mirrored sphere, reading their vertices and their frame constants
+// through pointers.
+//
+// 4.4 explains what these two shaders do and why a sky and a mirror are the same lookup
+// with different vectors. What is different here is only the plumbing, and the skybox
+// shows it at its plainest: it reads one field out of one vertex, and the pipeline it
+// belongs to declares no vertex state whatsoever.
+
+struct Vertex {
+    float3 position;
+    float3 normal;
+    float2 uv;
+};
+
+struct Globals {
+    float4x4 view;
+    float4x4 projection;
+    float4x4 view_rotation;
+    float4 view_position;
+    float4 sun_direction;
+    float4 sun_colour;
+    float4 ambient;
+};
+
+struct DrawData {
+    float4x4 model;
+    float3x3 normal_matrix;
+    float4 colour;
+};
+
+struct PushConstants {
+    Globals* globals;
+    DrawData* draws;
+    Vertex* vertices;
+    uint draw_index;
+};
+[[vk::push_constant]] PushConstants push;
+
+[[vk::binding(0, 0)]] SamplerCube environment;
+
+static const float3 kMirrorTint = float3(0.92, 0.95, 1.0);
+```
+
+The skybox reads exactly one field of one vertex:
+
+```slang title="code/src/4.advanced_vulkan/buffer_device_address/environment.slang"
+// ---------------------------------------------------------------------------
+// The sky
+// ---------------------------------------------------------------------------
+
+struct SkyVSOutput {
+    float4 position : SV_Position;
+    [[vk::location(0)]] float3 direction;
+};
+
+[shader("vertex")]
+SkyVSOutput vertexMain(uint vertex_id : SV_VulkanVertexID) {
+    // The only field of the vertex this shader wants. In 4.4 the pipeline had to be
+    // given exactly one vertex attribute to avoid the validation layers complaining
+    // about the two it did not consume; here the question cannot come up, because the
+    // pipeline describes no vertex layout at all and the shader takes what it likes.
+    float3 position = push.vertices[vertex_id].position;
+
+    SkyVSOutput output;
+    output.direction = position;
+
+    float4 clip = mul(push.globals.projection,
+                      mul(push.globals.view_rotation, float4(position, 1.0)));
+    // z = w, so depth is exactly 1.0 after the divide. See 4.4.
+    output.position = clip.xyww;
+    return output;
+}
+
+[shader("fragment")]
+float4 fragmentMain(SkyVSOutput input) : SV_Target {
+    return float4(environment.Sample(normalize(input.direction)).rgb, 1.0);
+}
+```
+
+and the sphere reads its vertex and its `DrawData` the way the scene does. It only reflects
+in this chapter; 4.4's refraction and Fresnel modes are not carried over, because they are
+not what this chapter is about:
+
+```slang title="code/src/4.advanced_vulkan/buffer_device_address/environment.slang"
+// ---------------------------------------------------------------------------
+// The mirrored sphere
+// ---------------------------------------------------------------------------
+
+struct MirrorVSOutput {
+    float4 position : SV_Position;
+    [[vk::location(0)]] float3 world_position;
+    [[vk::location(1)]] float3 normal;
+};
+
+[shader("vertex")]
+MirrorVSOutput mirrorVertexMain(uint vertex_id : SV_VulkanVertexID) {
+    Vertex vertex = push.vertices[vertex_id];
+    DrawData draw = push.draws[push.draw_index];
+
+    MirrorVSOutput output;
+    float4 world = mul(draw.model, float4(vertex.position, 1.0));
+    output.world_position = world.xyz;
+    output.position = mul(push.globals.projection, mul(push.globals.view, world));
+    output.normal = mul(draw.normal_matrix, vertex.normal);
+    return output;
+}
+
+[shader("fragment")]
+float4 mirrorFragmentMain(MirrorVSOutput input) : SV_Target {
+    float3 normal = normalize(input.normal);
+    // From the eye toward the surface: reflect() is defined for a vector pointing at
+    // the surface, and the classic bug is getting this the wrong way round.
+    float3 incident =
+        normalize(input.world_position - push.globals.view_position.xyz);
+    return float4(environment.Sample(reflect(incident, normal)).rgb * kMirrorTint, 1.0);
+}
+```
+
+## Drawing with addresses
+
+The seven passes are 4.4's. What differs is what each draw is told:
+
+```cpp title="code/src/4.advanced_vulkan/buffer_device_address/main.cpp"
+    // ---------------------------------------------------------------------------
+    // Six passes into six faces of one image. 4.4, unchanged.
+    // ---------------------------------------------------------------------------
+
+    void render_cube_faces(const vkc::FrameInfo& frame) {
+        vkc::image_barrier(frame.cmd, live_cube_.handle(), VK_IMAGE_LAYOUT_UNDEFINED,
+                           VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                           VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                           VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                           VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                           VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+
+        const VkExtent2D face_extent{kFaceSize, kFaceSize};
+
+        for (size_t face = 0; face < kFacePassCount; ++face) {
+            if (face > 0) {
+                vkc::image_barrier(frame.cmd, face_depth_.handle(),
+                                   VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                                   VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                                   VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                                   VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                                   VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT,
+                                   VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                                   VK_IMAGE_ASPECT_DEPTH_BIT);
+            }
+
+            vkc::begin_rendering(frame.cmd, live_face_views_[face],
+                                 face_depth_.view(), face_extent,
+                                 {{0.05F, 0.06F, 0.09F, 1.0F}});
+            set_viewport(frame.cmd, face_extent);
+
+            // The only thing that distinguishes this pass from the other six: which of
+            // the seven addresses written into the arena is pushed. There is no
+            // vkCmdBindDescriptorSets for it and nothing to allocate per pass.
+            draw_scene(frame.cmd, face_pipelines_, globals_[face]);
+            draw_sky(frame.cmd, face_pipelines_, globals_[face]);
+
+            vkCmdEndRendering(frame.cmd);
+        }
+
+        vkc::image_barrier(frame.cmd, live_cube_.handle(),
+                           VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                           VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                           VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                           VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                           VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    }
+
+    void render_screen(const vkc::FrameInfo& frame) {
+        vkc::begin_rendering(frame.cmd, frame.view, depth_.view(), frame.extent,
+                             {{0.05F, 0.06F, 0.09F, 1.0F}});
+        set_viewport(frame.cmd, frame.extent);
+
+        draw_scene(frame.cmd, screen_pipelines_, globals_[kScreenPass]);
+        draw_mirror(frame.cmd, globals_[kScreenPass]);
+        draw_sky(frame.cmd, screen_pipelines_, globals_[kScreenPass]);
+
+        vkCmdEndRendering(frame.cmd);
+    }
+
+    void draw_scene(VkCommandBuffer cmd, const ScenePipelines& pipelines,
+                    VkDeviceAddress globals) {
+        bind_indices(cmd, quad_);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelines.opaque);
+        bind_texture(cmd, floor_set_);
+        push(cmd, globals, quad_.vertex_address, kFloorDraw);
+        vkCmdDrawIndexed(cmd, kQuadIndexCount, 1, kFloorFirstIndex, 0, 0);
+
+        bind_indices(cmd, cube_);
+        bind_texture(cmd, crate_set_);
+        for (uint32_t i = 0; i < kCrates.size(); ++i) {
+            push(cmd, globals, cube_.vertex_address, kFirstCrateDraw + i);
+            vkCmdDrawIndexed(cmd, cube_.index_count, 1, 0, 0, 0);
+        }
+
+        bind_indices(cmd, quad_);
+        bind_texture(cmd, fern_set_);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, fern_pipeline_);
+        for (uint32_t i = 0; i < kFerns.size(); ++i) {
+            push(cmd, globals, quad_.vertex_address, kFirstFernDraw + i);
+            vkCmdDrawIndexed(cmd, kQuadIndexCount, 1, kUprightFirstIndex, 0, 0);
+        }
+    }
+
+    void draw_mirror(VkCommandBuffer cmd, VkDeviceAddress globals) {
+        bind_indices(cmd, sphere_);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, mirror_pipeline_);
+        bind_texture(cmd, live_set_);
+        push(cmd, globals, sphere_.vertex_address, kSphereDraw);
+        vkCmdDrawIndexed(cmd, sphere_.index_count, 1, 0, 0, 0);
+    }
+
+    void draw_sky(VkCommandBuffer cmd, const ScenePipelines& pipelines,
+                  VkDeviceAddress globals) {
+        bind_indices(cmd, cube_);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelines.sky);
+        bind_texture(cmd, sky_set_);
+        // The skybox reads no DrawData at all -- its model matrix is the identity and it
+        // is never anywhere else -- so the index it is given is never dereferenced.
+        push(cmd, globals, cube_.vertex_address, kFloorDraw);
+        vkCmdDrawIndexed(cmd, cube_.index_count, 1, 0, 0, 0);
+    }
+```
+
+The only thing that distinguishes a face pass from the screen pass is which of the seven
+`globals_` addresses is pushed. There is no `vkCmdBindDescriptorSets` for per-frame data, and
+nothing to allocate per pass.
+
+```cpp title="code/src/4.advanced_vulkan/buffer_device_address/main.cpp"
+    // ---------------------------------------------------------------------------
+    // Frame plumbing
+    // ---------------------------------------------------------------------------
+
+    void push(VkCommandBuffer cmd, VkDeviceAddress globals, VkDeviceAddress vertices,
+              uint32_t draw_index) {
+        const PushConstants constants{
+            .globals = globals,
+            .draws = draws_address_,
+            .vertices = vertices,
+            .draw_index = draw_index,
+        };
+        vkCmdPushConstants(cmd, pipeline_layout_,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                           sizeof(constants), &constants);
+        ++pushes_;
+    }
+
+    // Only the indices. There is no vkCmdBindVertexBuffers call anywhere in this file.
+    static void bind_indices(VkCommandBuffer cmd, const Mesh& mesh) {
+        vkCmdBindIndexBuffer(cmd, mesh.indices.handle(), 0, VK_INDEX_TYPE_UINT16);
+    }
+
+    void bind_texture(VkCommandBuffer cmd, VkDescriptorSet set) const {
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 0,
+                                1, &set, 0, nullptr);
+    }
+```
+
+`push` counts itself into `pushes_` so the report can say how many there were.
+`bind_texture` binds at set **0** now: with the frame set gone, the textures are the only set
+the layout has.
+
+The two projections are 4.4's:
+
+```cpp title="code/src/4.advanced_vulkan/buffer_device_address/main.cpp"
+    [[nodiscard]] static glm::mat4 screen_projection(VkExtent2D extent) {
+        const float aspect =
+            static_cast<float>(extent.width) / static_cast<float>(extent.height);
+        glm::mat4 projection =
+            glm::perspective(glm::radians(45.0F), aspect, 0.1F, 100.0F);
+        projection[1][1] *= -1.0F;  // Vulkan's clip-space y points down.
+        return projection;
+    }
+
+    // No Y-flip, for the reason 4.4 spends a section on: a cube face is sampled by
+    // direction, and its v axis already runs the way unflipped Vulkan clip space does.
+    [[nodiscard]] static glm::mat4 face_projection() {
+        return glm::perspective(glm::radians(90.0F), 1.0F, 0.1F, 100.0F);
+    }
 ```
 
 ## What addresses cannot replace
 
-The sample still has five descriptor sets, and they are all textures. An image cannot be
-reached by address, and the reason is not an oversight in the API.
+The sample still has five descriptor sets, and they are all textures:
 
-A buffer is bytes. An image is bytes plus a format, a tiling arrangement the driver
-chose, a swizzle, a mip chain and a filtering mode — and the hardware that reads one
-needs all of that, in a form it can consume, before it can turn a coordinate into a
-colour. That bundle is what a descriptor is. There is no 64-bit number that can stand in
-for it, because the information genuinely is not one number.
+```cpp title="code/src/4.advanced_vulkan/buffer_device_address/main.cpp"
+    // Five descriptor sets, all of them textures, and one descriptor set layout.
+    //
+    // 4.4 had two layouts and nineteen sets: fourteen of them -- two frames in flight
+    // times seven passes -- existed only to point at a uniform buffer. Those are what
+    // addresses replaced; these five are what they cannot replace. An image is
+    // read through hardware that needs a descriptor -- format, tiling, swizzle and
+    // filtering live in it, and none of those things are expressible as a number a
+    // shader can add to.
+    void create_descriptors() {
+        const VkDevice device = context().device();
 
-So the count went from nineteen descriptor sets and two layouts to five sets and one
-layout, and the five that remain are exactly the ones that were never about finding
-bytes. Chapter 3.4 already showed the other half of the answer for images: when there
-are too many textures to bind one at a time, you do not get an address, you get an
-*index* into an unbounded array. Addresses for buffers, indices for images.
+        const VkDescriptorSetLayoutBinding texture_binding{
+            .binding = 0,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+            .pImmutableSamplers = nullptr,
+        };
+        const VkDescriptorSetLayoutCreateInfo texture_layout_info{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .bindingCount = 1,
+            .pBindings = &texture_binding,
+        };
+        VK_CHECK(vkCreateDescriptorSetLayout(device, &texture_layout_info, nullptr,
+                                             &texture_set_layout_));
+
+        constexpr uint32_t kTextureSets = 5;  // crate, floor, fern, sky, live
+        const VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                             kTextureSets};
+        const VkDescriptorPoolCreateInfo pool_info{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .maxSets = kTextureSets,
+            .poolSizeCount = 1,
+            .pPoolSizes = &pool_size,
+        };
+        VK_CHECK(vkCreateDescriptorPool(device, &pool_info, nullptr, &descriptor_pool_));
+
+        crate_set_ = allocate_texture_set(crate_map_.view(), sampler_.handle());
+        floor_set_ = allocate_texture_set(floor_map_.view(), sampler_.handle());
+        fern_set_ = allocate_texture_set(fern_map_.view(), clamp_sampler_.handle());
+        sky_set_ = allocate_texture_set(sky_cube_.view(), cube_sampler_.handle());
+        live_set_ = allocate_texture_set(live_cube_.view(), cube_sampler_.handle());
+    }
+```
+
+An image cannot be reached by address, and the reason is not an oversight in the API. A
+buffer is bytes. An image is bytes plus a format, a tiling arrangement the driver chose, a
+swizzle, a mip chain and a filtering mode — and the hardware that reads one needs all of that,
+in a form it can consume, before it can turn a coordinate into a colour. That bundle is what a
+descriptor is. There is no 64-bit number that can stand in for it, because the information
+genuinely is not one number.
+
+So the count went from nineteen descriptor sets and two layouts to five sets and one layout,
+and the five that remain are exactly the ones that were never about finding bytes. The pool
+is sized for image samplers alone. Chapter 3.4 already showed the other half of the answer for
+images: when there are too many textures to bind one at a time, you do not get an address,
+you get an *index* into an unbounded array. Addresses for buffers, indices for images.
+
+## Pipelines
+
+```cpp title="code/src/4.advanced_vulkan/buffer_device_address/main.cpp"
+    // ---------------------------------------------------------------------------
+    // Pipelines
+    // ---------------------------------------------------------------------------
+
+    void create_pipelines() {
+        const VkDevice device = context().device();
+
+        // No vertex_input() call on any builder below, so every pipeline is created with
+        // zero bindings and zero attributes. That state used to configure the hardware
+        // that fetched vertices; there is nothing left for it to configure.
+        const VkPushConstantRange push_range{
+            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+            .offset = 0,
+            .size = sizeof(PushConstants),
+        };
+        const VkPipelineLayoutCreateInfo layout_info{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .setLayoutCount = 1,
+            .pSetLayouts = &texture_set_layout_,
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &push_range,
+        };
+        VK_CHECK(
+            vkCreatePipelineLayout(device, &layout_info, nullptr, &pipeline_layout_));
+
+        const auto base = [&](VkShaderModule module) -> vkc::PipelineBuilder {
+            return vkc::PipelineBuilder(device)
+                .shaders(module)
+                .colour_attachment(cube_format_)
+                .layout(pipeline_layout_);
+        };
+
+        const VkShaderModule scene_shader =
+            vkc::load_shader(device, LVK_CHAPTER_ID, "scene.slang");
+
+        // Two windings, for the screen and for a cube face. 4.4's caution applies
+        // unchanged: a cube face is stored mirrored, so the triangles that are
+        // counter-clockwise on screen are clockwise in a face.
+        for (size_t pass = 0; pass < 2; ++pass) {
+            const VkFrontFace winding =
+                pass == 0 ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
+            const VkPipeline opaque = base(scene_shader)
+                                          .cull(VK_CULL_MODE_BACK_BIT, winding)
+                                          .depth(depth_format_, /*test=*/true,
+                                                 /*write=*/true)
+                                          .build();
+            (pass == 0 ? screen_pipelines_ : face_pipelines_).opaque = opaque;
+        }
+
+        fern_pipeline_ = base(scene_shader)
+                             .shaders(scene_shader, "vertexMain", "cutoutFragmentMain")
+                             .cull(VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE)
+                             .depth(depth_format_, /*test=*/true, /*write=*/true)
+                             .build();
+
+        vkDestroyShaderModule(device, scene_shader, nullptr);
+
+        const VkShaderModule environment_shader =
+            vkc::load_shader(device, LVK_CHAPTER_ID, "environment.slang");
+
+        for (size_t pass = 0; pass < 2; ++pass) {
+            const VkFrontFace winding =
+                pass == 0 ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
+            const VkPipeline sky = base(environment_shader)
+                                       .cull(VK_CULL_MODE_FRONT_BIT, winding)
+                                       .depth(depth_format_, /*test=*/true,
+                                              /*write=*/false,
+                                              VK_COMPARE_OP_LESS_OR_EQUAL)
+                                       .build();
+            (pass == 0 ? screen_pipelines_ : face_pipelines_).sky = sky;
+        }
+
+        mirror_pipeline_ = base(environment_shader)
+                               .shaders(environment_shader, "mirrorVertexMain",
+                                        "mirrorFragmentMain")
+                               .cull(VK_CULL_MODE_BACK_BIT,
+                                     VK_FRONT_FACE_COUNTER_CLOCKWISE)
+                               .depth(depth_format_, /*test=*/true, /*write=*/true)
+                               .build();
+
+        vkDestroyShaderModule(device, environment_shader, nullptr);
+
+        context().name(screen_pipelines_.opaque, VK_OBJECT_TYPE_PIPELINE, "scene opaque");
+        context().name(face_pipelines_.opaque, VK_OBJECT_TYPE_PIPELINE,
+                       "scene opaque (cube face)");
+        context().name(fern_pipeline_, VK_OBJECT_TYPE_PIPELINE, "scene ferns");
+        context().name(screen_pipelines_.sky, VK_OBJECT_TYPE_PIPELINE, "skybox");
+        context().name(face_pipelines_.sky, VK_OBJECT_TYPE_PIPELINE,
+                       "skybox (cube face)");
+        context().name(mirror_pipeline_, VK_OBJECT_TYPE_PIPELINE, "mirrored sphere");
+    }
+```
+
+The pipeline layout has one set layout — the textures — and one push range of 32 bytes, for
+both stages. `base` no longer takes an attribute span: there is nothing to describe. The
+two-winding loops are 4.4's, unchanged.
+
+## The application
+
+```cpp title="code/src/4.advanced_vulkan/buffer_device_address/main.cpp"
+// The two pipelines whose front face depends on what is being drawn into. 4.4 explains
+// why a cube face needs the opposite winding from the screen.
+struct ScenePipelines {
+    VkPipeline opaque = VK_NULL_HANDLE;
+    VkPipeline sky = VK_NULL_HANDLE;
+};
+
+class BufferDeviceAddressApp : public vkc::App {
+public:
+    using vkc::App::App;
+
+protected:
+    void on_start() override {
+        cube_ = upload_mesh(context(), kCubeVertices, kCubeIndices);
+        quad_ = upload_mesh(context(), kQuadVertices, kQuadIndices);
+
+        const auto [sphere_vertices, sphere_indices] = make_sphere(48, 96, kMirrorRadius);
+        sphere_ = upload_mesh(context(), sphere_vertices, sphere_indices);
+
+        depth_format_ = vkc::choose_depth_format(context().physical_device());
+        cube_format_ = swapchain().format();
+
+        load_textures();
+        create_cubemaps();
+        create_arenas();
+        create_descriptors();
+        create_depth_buffer(swapchain().extent());
+        create_pipelines();
+
+        draws_.reserve(kDrawCount);
+
+        camera_.position = {0.0F, 1.80F, 5.60F};
+        camera_.pitch = -6.0F;
+
+        spdlog::info("1 sway the ferns, 2 report this frame's arena.");
+    }
+
+    void on_resize(VkExtent2D extent) override { create_depth_buffer(extent); }
+
+    void on_event(const SDL_Event& event) override {
+        camera_.handle_event(event, window().handle());
+
+        if (event.type != SDL_EVENT_KEY_DOWN || event.key.repeat) {
+            return;
+        }
+        switch (event.key.scancode) {
+            case SDL_SCANCODE_1:
+                sway_ = !sway_;
+                spdlog::info("Ferns {}", sway_ ? "swaying" : "still");
+                break;
+            case SDL_SCANCODE_2:
+                report_ = true;
+                break;
+            default:
+                break;
+        }
+    }
+
+    void on_shutdown() override {
+        const VkDevice device = context().device();
+
+        vkDestroyPipeline(device, mirror_pipeline_, nullptr);
+        vkDestroyPipeline(device, face_pipelines_.sky, nullptr);
+        vkDestroyPipeline(device, screen_pipelines_.sky, nullptr);
+        vkDestroyPipeline(device, fern_pipeline_, nullptr);
+        vkDestroyPipeline(device, face_pipelines_.opaque, nullptr);
+        vkDestroyPipeline(device, screen_pipelines_.opaque, nullptr);
+        vkDestroyPipelineLayout(device, pipeline_layout_, nullptr);
+        vkDestroyDescriptorPool(device, descriptor_pool_, nullptr);
+        vkDestroyDescriptorSetLayout(device, texture_set_layout_, nullptr);
+
+        for (const VkImageView view : live_face_views_) {
+            vkDestroyImageView(device, view, nullptr);
+        }
+        live_cube_.destroy();
+        sky_cube_.destroy();
+
+        cube_sampler_.destroy();
+        clamp_sampler_.destroy();
+        sampler_.destroy();
+        fern_map_.destroy();
+        floor_map_.destroy();
+        crate_map_.destroy();
+
+        for (FrameArena& arena : arenas_) {
+            arena.destroy();
+        }
+        face_depth_.destroy();
+        depth_.destroy();
+        sphere_.destroy();
+        quad_.destroy();
+        cube_.destroy();
+    }
+```
+
+`draws_.reserve(kDrawCount)` means the vector never reallocates during a frame. Shutdown
+destroys the arenas with everything else; nothing needs to be unmapped, because
+`vkc::Buffer` owns its mapping.
+
+The members, and `main`:
+
+```cpp title="code/src/4.advanced_vulkan/buffer_device_address/main.cpp"
+    vkc::Camera camera_;
+
+    Mesh cube_;
+    Mesh quad_;
+    Mesh sphere_;
+
+    VkFormat depth_format_ = VK_FORMAT_UNDEFINED;
+    VkFormat cube_format_ = VK_FORMAT_UNDEFINED;
+    vkc::Image depth_;
+    vkc::Image face_depth_;
+
+    vkc::Image sky_cube_;
+    vkc::Image live_cube_;
+    std::array<VkImageView, 6> live_face_views_{};
+
+    // One arena per frame in flight, and the addresses this frame wrote into it.
+    std::array<FrameArena, vkc::kFramesInFlight> arenas_;
+    std::array<VkDeviceAddress, kPassCount> globals_{};
+    VkDeviceAddress draws_address_ = 0;
+    std::vector<DrawData> draws_;
+
+    vkc::Image crate_map_;
+    vkc::Image floor_map_;
+    vkc::Image fern_map_;
+    vkc::Sampler sampler_;
+    vkc::Sampler clamp_sampler_;
+    vkc::Sampler cube_sampler_;
+
+    VkDescriptorSet crate_set_ = VK_NULL_HANDLE;
+    VkDescriptorSet floor_set_ = VK_NULL_HANDLE;
+    VkDescriptorSet fern_set_ = VK_NULL_HANDLE;
+    VkDescriptorSet sky_set_ = VK_NULL_HANDLE;
+    VkDescriptorSet live_set_ = VK_NULL_HANDLE;
+
+    VkDescriptorSetLayout texture_set_layout_ = VK_NULL_HANDLE;
+    VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
+
+    VkPipelineLayout pipeline_layout_ = VK_NULL_HANDLE;
+    ScenePipelines screen_pipelines_;
+    ScenePipelines face_pipelines_;
+    VkPipeline fern_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline mirror_pipeline_ = VK_NULL_HANDLE;
+
+    bool sway_ = false;
+    bool report_ = false;
+    uint32_t pushes_ = 0;
+};
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    try {
+        vkc::App::Options options{};
+        options.title = "LearnVulkan 4.5 - Buffer device address";
+        BufferDeviceAddressApp app(vkc::App::parse_args(argc, argv, options));
+        return app.run();
+    } catch (const std::exception& error) {
+        spdlog::error("{}", error.what());
+        return EXIT_FAILURE;
+    }
+}
+```
+
+`globals_` and `draws_address_` hold this frame's addresses between filling the arena and
+recording the draws.
 
 ## What it costs
 
@@ -306,51 +1480,52 @@ This is a real trade, and the article would be dishonest to skip it.
 
 **There is no type safety.** `VkDeviceAddress` is a `uint64_t`. Nothing distinguishes the
 address of the globals from the address of the vertices, and the three fields of
-`PushConstants` are named as carefully as they are for exactly that reason. Swap two of
-them and the compiler is content.
+`PushConstants` are named as carefully as they are for exactly that reason. Swap two of them
+and the compiler is content. **Type safety** — the compiler refusing to let one kind of thing
+stand in for another — is what a descriptor binding gave you for free.
 
-**There is no bounds checking, and no validation message.** A descriptor that points at
-a buffer too small for what the shader reads is something the validation layers can
-catch, because they know both the buffer and the layout. An address is a number: read
-past the end of the arena and you get whatever is there, and read a stale address and
-you get a page fault, which surfaces as `VK_ERROR_DEVICE_LOST` with nothing to say about
-where it came from. This is the one place in the series where the usual advice — turn on
-the validation layers and read what they say — does not help by itself. GPU-assisted
-validation can instrument address accesses, and it is worth knowing that before you need
-it.
+**There is no bounds checking, and no validation message.** A descriptor that points at a
+buffer too small for what the shader reads is something the validation layers can catch,
+because they know both the buffer and the layout. An address is a number: read past the end
+of the arena and you get whatever is there, and read a stale address and you get a page
+fault, which surfaces as `VK_ERROR_DEVICE_LOST` with nothing to say about where it came from.
+This is the one place in the series where the usual advice — turn on the validation layers and
+read what they say — does not help by itself. GPU-assisted validation can instrument address
+accesses, and it is worth knowing that before you need it.
 
-**Addresses are not stable across runs.** They are assigned when the buffer is created,
-so nothing that contains one can be serialised and reloaded, and a capture tool replaying
-a frame has to reconstruct them — which is what
-`VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT` exists for. If RenderDoc cannot
-replay a capture of your renderer, this is usually why.
+**Addresses are not stable across runs.** They are assigned when the buffer is created, so
+nothing that contains one can be serialised and reloaded, and a capture tool replaying a frame
+has to reconstruct them — **capture replay**, which is what
+`VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT` exists for. If RenderDoc cannot replay a
+capture of your renderer, this is usually why.
 
-What you get in exchange is that data stops being plumbed. There is no per-frame
-descriptor allocation, no set layout to keep in step with a shader, no binding numbers,
-and — the part that matters most later — a shader can be handed a structure it walks
-through by itself. A pointer inside a struct behind a pointer is just another pointer.
-That is what makes GPU-driven rendering possible, and it starts here.
+What you get in exchange is that data stops being plumbed. There is no per-frame descriptor
+allocation, no set layout to keep in step with a shader, no binding numbers, and — the part
+that matters most later — a shader can be handed a structure it walks through by itself. A
+pointer inside a struct behind a pointer is just another pointer. That is what makes
+**GPU-driven rendering** possible — the GPU deciding what to draw from data it reads itself,
+with the CPU issuing a handful of commands — and it starts here.
 
 ## Checking it against the previous chapter
 
-The claim this chapter makes is that nothing changed except the plumbing. That is
-checkable: 4.4's reference image and 4.5's are the same camera looking at the same scene
-lit the same way, so they should be the same image.
+The claim this chapter makes is that nothing changed except the plumbing. That is checkable:
+4.4's frame and 4.5's are the same camera looking at the same scene lit the same way, so they
+should be the same image.
 
 Comparing the two captures at frame 90: **1 of 921,600 pixels differs, by 1 in one
-channel.** One pixel, one level. Floating-point arithmetic reassociated somewhere between
-a uniform load and a pointer load, and that is the entire visible consequence of
-replacing every buffer binding in the sample.
+channel.** One pixel, one level. Floating-point arithmetic reassociated somewhere between a
+uniform load and a pointer load, and that is the entire visible consequence of replacing every
+buffer binding in the sample.
 
-That check is worth more than it looks. A layout disagreement between the C++ and the
-Slang would not crash — it would shade with a transposed matrix or a shifted normal, and
-look almost right. "Almost right" is exactly what a pixel comparison against a known-good
-image catches and what reading the code does not.
+That check is worth more than it looks. A layout disagreement between the C++ and the Slang
+would not crash — it would shade with a transposed matrix or a shifted normal, and look almost
+right. "Almost right" is exactly what a pixel comparison against a known-good image catches
+and what reading the code does not.
 
 :::note[What moved into vkcommon]
-Only one line: `features12.scalarBlockLayout = VK_TRUE` in `Context::create_device()`,
-because it is a property of the device every later chapter will want, and because a
-chapter that forgot it would fail in a way that is hard to read.
+Nothing. Both device features this chapter depends on — `bufferDeviceAddress` and
+`scalarBlockLayout` — have been enabled in `Context::create_device()` since 1.3, and the
+cubemap code is 4.4's, which is to say 1.11's `vkc::Image` and `vkc::load_cubemap`.
 
 `buffer_address()` and `FrameArena` stay in this chapter's `main.cpp`. They are what the
 chapter teaches, and by the rule this series follows they are not shared until the next
@@ -362,7 +1537,7 @@ chapter that needs them can say so.
 - `vkGetBufferDeviceAddress`, and `VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT` on every
   buffer a shader reads
 - pointers in Slang, and the `PhysicalStorageBuffer64` memory model that comes with them
-- `scalarBlockLayout`, without which the very first pointer is rejected
+- scalar block layout, which 1.3 enabled and without which the very first pointer is rejected
 - fourteen uniform buffers and fourteen descriptor sets replaced by one 64 KiB arena per
   frame in flight, bump-allocated
 - push constants down from 128 bytes to 32, because they now carry addresses rather than
@@ -372,27 +1547,48 @@ chapter that needs them can say so.
 - the index buffer still bound, because index fetch is still fixed-function
 - 30 chapters in the build now
 
+## Words introduced in this chapter
+
+| | |
+|---|---|
+| **buffer device address** | the feature that lets a buffer be named by a 64-bit address instead of a descriptor |
+| **device address** | a `VkDeviceAddress`: where a buffer starts in the GPU's virtual address space |
+| **pointer** | a variable holding an address, dereferenced in Slang with `->`, `.` or `[i]` |
+| **physical storage buffer** | the SPIR-V storage class a pointer's target lives in |
+| **scalar block layout** | members aligned to their components' size, as C++ does — no 16-byte rounding |
+| **straddling vector** | a vector that crosses a 16-byte boundary, which the default block layout rules forbid |
+| **frame arena** | one scratch buffer per frame in flight, filled from the top and reset each frame |
+| **bump allocator** | allocation by advancing a cursor, freed all at once by resetting it |
+| **suballocation** | handing out ranges of one allocation; with addresses, a range is just an offset added on |
+| **vertex pulling** | the vertex shader reading its own vertex from memory, instead of fixed-function vertex input |
+| **index fetch** | the fixed-function stage that reads the index buffer and produces `SV_VulkanVertexID` |
+| **alignment rounding** | `(x + a − 1) & ~(a − 1)`: the next multiple of a power of two `a` |
+| **type safety** | the compiler refusing one kind of value where another is expected — which a raw address gives up |
+| **capture replay** | a debugger reconstructing a frame, which needs addresses to come back the same |
+| **GPU-driven rendering** | the GPU deciding what to draw from data it reads itself, which pointers-in-structs make possible |
+
 ## Exercises
 
-1. Delete `features12.scalarBlockLayout = VK_TRUE` and run. Predict, before you do, which
-   of the two shaders is rejected first and which member it names. Then put a `float pad;`
-   after `position` in both `Vertex` structs and watch the error move.
+1. Delete `features12.scalarBlockLayout = VK_TRUE` from `device.cpp` and run. Predict,
+   before you do, which of the two shaders is rejected first and which member it names. Then
+   put a `float pad;` after `position` in both `Vertex` structs and watch the error move.
 2. Swap the `globals` and `draws` fields in the C++ `PushConstants` without touching the
-   Slang. Describe what you see, then work out how long it would have taken you to find
-   this if it had been a one-field shift rather than a total scramble.
-3. Drop `kArenaBytes` to 1024 and read the exception. Then raise the arena to exactly
-   2,952 bytes and explain why it still throws.
-4. The skybox is handed a `draws` pointer and a `draw_index` it never dereferences. Give
-   it `0` as the address instead and confirm nothing happens. Then make its fragment
-   shader read `push.draws[0].colour` and explain the result.
-5. Put a pointer *inside* `DrawData` — a `float4*` of per-object data, allocated in the
-   same arena — and have the fragment shader follow it. This is the shape everything from
-   here to GPU-driven rendering is built on.
+   Slang. Describe what you see, then work out how long it would have taken you to find this
+   if it had been a one-field shift rather than a total scramble.
+3. Drop `kArenaBytes` to 1024 and read the exception. Then raise the arena to exactly 2,952
+   bytes and explain why it still does not throw — and what change to the draw list would
+   make it.
+4. The skybox is handed a `draws` pointer and a `draw_index` it never dereferences. Give it
+   `0` as the address instead and confirm nothing happens. Then make its fragment shader read
+   `push.draws[0].colour` and explain the result.
+5. Put a pointer *inside* `DrawData` — a `float4*` of per-object data, allocated in the same
+   arena — and have the fragment shader follow it. This is the shape everything from here to
+   GPU-driven rendering is built on.
 6. Measure it. Time 4.4 and 4.5 over a thousand frames and compare. The honest expected
-   answer for a scene this size is "no difference you can measure", and understanding why
-   the technique is still worth it is the point of the exercise.
+   answer for a scene this size is "no difference you can measure", and understanding why the
+   technique is still worth it is the point of the exercise.
 
 Next: 4.6 turns to Slang itself — modules, generics and interfaces — because the scene
-shader and the environment shader in this chapter contain the same four struct
-declarations copied word for word, and that is exactly the kind of thing that stops being
-acceptable once the structs are the only contract left holding the two sides together.
+shader and the environment shader in this chapter contain the same four struct declarations
+copied word for word, and that is exactly the kind of thing that stops being acceptable once
+the structs are the only contract left holding the two sides together.

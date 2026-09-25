@@ -39,25 +39,14 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <spdlog/spdlog.h>
 
-// The six faces arrive as PNG files, so this chapter decodes them itself. As in chapter
-// 1.11, STB_IMAGE_STATIC keeps stb's symbols private to this translation unit: Assimp's
-// static library exports the same names, and one global definition anywhere would break
-// every Part 3 link. A private copy cannot clash with anything.
-#define STB_IMAGE_STATIC
-#define STB_IMAGE_IMPLEMENTATION
-#include <stb_image.h>
-
 #include <array>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <filesystem>
-#include <format>
-#include <memory>
 #include <numbers>
 #include <span>
-#include <stdexcept>
 #include <vector>
 
 namespace {
@@ -329,120 +318,24 @@ struct Mesh {
 }
 
 // ---------------------------------------------------------------------------
-// The cubemap itself
+// The live cubemap's faces
 // ---------------------------------------------------------------------------
 
-// One image, six layers, and up to seven views onto it.
-//
-// vkc::Image has made a single-layer 2D image since 1.11 and cannot express this, so it
-// is written out here in full -- which is just as well, because the three lines that
-// make it a cube are the chapter.
-struct Cubemap {
-    VkImage image = VK_NULL_HANDLE;
-    VmaAllocation allocation = VK_NULL_HANDLE;
-    // All six layers, VK_IMAGE_VIEW_TYPE_CUBE. This is what a descriptor points at and
-    // what the shader's SamplerCube samples.
-    VkImageView cube_view = VK_NULL_HANDLE;
-    // One layer each, VK_IMAGE_VIEW_TYPE_2D. These are what rendering passes attach.
-    // Empty for a cubemap that is only ever read.
-    std::array<VkImageView, 6> face_views{};
-
-    void destroy(VkDevice device, VmaAllocator allocator) noexcept {
-        for (VkImageView& view : face_views) {
-            if (view != VK_NULL_HANDLE) {
-                vkDestroyImageView(device, view, nullptr);
-                view = VK_NULL_HANDLE;
-            }
-        }
-        if (cube_view != VK_NULL_HANDLE) {
-            vkDestroyImageView(device, cube_view, nullptr);
-            cube_view = VK_NULL_HANDLE;
-        }
-        if (image != VK_NULL_HANDLE) {
-            vmaDestroyImage(allocator, image, allocation);
-            image = VK_NULL_HANDLE;
-            allocation = VK_NULL_HANDLE;
-        }
-    }
-};
-
-[[nodiscard]] Cubemap create_cubemap(vkc::Context& context, VkFormat format,
-                                     uint32_t size, VkImageUsageFlags usage,
-                                     bool with_face_views) {
-    Cubemap cube;
-
-    const VkImageCreateInfo image_info{
-        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-        .pNext = nullptr,
-        // Without this flag the image is six ordinary array layers and no view may call
-        // it a cube. It is the whole difference, and it must be asked for at creation:
-        // a view cannot add it later.
-        .flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT,
-        // Still 2D. A cubemap is not a 3D image -- it is six 2D images that a sampler
-        // has been told how to choose between.
-        .imageType = VK_IMAGE_TYPE_2D,
-        .format = format,
-        .extent = {size, size, 1},
-        .mipLevels = 1,
-        // Six, and exactly six. CUBE_COMPATIBLE requires it, and the order is fixed by
-        // the specification: +X, -X, +Y, -Y, +Z, -Z.
-        .arrayLayers = 6,
-        .samples = VK_SAMPLE_COUNT_1_BIT,
-        .tiling = VK_IMAGE_TILING_OPTIMAL,
-        .usage = usage,
-        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-        .queueFamilyIndexCount = 0,
-        .pQueueFamilyIndices = nullptr,
-        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-    };
-
-    const VmaAllocationCreateInfo alloc_info{
-        .flags = 0,
-        .usage = VMA_MEMORY_USAGE_AUTO,
-        .requiredFlags = 0,
-        .preferredFlags = 0,
-        .memoryTypeBits = 0,
-        .pool = VK_NULL_HANDLE,
-        .pUserData = nullptr,
-        .priority = 0.0F,
-    };
-    VK_CHECK(vmaCreateImage(context.allocator(), &image_info, &alloc_info, &cube.image,
-                            &cube.allocation, nullptr));
-
-    // The sampling view: type CUBE, all six layers at once.
-    const VkImageViewCreateInfo cube_view_info{
-        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .image = cube.image,
-        .viewType = VK_IMAGE_VIEW_TYPE_CUBE,
-        .format = format,
-        .components = {},
-        .subresourceRange =
-            {
-                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                .baseMipLevel = 0,
-                .levelCount = 1,
-                .baseArrayLayer = 0,
-                .layerCount = 6,
-            },
-    };
-    VK_CHECK(vkCreateImageView(context.device(), &cube_view_info, nullptr,
-                               &cube.cube_view));
-
-    if (!with_face_views) {
-        return cube;
-    }
-
-    // The rendering views: one layer each, and type 2D rather than CUBE. A rendering
-    // pass attaches a single 2D image; it has no concept of a cube and does not need
-    // one. Six views onto six layers of one image is all "render to a cubemap" is.
+// vkc::Image with `.cube = true` makes the image and the CUBE view a shader samples, and
+// 1.11 explained every field of both. What it does not make is a way to render *into*
+// one face: a rendering pass attaches a single 2D image and has no concept of a cube. So
+// each face gets a view of its own -- one layer, type 2D -- and six views onto six
+// layers of one image is all "render to a cubemap" is.
+[[nodiscard]] std::array<VkImageView, 6> create_face_views(VkDevice device,
+                                                           const vkc::Image& cube,
+                                                           VkFormat format) {
+    std::array<VkImageView, 6> views{};
     for (uint32_t face = 0; face < 6; ++face) {
-        const VkImageViewCreateInfo face_view_info{
+        const VkImageViewCreateInfo view_info{
             .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
             .pNext = nullptr,
             .flags = 0,
-            .image = cube.image,
+            .image = cube.handle(),
             .viewType = VK_IMAGE_VIEW_TYPE_2D,
             .format = format,
             .components = {},
@@ -455,86 +348,9 @@ struct Cubemap {
                     .layerCount = 1,
                 },
         };
-        VK_CHECK(vkCreateImageView(context.device(), &face_view_info, nullptr,
-                                   &cube.face_views[face]));
+        VK_CHECK(vkCreateImageView(device, &view_info, nullptr, &views[face]));
     }
-    return cube;
-}
-
-// Decodes the six files and uploads them into the six layers.
-void upload_cubemap(vkc::Context& context, const Cubemap& cube, uint32_t size,
-                    std::span<const char* const> files) {
-    const VkDeviceSize face_bytes =
-        static_cast<VkDeviceSize>(size) * static_cast<VkDeviceSize>(size) * 4;
-
-    // One staging buffer holding all six faces back to back, so the whole cubemap is one
-    // allocation and one submit rather than six of each.
-    vkc::Buffer staging(context.allocator(), face_bytes * 6,
-                        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
-                            VMA_ALLOCATION_CREATE_MAPPED_BIT);
-
-    for (size_t face = 0; face < files.size(); ++face) {
-        const std::filesystem::path path = vkc::asset_path(files[face]);
-
-        int width = 0;
-        int height = 0;
-        int channels = 0;
-        const std::unique_ptr<stbi_uc, void (*)(void*)> pixels(
-            stbi_load(path.string().c_str(), &width, &height, &channels, STBI_rgb_alpha),
-            stbi_image_free);
-        if (pixels == nullptr) {
-            throw std::runtime_error(std::format(
-                "Could not load '{}': {}. Did you run tools/make_textures.py?",
-                path.string(), stbi_failure_reason()));
-        }
-        // Every face of a cubemap is square and they are all the same size. The
-        // validation layers would not catch a mismatch here -- the copy would simply
-        // read the wrong number of bytes -- so it is worth checking.
-        if (width != static_cast<int>(size) || height != static_cast<int>(size)) {
-            throw std::runtime_error(
-                std::format("'{}' is {}x{}, but every cubemap face must be {}x{}.",
-                            path.string(), width, height, size, size));
-        }
-
-        std::memcpy(static_cast<std::byte*>(staging.mapped()) +
-                        static_cast<size_t>(face_bytes) * face,
-                    pixels.get(), static_cast<size_t>(face_bytes));
-    }
-
-    vkc::immediate_submit(context, [&](VkCommandBuffer cmd) {
-        // 4.3's barrier, and it covers all six layers because its subresource range says
-        // VK_REMAINING_ARRAY_LAYERS. A range that named layer 0 alone would leave the
-        // other five in UNDEFINED, and the copy into them would be undefined behaviour
-        // that happens to work on most drivers.
-        vkc::image_barrier(cmd, cube.image, VK_IMAGE_LAYOUT_UNDEFINED,
-                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                           VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-                           VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-
-        // One region per face. baseArrayLayer is the only field that differs, and it is
-        // how the six blocks of the staging buffer find their six layers.
-        std::array<VkBufferImageCopy, 6> regions{};
-        for (uint32_t face = 0; face < 6; ++face) {
-            regions[face] = VkBufferImageCopy{
-                .bufferOffset = face_bytes * face,
-                .bufferRowLength = 0,
-                .bufferImageHeight = 0,
-                .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, face, 1},
-                .imageOffset = {0, 0, 0},
-                .imageExtent = {size, size, 1},
-            };
-        }
-        vkCmdCopyBufferToImage(cmd, staging.handle(), cube.image,
-                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                               static_cast<uint32_t>(regions.size()), regions.data());
-
-        vkc::image_barrier(cmd, cube.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                           VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                           VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
-                           VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-    });
+    return views;
 }
 
 // The two pipelines whose front-face setting depends on what is being drawn into.
@@ -603,7 +419,6 @@ protected:
 
     void on_shutdown() override {
         const VkDevice device = context().device();
-        const VmaAllocator allocator = context().allocator();
 
         vkDestroyPipeline(device, mirror_pipeline_, nullptr);
         vkDestroyPipeline(device, face_pipelines_.sky, nullptr);
@@ -616,8 +431,11 @@ protected:
         vkDestroyDescriptorSetLayout(device, texture_set_layout_, nullptr);
         vkDestroyDescriptorSetLayout(device, frame_set_layout_, nullptr);
 
-        live_cube_.destroy(device, allocator);
-        sky_cube_.destroy(device, allocator);
+        for (const VkImageView view : live_face_views_) {
+            vkDestroyImageView(device, view, nullptr);
+        }
+        live_cube_.destroy();
+        sky_cube_.destroy();
 
         cube_sampler_.destroy();
         clamp_sampler_.destroy();
@@ -660,7 +478,7 @@ private:
         // nothing in there worth preserving. The source scope is the previous frame's
         // *reading* of this cubemap by the sphere, two frames back at worst -- writing
         // after a read is a hazard exactly as it was in 4.3.
-        vkc::image_barrier(frame.cmd, live_cube_.image, VK_IMAGE_LAYOUT_UNDEFINED,
+        vkc::image_barrier(frame.cmd, live_cube_.handle(), VK_IMAGE_LAYOUT_UNDEFINED,
                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
                            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
@@ -687,7 +505,7 @@ private:
                                    VK_IMAGE_ASPECT_DEPTH_BIT);
             }
 
-            vkc::begin_rendering(frame.cmd, live_cube_.face_views[face],
+            vkc::begin_rendering(frame.cmd, live_face_views_[face],
                                  face_depth_.view(), face_extent,
                                  {{0.05F, 0.06F, 0.09F, 1.0F}});
             set_viewport(frame.cmd, face_extent);
@@ -708,7 +526,7 @@ private:
         }
 
         // And now it is a texture. One barrier covers all six layers.
-        vkc::image_barrier(frame.cmd, live_cube_.image,
+        vkc::image_barrier(frame.cmd, live_cube_.handle(),
                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
@@ -935,19 +753,28 @@ private:
     }
 
     void create_cubemaps() {
-        // Read only: the six PNGs go in and nothing ever writes it again.
-        sky_cube_ = create_cubemap(context(), VK_FORMAT_R8G8B8A8_SRGB, kFaceSize,
-                                   VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                                       VK_IMAGE_USAGE_SAMPLED_BIT,
-                                   /*with_face_views=*/false);
-        upload_cubemap(context(), sky_cube_, kFaceSize, kSkyFiles);
+        // Read only. vkc::load_cubemap, from 1.11, decodes the six PNGs -- in the
+        // specification's face order -- into one CUBE_COMPATIBLE image.
+        std::array<std::filesystem::path, 6> sky_faces;
+        for (size_t face = 0; face < sky_faces.size(); ++face) {
+            sky_faces[face] = vkc::asset_path(kSkyFiles[face]);
+        }
+        sky_cube_ = vkc::load_cubemap(context(), sky_faces, VK_FORMAT_R8G8B8A8_SRGB);
 
         // Written every frame and read every frame: 4.3's two usage bits, on a
         // six-layer image.
-        live_cube_ = create_cubemap(context(), cube_format_, kFaceSize,
-                                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-                                        VK_IMAGE_USAGE_SAMPLED_BIT,
-                                    /*with_face_views=*/true);
+        live_cube_ = vkc::Image(context(),
+                                vkc::ImageDesc{
+                                    .format = cube_format_,
+                                    .extent = {kFaceSize, kFaceSize},
+                                    .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                             VK_IMAGE_USAGE_SAMPLED_BIT,
+                                    .mip_levels = 1,
+                                    .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
+                                    .array_layers = 6,
+                                    .cube = true,
+                                });
+        live_face_views_ = create_face_views(context().device(), live_cube_, cube_format_);
 
         // One depth buffer, reused by all six faces. They are rendered one after another,
         // never at once, so six would be six times the memory for nothing -- at the cost
@@ -955,8 +782,8 @@ private:
         face_depth_ = vkc::create_depth_buffer(context(), depth_format_,
                                                {kFaceSize, kFaceSize});
 
-        context().name(sky_cube_.image, VK_OBJECT_TYPE_IMAGE, "sky cubemap");
-        context().name(live_cube_.image, VK_OBJECT_TYPE_IMAGE, "live cubemap");
+        context().name(sky_cube_.handle(), VK_OBJECT_TYPE_IMAGE, "sky cubemap");
+        context().name(live_cube_.handle(), VK_OBJECT_TYPE_IMAGE, "live cubemap");
     }
 
     void create_descriptors() {
@@ -1057,8 +884,8 @@ private:
 
         // The two cubemaps, written into exactly the same kind of set as the three
         // textures above. The only difference is that these views are CUBE views.
-        sky_set_ = allocate_texture_set(sky_cube_.cube_view, cube_sampler_.handle());
-        live_set_ = allocate_texture_set(live_cube_.cube_view, cube_sampler_.handle());
+        sky_set_ = allocate_texture_set(sky_cube_.view(), cube_sampler_.handle());
+        live_set_ = allocate_texture_set(live_cube_.view(), cube_sampler_.handle());
 
         context().name(sky_set_, VK_OBJECT_TYPE_DESCRIPTOR_SET, "sky cubemap");
         context().name(live_set_, VK_OBJECT_TYPE_DESCRIPTOR_SET, "live cubemap");
@@ -1262,8 +1089,9 @@ private:
     vkc::Image depth_;
     vkc::Image face_depth_;
 
-    Cubemap sky_cube_;
-    Cubemap live_cube_;
+    vkc::Image sky_cube_;
+    vkc::Image live_cube_;
+    std::array<VkImageView, 6> live_face_views_{};
 
     std::array<std::array<vkc::Buffer, kPassCount>, vkc::kFramesInFlight>
         uniform_buffers_;

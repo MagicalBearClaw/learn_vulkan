@@ -1,0 +1,194 @@
+---
+title: Review
+description: What 4.1 to 4.5 built, the frame they add up to, the mathematics each one derived, every barrier in the part, and the things Part 4 does badly on purpose.
+sidebar:
+  order: 99
+---
+
+Part 3 ended with a renderer that loaded real models and bound nothing per draw. It drew
+them with the fixed-function state 1.13 had set up once and never questioned: `LESS`
+against a buffer cleared to 1.0, back faces culled, no blending, one render target, and a
+descriptor for every buffer a shader read.
+
+Part 4 so far has taken each of those apart. This page reviews chapters 4.1 to 4.5; it will
+grow as the rest of the part — instancing and compute among it — is written.
+
+This chapter has no new code.
+
+## What you built
+
+| Chapter | Added |
+|---|---|
+| 4.1 | the depth test examined; depth precision derived; depth bias; a stencil buffer, a stamp pass and an outline pass |
+| 4.2 | three cull modes; alpha cutout with `discard`; the full blend state; a back-to-front sort |
+| 4.3 | a render target of your own; two precise barriers; a fullscreen triangle; convolution kernels; a render scale |
+| 4.4 | a sky from a cubemap; a six-face render target; six cameras; reflection, refraction and Fresnel |
+| 4.5 | buffer device addresses; a frame arena; vertex pulling; five descriptor sets where there were nineteen |
+
+## The frame, assembled
+
+4.5's frame is every chapter of the part in one command buffer:
+
+```
+   on_render
+      │
+      ├── arena.reset()                                            ── 4.5
+      ├── write 7 × Globals, 10 × DrawData  ──▶ 2 952 bytes, 9 addresses
+      │
+      ├── barrier: live cube ──▶ COLOR_ATTACHMENT_OPTIMAL (6 layers)  ── 4.3 / 4.4
+      ├── for each of 6 faces                                      ── 4.4
+      │      barrier: face depth, write ──▶ next clear   (after face 0)
+      │      begin_rendering(face view, face depth)
+      │      floor, crates      cull BACK, front = CLOCKWISE       ── 4.2 / 4.4
+      │      ferns              cull NONE, discard                 ── 4.2
+      │      sky                LESS_OR_EQUAL, xyww, cull FRONT    ── 4.1 / 4.4
+      ├── barrier: live cube ──▶ SHADER_READ_ONLY_OPTIMAL
+      │
+      └── screen pass
+             floor, crates, ferns   front = COUNTER_CLOCKWISE
+             sphere                 reflect(incident, n) into the live cube
+             sky                    drawn last, rejected wherever the scene is
+```
+
+Every draw in it pushes 32 bytes — three addresses and an index — and binds exactly one
+descriptor set, for its texture.
+
+## The mathematics Part 4 derived
+
+Each result was derived where it was first needed, and each was checked against the sample
+rather than asserted.
+
+**Depth precision falls with the square of distance** (4.1). The window-space depth is
+`z_w = f/(f−n) · (1 − n/d)`, so `dz_w/dd = f n / ((f−n) d²)`, and the smallest separation the
+buffer can resolve is `Δd = Δz_w · (f−n) d² / (f n)`. With `n = 0.1`, `f = 100`: 0.6 µm at 1 m,
+1.49 mm at 50 m, half of every representable value spent in the first ten centimetres.
+Reversed-Z brings 50 m down to 2.9 µm — and needs the projection changed too, not just the
+compare op.
+
+**The stencil test is one integer comparison, reference on the left** (4.1):
+`(reference & compareMask) compareOp (stencil & compareMask)`. Measured, not assumed: with
+`reference = 1`, `GREATER` renders byte-identical to `NOT_EQUAL` and `LESS` draws nothing.
+
+**Winding is the sign of a determinant** (4.2, again in 4.4). A screen triangle's signed area
+is `½·det[b − a, c − a]`, and a linear map multiplies every signed area by its own determinant.
+The y-flip has determinant −1, so it reverses every winding — which is why `frontFace` and the
+projection are one decision. A cube face's `(s, t, forward)` frame has determinant −1 too, which
+is why 4.4's face pipelines are `CLOCKWISE`.
+
+**Blending order has an exact error** (4.2). Swapping two layers of the over operator changes
+the result by `a_A · a_B · (C_A − C_B)`, independent of the background. All 18 055 pixels that
+change when 4.2's sort is turned off match that to within 0.011.
+
+**Alpha composes as coverage** (4.2): `a_out = 1 − (1 − a_src)(1 − a_dst) = a_src + a_dst(1 − a_src)`.
+The obvious `ONE, ZERO` stores `a_src` instead, and predicts the exact byte — 140 — that the
+reference capture found.
+
+**A kernel's sum is what it does to a flat region** (4.3). Sum 1 keeps brightness, sum 0 keeps
+only variation. The 8-neighbour edge kernel is `3∇²f` by Taylor expansion, so a smooth ramp
+comes out black, and sharpen is exactly `identity − edges`.
+
+**Face selection picks the major axis** (4.4), and one face covers the directions where the
+other two components are no larger than it — a 45° half-angle, so a 90° camera. The
+specification's `sc`/`tc` table fixes every face camera's right and up vectors; all twelve
+were checked.
+
+**Refraction follows Snell's law, and entering glass cannot totally reflect** (4.4).
+`k = 1 − η²(1 − cos² θ) ≥ 1 − η² > 0` whenever `η < 1`, so the sample's guard never fires. Schlick
+gives `F₀ = ((n₁ − n₂)/(n₁ + n₂))²` — 0.043 for glass, the 0.04 in the shader.
+
+**Rounding up to a power of two is a mask** (4.5): `(x + a − 1) & ~(a − 1)`.
+
+## The Vulkan lessons
+
+**Pipeline state changes the picture as much as shaders do.** 4.1's outline and 4.2's glass are
+drawn by fragment shaders one line long. Depth test, depth write, compare op, bias, stencil,
+cull mode, front face and blend state are all fixed when the pipeline is built, which is why
+4.1 has five pipelines, 4.2 seven, and 4.4 two of everything.
+
+**A barrier is two dependencies.** Execution — the source stages finish before the destination
+stages start — and memory — the source writes are made available and then visible. 4.3's
+missing-barrier experiment showed the difference: the frames were still correctly *ordered* by
+vkcommon's frame-start barrier, and synchronization validation still reported a hazard,
+because nothing had made the writes visible.
+
+**Addresses for buffers, descriptors for images.** Descriptor sets across the part:
+
+| | per-frame data reached by | descriptor sets | set layouts | push constant |
+|---|---|---|---|---|
+| 4.1 | uniform buffer | 4 | 2 | 128 B |
+| 4.4 | 14 uniform buffers | 19 | 2 | 128 B |
+| 4.5 | one arena, by address | 5 | 1 | 32 B |
+
+The five that remain in 4.5 are all textures. An image is bytes *plus* format, tiling, swizzle
+and filtering, and no 64-bit number can carry that.
+
+## Every barrier in Part 4
+
+| Where | Layout | Source stage / access | Destination stage / access | Hazard |
+|---|---|---|---|---|
+| 4.3, into the scene image | `UNDEFINED` → `COLOR_ATTACHMENT_OPTIMAL` | fragment shader / sampled read | colour output / colour write | write after read, across frames |
+| 4.3, out of the scene image | `COLOR_ATTACHMENT_OPTIMAL` → `SHADER_READ_ONLY_OPTIMAL` | colour output / colour write | fragment shader / sampled read | read after write |
+| 4.4, into the live cube | same as 4.3's first, all six layers | | | write after read |
+| 4.4, between faces | depth, unchanged | late fragment tests / depth write | early fragment tests / depth write | write after write |
+| 4.4, out of the live cube | same as 4.3's second, all six layers | | | read after write |
+
+The two 4.3 barriers chain across frames through the fragment-shader stage they share, which
+is how the second one also protects the first frame's writes from the next frame's layout
+transition.
+
+## What is in `vkcommon` now
+
+**Nothing new, for the third part running.** Every file in `code/common/` is still owned by a
+chapter in Part 1. What Part 4 did instead was be the first to *call* things Part 1 had written
+and set aside for it:
+
+| Written in | Used first in |
+|---|---|
+| 1.3 — `shaderDemoteToHelperInvocation` | 4.2, the first `discard` |
+| 1.3 — `bufferDeviceAddress`, `scalarBlockLayout` | 4.5, the first pointer |
+| 1.7 — `depth_bias`, `stencil_attachment`, `stencil_test` | 4.1 |
+| 1.7 — `colour_blend`, `alpha_blending` | 4.2 |
+| 1.7 — `vkc::image_barrier` | 4.3 |
+| 1.11 — `ImageDesc::array_layers`, `cube`, `vkc::load_cubemap` | 4.4 |
+
+The samples call those rather than carrying their own copies. 4.3 and 4.4 used to define local
+versions of `image_barrier` and of cubemap creation and loading; they now use the shared code,
+and render byte-identically for it — 4.4's static-sky round trip still reads zero pixels
+different.
+
+What stays in the chapters is what only they need: 4.1's depth-stencil buffer and three-attachment
+`begin_rendering`, 4.4's six per-face views, and 4.5's `buffer_address` and `FrameArena`.
+
+## Things Part 4 does badly on purpose
+
+**Transparency is sorted per object.** 4.2 sorts panes by centre distance. Two panes that
+intersect cannot be ordered that way at all, and order-independent transparency is a later
+subject.
+
+**The environment map is right at one point.** 4.4 renders it from the sphere's centre, every
+frame, at 512 per face — seven scene draws where there was one. Real renderers update such maps
+rarely, small, and only near the camera.
+
+**The sphere has one surface.** Light refracts in and never out, so total internal reflection
+never happens and the glass has no back. And one `F₀` serves water, glass and diamond.
+
+**Nothing checks an address.** 4.5 reads through raw pointers with no bounds checks and no
+validation message for a stale one; GPU-assisted validation is the tool for that, and it has not
+been needed yet.
+
+**The shaders repeat themselves.** 4.5's two shaders declare the same four structs word for word,
+and the C++ declares them a third time. With descriptors gone, those declarations are the only
+contract between the two sides — which is the problem 4.6 starts on.
+
+## Before moving on
+
+One comparison is worth making yourself:
+
+```bash
+diff code/src/4.advanced_vulkan/cubemaps/main.cpp \
+     code/src/4.advanced_vulkan/buffer_device_address/main.cpp
+```
+
+The pictures differ in one pixel by one level. The diff is most of the file. That is the part's
+last lesson in one command: the same frame can be delivered by very different plumbing, and a
+pixel comparison against a known-good image is how you know the new plumbing is right.

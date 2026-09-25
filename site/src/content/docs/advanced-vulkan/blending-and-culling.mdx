@@ -427,9 +427,10 @@ the following requirements is required (VkPhysicalDeviceVulkan13Features::shader
 OR VkPhysicalDeviceShaderDemoteToHelperInvocationFeaturesEXT::shaderDemoteToHelperInvocation).
 ```
 
-One line in `vkcommon`'s device creation fixes it:
+The fix is one line in device creation — and it is already in yours. Chapter 1.3 enabled
+it, with a comment saying this chapter would be the one to need it:
 
-```cpp title="code/common/scaffold/src/context.cpp"
+```cpp title="code/common/scaffold/src/device.cpp"
 features13.shaderDemoteToHelperInvocation = VK_TRUE;
 ```
 
@@ -649,7 +650,8 @@ arrived" — is the obvious-looking one, and it is wrong: it replaces the target
 the pane's.
 
 It was what this chapter's sample had first, and it is what `vkcommon`'s `alpha_blending()`
-helper had carried since it was written. Every colour on screen was correct, and every blended
+helper carried until this chapter found the problem — which is why the version you wrote in
+1.7 already has `ZERO` and `ONE`. Every colour on screen was correct, and every blended
 fragment was quietly overwriting the attachment's alpha with its own. The table predicts the
 exact byte: `0.55 × 255 = 140.25`, stored as 140 — and the reference capture came back with
 80038 pixels at alpha 140, in an image that is supposed to be opaque.
@@ -1225,20 +1227,12 @@ add_chapter(4.2.blending_and_culling
 ```
 
 :::note[What moved into vkcommon]
-One setter on `PipelineBuilder`, for chapters that need a blend mode the boolean does not
-cover:
-
-```cpp title="code/common/scaffold/include/vkc/pipeline.hpp"
-PipelineBuilder& colour_blend(const VkPipelineColorBlendAttachmentState& state);
-```
-
-The struct itself is still written out field by field in this chapter's `main.cpp`. The
-builder carries it and decides nothing.
-
-Two fixes went into `vkcommon` alongside it: `shaderDemoteToHelperInvocation` in
-`context.cpp`, without which no shader in the series may use `discard`, and the alpha
-factors on `alpha_blending()`'s default state, which had the `ONE`/`ZERO` bug described
-above. Nothing called that helper yet, so nothing had hit it.
+Nothing. `colour_blend()` has been on `PipelineBuilder` since 1.7, which listed it as this
+chapter's; the struct it carries is still written out field by field in `main.cpp`, and the
+builder decides nothing. `shaderDemoteToHelperInvocation` has been enabled in
+`Context::create_device()` since 1.3, and the caution box above is the story of why it is
+there. The `ZERO`/`ONE` alpha factors in 1.7's `alpha_blending()` default are this chapter's
+finding too: the version you wrote already has them.
 :::
 
 ## What changed since 4.1
