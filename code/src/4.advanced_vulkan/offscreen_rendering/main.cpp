@@ -204,59 +204,6 @@ static_assert(sizeof(PostPushConstants) == 16);
     return placement.position + glm::vec3(0.0F, 0.5F * placement.size.y, 0.0F);
 }
 
-// One image-layout transition, said precisely.
-//
-// vkcommon has had transition_image() since 1.5, and it names ALL_COMMANDS on both
-// sides: "everything before, everything after". That is always correct and it is a
-// blunt instrument -- it forbids overlap that was never a problem. Until now no chapter
-// has had a reason to do better, because the only transitions were at the very top and
-// bottom of the frame where there was nothing to overlap with anyway.
-//
-// This chapter has two transitions in the middle of a frame, and what they say decides
-// how much of the two passes the GPU is allowed to run at the same time. So they are
-// spelled out: which stage produced the data, which access wrote it, which stage is
-// about to consume it, and which access will read it. Everything outside those four
-// answers stays free to move.
-void image_barrier(VkCommandBuffer cmd, VkImage image, VkImageLayout from,
-                   VkImageLayout to, VkPipelineStageFlags2 src_stage,
-                   VkAccessFlags2 src_access, VkPipelineStageFlags2 dst_stage,
-                   VkAccessFlags2 dst_access) {
-    const VkImageMemoryBarrier2 barrier{
-        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-        .pNext = nullptr,
-        .srcStageMask = src_stage,
-        .srcAccessMask = src_access,
-        .dstStageMask = dst_stage,
-        .dstAccessMask = dst_access,
-        .oldLayout = from,
-        .newLayout = to,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .image = image,
-        .subresourceRange =
-            {
-                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                .baseMipLevel = 0,
-                .levelCount = VK_REMAINING_MIP_LEVELS,
-                .baseArrayLayer = 0,
-                .layerCount = VK_REMAINING_ARRAY_LAYERS,
-            },
-    };
-
-    const VkDependencyInfo dependency{
-        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-        .pNext = nullptr,
-        .dependencyFlags = 0,
-        .memoryBarrierCount = 0,
-        .pMemoryBarriers = nullptr,
-        .bufferMemoryBarrierCount = 0,
-        .pBufferMemoryBarriers = nullptr,
-        .imageMemoryBarrierCount = 1,
-        .pImageMemoryBarriers = &barrier,
-    };
-    vkCmdPipelineBarrier2(cmd, &dependency);
-}
-
 class OffscreenRenderingApp : public vkc::App {
 public:
     using vkc::App::App;
@@ -392,12 +339,12 @@ private:
         // frame's *second* pass may still be sampling this image when the current
         // frame's first pass wants to overwrite it. Writing after a read is still a
         // hazard. FRAGMENT_SHADER / SHADER_SAMPLED_READ is what that previous reader was.
-        image_barrier(frame.cmd, offscreen_colour_.handle(), VK_IMAGE_LAYOUT_UNDEFINED,
-                      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                      VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
-                      VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-                      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                      VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        vkc::image_barrier(frame.cmd, offscreen_colour_.handle(), VK_IMAGE_LAYOUT_UNDEFINED,
+                           VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                           VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                           VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                           VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                           VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
 
         // And this is the whole of "render to texture" in Vulkan 1.3: the function every
         // chapter since 1.13 has called, with a different view and a different extent.
@@ -472,13 +419,13 @@ private:
         // being written. The picture would usually still look right, which is the worst
         // possible failure mode -- the synchronisation validation layer is what catches
         // it, and the article shows what it says.
-        image_barrier(frame.cmd, offscreen_colour_.handle(),
-                      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                      VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                      VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
-                      VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        vkc::image_barrier(frame.cmd, offscreen_colour_.handle(),
+                           VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                           VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                           VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                           VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                           VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
 
         // The second pass's rendering info, written out rather than taken from vkcommon,
         // because it differs from every previous one in this series in two ways.

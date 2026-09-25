@@ -1,6 +1,6 @@
 ---
 title: "Pipeline state: blending & culling"
-description: Culling throws triangles away before the fragment shader runs; blending decides what happens to the colour after it returns. Between them sits the one piece of transparency Vulkan has no switch for.
+description: Culling throws triangles away before the fragment shader runs; blending decides what happens to the colour after it returns. One determinant explains the first, one line of algebra explains why the second cares about order, and between them sits the one piece of transparency Vulkan has no switch for.
 sidebar:
   order: 2
 ---
@@ -17,6 +17,184 @@ the fragment shader rather than after it.
 The scene has three kinds of surface in it. The crates and the floor are opaque. The ferns
 look like plants and are flat quads with most of their texture thrown away. The panes are
 transparent, and they are the only things here that had to be sorted by hand.
+
+Four keys switch between the variants, so every failure this chapter describes can be looked
+at: <kbd>1</kbd> cycles the opaque geometry's cull mode, <kbd>2</kbd> toggles sorting the
+panes, <kbd>3</kbd> toggles the panes' depth writes, and <kbd>4</kbd> switches the ferns
+between alpha testing and alpha blending.
+
+## The scene
+
+The file opens as 4.1's did, with one more header — `<algorithm>`, for the sort at the end of
+the chapter — and without `<stdexcept>`, because nothing here throws:
+
+```cpp title="code/src/4.advanced_vulkan/blending_and_culling/main.cpp"
+#include <vkc/app.hpp>
+#include <vkc/buffer.hpp>
+#include <vkc/camera.hpp>
+#include <vkc/check.hpp>
+#include <vkc/image.hpp>
+#include <vkc/paths.hpp>
+#include <vkc/pipeline.hpp>
+
+#include <SDL3/SDL.h>
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_inverse.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <spdlog/spdlog.h>
+
+#include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdlib>
+#include <cstring>
+#include <exception>
+#include <span>
+```
+
+`Vertex`, the 24-vertex cube and its 36 indices are 4.1's, character for character. The quad
+buffer changes. It still holds 4.1's floor — wider now — but the second quad is no longer a
+slab lying in the floor. It is a unit quad standing upright, which every fern and every pane
+is a scaled and rotated copy of:
+
+```cpp title="code/src/4.advanced_vulkan/blending_and_culling/main.cpp"
+constexpr float kFloorY = -1.0F;
+// Wider than 4.1's floor, so that its far edge falls outside the frame rather than
+// drawing a hard line across the horizon.
+constexpr float kFloorHalf = 22.0F;
+constexpr float kFloorTiles = 19.0F;
+
+// Two quads in one buffer: 4.1's floor, in world space, and a unit upright quad that
+// every fern and every pane of glass is an instance of. The upright quad stands on
+// y = 0 and is one unit tall, so translating it to the floor's y puts its foot on the
+// ground with no arithmetic.
+constexpr std::array<Vertex, 8> kQuadVertices{{
+    // floor, indices 0..5
+    {{-kFloorHalf, kFloorY, -kFloorHalf}, {0, 1, 0}, {0, 0}},
+    {{-kFloorHalf, kFloorY, kFloorHalf}, {0, 1, 0}, {0, kFloorTiles}},
+    {{kFloorHalf, kFloorY, kFloorHalf}, {0, 1, 0}, {kFloorTiles, kFloorTiles}},
+    {{kFloorHalf, kFloorY, -kFloorHalf}, {0, 1, 0}, {kFloorTiles, 0}},
+    // upright unit quad facing +z, indices 6..11
+    {{-0.5F, 0.0F, 0.0F}, {0, 0, 1}, {0, 1}},
+    {{0.5F, 0.0F, 0.0F}, {0, 0, 1}, {1, 1}},
+    {{0.5F, 1.0F, 0.0F}, {0, 0, 1}, {1, 0}},
+    {{-0.5F, 1.0F, 0.0F}, {0, 0, 1}, {0, 0}},
+}};
+
+constexpr std::array<uint16_t, 12> kQuadIndices{
+    0, 1, 2, 2, 3, 0,  // floor
+    4, 5, 6, 6, 7, 4,  // upright
+};
+
+constexpr uint32_t kFloorFirstIndex = 0;
+constexpr uint32_t kUprightFirstIndex = 6;
+constexpr uint32_t kQuadIndexCount = 6;
+```
+
+Putting the upright quad's foot at `y = 0` rather than centring it is a small decision that
+pays for itself: every placement below can give the floor's y as its position, and the quad
+stands on the ground without anyone adding half its height.
+
+Every object in the scene is described by one struct — where its foot is, which way it faces,
+and how big it is:
+
+```cpp title="code/src/4.advanced_vulkan/blending_and_culling/main.cpp"
+struct Placement {
+    glm::vec3 position;  // where its foot sits
+    float angle;         // radians about y
+    glm::vec2 size;      // width, height
+};
+
+constexpr std::array<Placement, 2> kCrates{{
+    {{-1.35F, kFloorY, 0.5F}, 0.36F, {1.0F, 1.0F}},
+    {{1.30F, kFloorY, -1.20F}, -0.72F, {1.0F, 1.0F}},
+}};
+
+// A stand of ferns, deliberately overlapping each other from this camera. Overlap is
+// what makes the difference between the cutout and the blended version obvious.
+constexpr std::array<Placement, 6> kFerns{{
+    {{-3.30F, kFloorY, 1.70F}, 0.30F, {2.0F, 2.0F}},
+    {{-2.10F, kFloorY, 2.90F}, -0.55F, {1.7F, 1.7F}},
+    {{-2.70F, kFloorY, 2.30F}, 0.95F, {1.5F, 1.5F}},
+    {{2.55F, kFloorY, 2.10F}, 0.80F, {2.1F, 2.1F}},
+    {{3.40F, kFloorY, 1.30F}, -0.20F, {1.6F, 1.6F}},
+    {{0.35F, kFloorY, 3.30F}, 0.15F, {1.8F, 1.8F}},
+}};
+```
+
+The crates are the same two as 4.1's, now positioned by their foot. The cube is centred on
+its own origin, so `on_render` lifts it by half a unit — the one place the foot convention
+costs anything.
+
+The panes are the experiment:
+
+```cpp title="code/src/4.advanced_vulkan/blending_and_culling/main.cpp"
+// Three panes of coloured glass at three different distances, placed so that all three
+// overlap on screen. The overlap is the whole experiment: two transparent surfaces that
+// never cover the same pixel look identical whatever order they are drawn in.
+//
+// The order they appear in this array is *not* the order they should be drawn in --
+// blue is the farthest away and comes last -- which is what the sort exists to fix.
+constexpr std::array<Placement, 3> kPanes{{
+    {{-1.15F, kFloorY, 5.10F}, 0.12F, {1.9F, 1.5F}},
+    {{0.80F, kFloorY, 6.00F}, -0.20F, {1.9F, 1.5F}},
+    {{-0.30F, kFloorY, 4.10F}, 0.04F, {1.9F, 1.5F}},
+}};
+
+constexpr std::array<glm::vec4, 3> kPaneColours{{
+    {0.88F, 0.16F, 0.20F, 0.55F},
+    {0.14F, 0.76F, 0.38F, 0.55F},
+    {0.18F, 0.36F, 0.96F, 0.55F},
+}};
+
+constexpr glm::vec4 kWhite{1.0F};
+```
+
+Red, green and blue at `z = 5.10`, `6.00` and `4.10`. The camera sits at `z = 12.6` looking
+down −z, so blue is the farthest, red the middle and green the nearest. The array lists them
+red, green, blue — farthest *last* — which is the worst order there is, and deliberately so.
+All three share one alpha, 0.55, which keeps the arithmetic later in this chapter readable.
+
+The three cull modes, with names for the log:
+
+```cpp title="code/src/4.advanced_vulkan/blending_and_culling/main.cpp"
+constexpr std::array<VkCullModeFlags, 3> kCullModes{
+    VK_CULL_MODE_BACK_BIT,
+    VK_CULL_MODE_NONE,
+    VK_CULL_MODE_FRONT_BIT,
+};
+constexpr std::array<const char*, 3> kCullModeNames{"back", "none", "front"};
+```
+
+`VkCullModeFlags` is a bitmask rather than an enum because there is a fourth value these three
+do not use: `VK_CULL_MODE_FRONT_AND_BACK`, which is `FRONT_BIT | BACK_BIT` and discards every
+triangle while still running the vertex stage. It sounds useless, and it is occasionally the
+right way to run vertex work that produces no pixels.
+
+The sun, `Globals`, `PushConstants` and `normal_matrix_of` are 4.1's, unchanged. Two helpers
+turn a placement into what the GPU and the sort each need:
+
+```cpp title="code/src/4.advanced_vulkan/blending_and_culling/main.cpp"
+[[nodiscard]] glm::mat4 model_of(const Placement& placement) {
+    return glm::scale(
+        glm::rotate(glm::translate(glm::mat4(1.0F), placement.position), placement.angle,
+                    glm::vec3(0.0F, 1.0F, 0.0F)),
+        glm::vec3(placement.size.x, placement.size.y, 1.0F));
+}
+
+// The middle of the quad, for sorting. Only the horizontal position really matters at
+// this camera angle, but the centre is the honest answer and costs nothing.
+[[nodiscard]] glm::vec3 centre_of(const Placement& placement) {
+    return placement.position + glm::vec3(0.0F, 0.5F * placement.size.y, 0.0F);
+}
+```
+
+`model_of` is `T · R · S` again, now with a non-uniform scale: `size.x` stretches the quad's
+width, `size.y` its height, and `z` stays 1 because a quad has no depth to scale. The normal
+matrix is why that matters — a non-uniform scale is exactly the case 2.2's inverse-transpose
+exists for, and `normal_matrix_of` already handles it.
+
+`centre_of` is the foot plus half the height: the point the sort measures distance to.
 
 ## Culling happens first
 
@@ -38,31 +216,83 @@ Which winding counts as front is `frontFace`, and it is decided from the triangl
 signed area **in framebuffer coordinates** — after the vertex shader, after the
 projection, after everything. That last part is where this series has a trap in it.
 
+### Winding is the sign of a determinant
+
+3.1 met winding as the direction a cross product points. On screen there is no third
+dimension to point into, and the same idea becomes a signed area. For a triangle with
+corners `a`, `b`, `c` in 2D:
+
+```
+                 1     | (b − a).x   (c − a).x |
+   area(a,b,c) = ─  ·  |                       |
+                 2     | (b − a).y   (c − a).y |
+
+               = ½ · ( (b.x − a.x)(c.y − a.y) − (c.x − a.x)(b.y − a.y) )
+```
+
+That is the `z` component of 3.1's cross product with both edges laid flat, halved. Its size
+is the triangle's area. Its **sign** says which way round the corners go: swap any two of
+them and one column of the determinant changes places with the other, which negates it. So
+"clockwise" and "counter-clockwise" are not geometric mysteries. They are the two signs of
+this number, and `frontFace` says which sign counts as front.
+
+Now apply a linear map `M` to all three corners — any rotation, scale or reflection of the
+screen. The edges become `M(b − a)` and `M(c − a)`, and the determinant of a product is the
+product of the determinants:
+
+```
+   det [ M(b − a)   M(c − a) ]  =  det( M · [ b − a   c − a ] )
+                                =  det(M) · det [ b − a   c − a ]
+```
+
+So every triangle's signed area is multiplied by the same number, `det(M)`. If that number
+is positive, every winding survives. If it is negative, **every winding reverses at once**.
+
 ### The projection matrix and `frontFace` are one decision
 
 Every chapter since 1.13 has built its projection like this:
 
 ```cpp title="code/src/4.advanced_vulkan/blending_and_culling/main.cpp"
-glm::mat4 projection = glm::perspective(glm::radians(45.0F), aspect, 0.1F, 100.0F);
-projection[1][1] *= -1.0F;  // Vulkan's clip-space y points down.
+[[nodiscard]] static glm::mat4 build_projection(VkExtent2D extent) {
+    const float aspect =
+        static_cast<float>(extent.width) / static_cast<float>(extent.height);
+    glm::mat4 projection =
+        glm::perspective(glm::radians(45.0F), aspect, 0.1F, 100.0F);
+    projection[1][1] *= -1.0F;  // Vulkan's clip-space y points down.
+    return projection;
+}
 ```
 
-Negating one axis mirrors the image, and mirroring an image reverses the apparent winding
-of every triangle in it. So that one line changes which `frontFace` value is correct.
+Negating `projection[1][1]` negates every vertex's clip-space `y`. The perspective divide
+then divides `x` and `y` by the same positive `w`, and `−y / w = −(y / w)`, so the flip
+arrives in normalised device coordinates unchanged. There it is the linear map
 
-This is worth measuring rather than arguing about, because the sample makes it cheap to.
-Running all four combinations and counting how much of the frame is left showing the
-background:
+```
+   M  =  | 1    0 |        det(M)  =  1 · (−1)  −  0 · 0  =  −1
+         | 0   −1 |
+```
+
+and the previous section says what a determinant of −1 does: it reverses the winding of
+every triangle on screen. The viewport transform that follows is a positive scale and a
+translation, whose determinant is positive, so nothing after this point undoes it.
+
+That is the whole reason the y-flip and `frontFace` are one decision. It is worth measuring
+rather than trusting, because the sample makes it cheap to. Running all four combinations and
+counting how much of the frame is left showing the background:
 
 | | `VK_FRONT_FACE_COUNTER_CLOCKWISE` | `VK_FRONT_FACE_CLOCKWISE` |
 |---|---|---|
 | **y-flip present** | floor drawn (33% background) | floor culled away (89%) |
 | **y-flip removed** | floor culled away (89%) | floor drawn (33%) |
 
-The correct value swaps exactly when the flip is removed. Neither column is *right* in the
-abstract — `frontFace` is only meaningful together with the projection that feeds it, which
-is why a `frontFace` copied out of OpenGL material, or out of a Vulkan sample that builds
-its projection differently, is a coin flip.
+The correct value swaps exactly when the flip is removed, as a determinant of −1 says it
+must. Neither column is *right* in the abstract — `frontFace` is only meaningful together
+with the projection that feeds it, which is why a `frontFace` copied out of OpenGL material,
+or out of a Vulkan sample that builds its projection differently, is a coin flip.
+
+The same argument covers something no chapter has done yet. A model matrix with a negative
+scale on one axis — a mirrored object — has a negative determinant too, and turns that object
+inside out under culling. Exercise 7 asks you to predict which faces you will then see.
 
 Pressing <kbd>1</kbd> cycles the opaque geometry between back, none and front culling.
 Culling the front faces is the useful one to look at, because it does not simply delete the
@@ -79,23 +309,77 @@ scene — it turns it inside out:
 
 The ferns and the panes are drawn with `VK_CULL_MODE_NONE`, and they have to be. A quad is
 a sheet with no inside: whichever way it is wound, the ferns behind the camera's line of
-sight are seen from the other side, and culling would delete half of them.
+sight are seen from the other side, and culling would delete half of them. Geometry like
+this — a surface with two visible faces and one set of triangles — is **two-sided**.
 
 That has a consequence in the shader. A flat sheet has one normal, and seen from behind,
-every lighting term built from it is wrong. The fix is to flip it toward the viewer:
+every lighting term built from it is wrong. The fix is to flip it toward the viewer.
+
+## The shader: four entry points that barely differ
+
+The interface blocks, `Globals` and the vertex stage are 4.1's. The push block gains one
+comment, because for the first time its `colour.a` means something:
 
 ```slang title="code/src/4.advanced_vulkan/blending_and_culling/blending_and_culling.slang"
+struct PushConstants {
+    float4x4 model;
+    float3x3 normal_matrix;
+    float4 colour;  // the glass panes carry their transparency in .a
+};
+[[vk::push_constant]] PushConstants push;
+
+static const float kSpecularStrength = 0.2;
+
+// Anything below this much alpha is not part of the leaf. 0.5 is the conventional
+// choice and it is arbitrary: the article works through what moving it does.
+static const float kCutoutThreshold = 0.5;
+```
+
+4.1's Phong code moves into a function, because three entry points now need it and one of
+them needs it two-sided:
+
+```slang title="code/src/4.advanced_vulkan/blending_and_culling/blending_and_culling.slang"
+// `two_sided` is what a quad drawn with culling off needs. Its single normal points one
+// way; seen from behind, every lighting term built from that normal is wrong. Flipping
+// it to face the viewer is the cheap fix, and it is only ever correct for geometry that
+// really is a flat sheet -- which is exactly the geometry culling has to be turned off
+// for.
 float3 shade(VSOutput input, float3 albedo, bool two_sided) {
     float3 normal = normalize(input.normal);
     float3 to_eye = normalize(globals.view_position.xyz - input.world_position);
     if (two_sided && dot(normal, to_eye) < 0.0) {
         normal = -normal;
     }
-    // ...
+
+    float3 to_sun = normalize(-globals.sun_direction.xyz);
+
+    float diffuse_amount = max(dot(normal, to_sun), 0.0);
+    float3 diffuse = globals.sun_colour.rgb * diffuse_amount * albedo;
+
+    float3 reflected = reflect(-to_sun, normal);
+    float specular_amount = pow(max(dot(to_eye, reflected), 0.0), globals.ambient.w);
+    float3 specular = globals.sun_colour.rgb * specular_amount * kSpecularStrength;
+
+    return globals.ambient.rgb * albedo + diffuse + specular;
+}
 ```
 
-This is only ever correct for geometry that really is a flat sheet — which is exactly the
-geometry culling had to be turned off for. The two decisions travel together.
+`dot(normal, to_eye) < 0` is 2.2's dot product used as a test of which side you are on: the
+dot product of two unit vectors is the cosine of the angle between them, and it is negative
+exactly when that angle exceeds 90° — when the normal points away from the eye. The function
+returns a colour rather than a `float4`, because the three callers disagree about alpha.
+
+The opaque surfaces call it one-sided and write a solid alpha:
+
+```slang title="code/src/4.advanced_vulkan/blending_and_culling/blending_and_culling.slang"
+// The opaque surfaces: the floor and the crates. 4.1's shader, with the two-sided flag
+// off because a closed box and a floor are never seen from behind.
+[shader("fragment")]
+float4 fragmentMain(VSOutput input) : SV_Target {
+    float3 albedo = base_colour_map.Sample(input.uv).rgb * push.colour.rgb;
+    return float4(shade(input, albedo, false), 1.0);
+}
+```
 
 ## Alpha testing is not pipeline state
 
@@ -103,16 +387,33 @@ Vulkan has no alpha-test switch. OpenGL had one and it is gone; the replacement 
 in the fragment shader:
 
 ```slang title="code/src/4.advanced_vulkan/blending_and_culling/blending_and_culling.slang"
-float4 sampled = base_colour_map.Sample(input.uv);
-if (sampled.a < kCutoutThreshold) {
-    discard;
+// The ferns, as a cutout.
+//
+// `discard` ends the invocation: no colour is written, and -- the part that matters --
+// no depth is written either. The quad's empty texels leave the depth buffer untouched,
+// so whatever is behind them is still drawn. That is what lets an alpha-tested plant be
+// treated as ordinary opaque geometry, needing no sorting and no blending.
+//
+// The cost is that the decision is binary. A texel is in or out, so the silhouette is
+// as jagged as the resolution allows, and the sampler's smooth gradient at the leaf's
+// edge is thrown away. 4.9 comes back to this with alpha-to-coverage.
+[shader("fragment")]
+float4 cutoutFragmentMain(VSOutput input) : SV_Target {
+    float4 sampled = base_colour_map.Sample(input.uv);
+    if (sampled.a < kCutoutThreshold) {
+        discard;
+    }
+    return float4(shade(input, sampled.rgb * push.colour.rgb, true), 1.0);
 }
 ```
 
 `discard` ends the invocation. No colour is written — and, the part that matters, no depth
 is written either. The fern's empty texels leave the depth buffer untouched, so whatever is
-behind them still gets drawn. That is what lets an alpha-tested plant be treated as
-ordinary opaque geometry: depth writes on, blending off, no sorting, drawn in any order.
+behind them still gets drawn. That is what lets an **alpha cutout** be treated as ordinary
+opaque geometry: depth writes on, blending off, no sorting, drawn in any order.
+
+A survivor writes alpha `1.0`, not `sampled.a`. It was either in or out, and a fragment that
+is in is opaque.
 
 :::caution[This needs a device feature, and nothing tells you until it does]
 Slang compiles `discard` to `OpDemoteToHelperInvocation` rather than the older `OpKill`,
@@ -134,6 +435,11 @@ features13.shaderDemoteToHelperInvocation = VK_TRUE;
 
 The shaders still ran on this machine and the ferns still cut out correctly, which is the
 point of running with the validation layers on rather than trusting the picture.
+
+*Demote* rather than *kill* is the reason: a demoted invocation stops writing but keeps
+running as a helper, so its neighbours in the 2×2 quad the GPU shades together can still
+compute the screen-space derivatives that mip selection needs. Killing it outright would
+leave those derivatives undefined along every cutout edge.
 :::
 
 ### What alpha testing costs
@@ -142,8 +448,24 @@ The decision is binary: a texel is in or out. The sampler's smooth gradient alon
 leaf's edge — the thing that cost you a mip chain and a linear filter — is thrown away, and
 the silhouette comes out as hard as the resolution allows.
 
-Press <kbd>4</kbd> to hand the same ferns to the blender instead. Across the whole frame
-only 1.90% of pixels change, and they are almost all on the leaf edges:
+Press <kbd>4</kbd> to hand the same ferns to the blender instead:
+
+```slang title="code/src/4.advanced_vulkan/blending_and_culling/blending_and_culling.slang"
+// The same ferns, handed to the blender instead. No discard, and the sampled alpha goes
+// out in the result for the blend equation to use.
+//
+// This is the version that looks right in a still frame and wrong the moment two plants
+// overlap, because blending is order-dependent and these are not sorted. Toggle 4 in the
+// sample switches between this entry point and the one above.
+[shader("fragment")]
+float4 foliageBlendFragmentMain(VSOutput input) : SV_Target {
+    float4 sampled = base_colour_map.Sample(input.uv);
+    return float4(shade(input, sampled.rgb * push.colour.rgb, true), sampled.a);
+}
+```
+
+Across the whole frame only 1.90% of pixels change, and they are almost all on the leaf
+edges:
 
 <figure>
   <img src="/img/4.2/fern-edge-detail.png" alt="Side-by-side magnification of fern leaflets: the left panel has hard stair-stepped edges, the right has smooth graded ones" />
@@ -154,6 +476,17 @@ only 1.90% of pixels change, and they are almost all on the leaf edges:
 
 So why not blend the ferns? Because blending costs an ordering constraint, and alpha
 testing does not — which is the rest of this chapter.
+
+The last entry point is for the glass, and has nothing in it but the colour:
+
+```slang title="code/src/4.advanced_vulkan/blending_and_culling/blending_and_culling.slang"
+// The glass panes. Flat colour, alpha and all, straight from the push block: the point
+// of the panes is the blend state behind them, and a texture would only get in the way.
+[shader("fragment")]
+float4 flatFragmentMain(VSOutput input) : SV_Target {
+    return push.colour;
+}
+```
 
 ## The blend state, field by field
 
@@ -176,75 +509,185 @@ const VkPipelineColorBlendAttachmentState source_over{
 };
 ```
 
-There are **two** equations here, not one, and each has two factors and an operation. Both
-have the same shape — take the source, take the destination, scale each by its factor,
-combine them with the op:
+There are **two** equations here, not one — the **blend equation** for colour and a second
+for alpha — and each has two **blend factors** and an operation. Both have the same shape:
+take the source (what the shader returned), take the destination (what the attachment already
+holds), scale each by its factor, and combine them with the op:
 
 ```text
 result.rgb = src.rgb * SRC_ALPHA + dst.rgb * ONE_MINUS_SRC_ALPHA
 result.a   = src.a   * ZERO      + dst.a   * ONE
 ```
 
-The colour line is source-over, the arrangement almost everything uses. Written out, it is a
-linear interpolation between what was there and what arrived, with the incoming alpha as the
-blend weight: at `src.a = 1` the new fragment wins outright, at `0` it contributes nothing.
+`VK_BLEND_FACTOR_SRC_ALPHA` is the factor `src.a`; `VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA` is
+`1 − src.a`. `VK_BLEND_OP_ADD` adds the two scaled terms, and it is the op almost every blend
+uses — the others are subtract, reverse subtract, min and max.
+
+`colorWriteMask` is a separate gate after all of that: which of the four channels the result
+is allowed to touch. All four, here. Clearing a bit is how a pipeline that still has a colour
+attachment is kept from writing part of it.
+
+### The over operator
+
+The colour line has a name. Written with `a` for the source's alpha:
+
+```
+   C_out  =  a · C_src  +  (1 − a) · C_dst
+```
+
+This is the **over operator** — "source over destination" — and it is a linear interpolation
+between what was there and what arrived, with the incoming alpha as the weight. At `a = 1`
+the new fragment wins outright; at `a = 0` it contributes nothing; at `0.55` the pane
+contributes 55% of its own colour and lets 45% of the background through.
+
+That reading — alpha as the fraction of light a layer *blocks* — is what the rest of this
+chapter rests on.
+
+### Blending is not commutative
+
+Opaque geometry can be drawn in any order. Whatever arrives second either wins the depth
+test or loses it, and the answer does not depend on which arrived first. That freedom is
+what the depth buffer buys.
+
+The over operator does not have it. Put two layers `A` and `B` over a background `D`, first
+in one order:
+
+```
+   A over (B over D)  =  a_A·C_A  +  (1 − a_A)·[ a_B·C_B + (1 − a_B)·D ]
+                      =  a_A·C_A  +  (1 − a_A)·a_B·C_B  +  (1 − a_A)(1 − a_B)·D
+```
+
+and then in the other, which is the same expression with `A` and `B` exchanged:
+
+```
+   B over (A over D)  =  a_B·C_B  +  (1 − a_B)·a_A·C_A  +  (1 − a_A)(1 − a_B)·D
+```
+
+Subtract. The background term is identical in both and cancels — whatever is behind the two
+layers, it is attenuated by both of them either way. What is left is:
+
+```
+   A over (B over D)  −  B over (A over D)
+        =  a_A·C_A − a_A·C_A + a_A·a_B·C_A  +  a_B·C_B − a_A·a_B·C_B − a_B·C_B
+        =  a_A · a_B · ( C_A − C_B )
+```
+
+Three things fall out of that one line:
+
+- The error is **zero only if** one layer is fully transparent (`a = 0`), or the two are
+  exactly the same colour. Two real panes of different glass always disagree.
+- It is **independent of the background**. The order bug looks the same over the floor, over
+  a crate, over the sky.
+- Its size is **predictable**. With both alphas at 0.55, `a_A · a_B = 0.3025`, so the wrong
+  order is off by about 30% of the difference between the two panes' colours.
+
+That is a strong enough claim to test against the sample. Blending happens in linear colour —
+the swapchain is `_SRGB`, so the hardware decodes, blends and re-encodes — so the measurement
+decodes the two captures back to linear first. Only two pairs of panes change relative order
+when sorting is switched off: red and green are drawn red-first either way, so their overlap
+cannot change.
+
+| overlap | predicted `0.3025 · (C_A − C_B)` | measured, sorted − unsorted | pixels |
+|---|---|---|---|
+| red over blue | (0.212, −0.061, −0.230) | (0.211, −0.061, −0.227) | 11 358 |
+| green over blue | (−0.012, 0.121, −0.176) | (−0.012, 0.120, −0.173) | 6 697 |
+
+Every one of the 18 055 pixels that change falls into one of those two rows, within 0.011 of
+the prediction — about what 8-bit quantisation of an sRGB value allows. **Order dependence**
+is not a vague property of blending; it is `a_A · a_B · (C_A − C_B)`, to the pixel.
+
+:::note[Premultiplied alpha, and why it composes]
+The over operator is not commutative, but it *is* associative — `(A over B) over C` equals
+`A over (B over C)` — and that is easiest to see in a different representation.
+
+**Premultiplied alpha** stores each colour already multiplied by its own alpha: `C' = a · C`.
+Over then becomes
+
+```
+   C'_out  =  C'_src  +  (1 − a_src) · C'_dst
+   a_out   =  a_src   +  (1 − a_src) · a_dst
+```
+
+— the *same* equation for colour and for alpha, with factors `ONE` and `ONE_MINUS_SRC_ALPHA`
+on both lines. Expanding `(A over B) over C` and `A over (B over C)` in this form gives
+`C'_A + (1 − a_A)·C'_B + (1 − a_A)(1 − a_B)·C'_C` both ways. Associativity is what lets a
+renderer flatten a group of layers into one image in advance and composite that image later.
+
+This series stays with straight alpha, where the shader returns the unmultiplied colour. The
+panes and ferns are the only blended things in it, and they are blended straight into the
+final image.
+:::
 
 ### The alpha equation is a separate decision, and the obvious answer is wrong
 
 The colour line is the one everybody quotes. The alpha line is the one that bites.
 
-The obvious-looking choice for it — `ONE` and `ZERO`, "store the alpha that arrived" — was
-what this chapter's sample had first, and it is what `vkcommon`'s `alpha_blending()` helper
-had carried since it was written. Every colour on screen was correct, and every blended
-fragment was quietly overwriting the attachment's alpha with its own.
+What *should* happen to the destination's alpha when a layer goes over it? Alpha is the
+fraction of light a layer blocks. Light gets through two layers only if it gets through
+each, so the fraction that gets through both is `(1 − a_src)(1 − a_dst)`, and the fraction
+blocked is one minus that:
 
-The panes show it in the finished scene, because they blend whatever the toggles say: the
-reference capture came back with 80038 pixels at alpha 140 — which is 0.55 × 255, the panes'
-own transparency — in an image that is supposed to be opaque.
+```
+   a_out  =  1 − (1 − a_src)(1 − a_dst)
+          =  a_src + a_dst − a_src·a_dst
+          =  a_src + a_dst·(1 − a_src)
+```
+
+That is **separate alpha blending** done properly: factor `ONE` on the source and
+`ONE_MINUS_SRC_ALPHA` on the destination. Now look at the three choices that matter for an
+attachment cleared to alpha 1 — the only kind this chapter has:
+
+| alpha factors | equation | `a_out` over `a_dst = 1`, `a_src = 0.55` |
+|---|---|---|
+| `ONE`, `ONE_MINUS_SRC_ALPHA` | `a_src + a_dst(1 − a_src)` | `0.55 + 0.45 = 1.0` |
+| `ZERO`, `ONE` | `a_dst` | `1.0` |
+| `ONE`, `ZERO` | `a_src` | **`0.55`**, stored as 140 |
+
+The first two agree whenever the destination is already opaque; the sample uses the second,
+which says "leave the target's alpha alone" most directly. The third — "store the alpha that
+arrived" — is the obvious-looking one, and it is wrong: it replaces the target's alpha with
+the pane's.
+
+It was what this chapter's sample had first, and it is what `vkcommon`'s `alpha_blending()`
+helper had carried since it was written. Every colour on screen was correct, and every blended
+fragment was quietly overwriting the attachment's alpha with its own. The table predicts the
+exact byte: `0.55 × 255 = 140.25`, stored as 140 — and the reference capture came back with
+80038 pixels at alpha 140, in an image that is supposed to be opaque.
 
 The ferns show it more starkly, but only with <kbd>4</kbd> held on the blended mode. The
 cut-out shader ends `return float4(shade(...), 1.0)`, so a fern that survives the alpha test
-writes a solid alpha; the blended one passes `sampled.a` straight through. Sampling the same
-floor pixel under an empty fern texel in each:
+writes a solid alpha; the blended one passes `sampled.a` straight through, and an empty texel
+has `sampled.a = 0`. Sampling the same floor pixel under an empty fern texel in each:
 
 ```text
 cut out (default) = (100, 94, 87, 255)
 blended  (key 4)  = (100, 94, 87,   0)
 ```
 
-Identical colour, alpha zero.
+Identical colour, alpha zero — exactly `ONE, ZERO` with `a_src = 0`.
 
 Nothing about the rendered frame looked wrong, which is why this survived until a capture
 was inspected channel by channel: presenting a swapchain image does not oblige anyone to
 read its alpha. It stops being ignorable the moment that image is consumed as data — a PNG
-on a web page, or an offscreen target something later samples, which is chapter 4.3.
-`ZERO` and `ONE` keep whatever alpha the attachment already had, which for a target cleared
-to 1 is what is wanted.
+on a web page, or an offscreen target something later samples, which is chapter 4.3. And
+there the first row of the table becomes the only right answer, because an offscreen target
+cleared to alpha 0 is exactly the case where `ZERO, ONE` would leave it transparent forever.
 
-## Blending is not commutative, and the depth test cannot save you
+## Sorting: the painter's algorithm
 
-Opaque geometry can be drawn in any order. Whatever arrives second either wins the depth
-test or loses it, and the answer does not depend on which arrived first. That freedom is
-what the depth buffer buys.
+Blending takes away the freedom opaque geometry had. A transparent surface has to be drawn
+*after* everything behind it, and the depth test cannot sort this out, because a pane that is
+behind another pane still has to be drawn — and drawn first.
 
-Blending takes it away. "Red over green" and "green over red" are different pictures, so a
-transparent surface has to be drawn *after* everything behind it. The depth test cannot
-sort this out, because a pane that is behind another pane still has to be drawn — and drawn
-first.
+Drawing far things first and near things over them is the **painter's algorithm**, after the
+way a painter lays in a background before the figures in front of it. Here it is a sort of
+three indices by distance from the eye, farthest first.
 
-So the panes are sorted by hand, farthest first:
+The panes are sorted by *squared* distance, `dot(v, v)` rather than `length(v)`. That is safe
+because the square root is increasing: for non-negative numbers, `x > y` exactly when
+`√x > √y`, so both keys put the panes in the same order and the square root is wasted work.
 
-```cpp title="code/src/4.advanced_vulkan/blending_and_culling/main.cpp"
-if (sort_panes_) {
-    const glm::vec3 eye = camera_.position;
-    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-        return glm::dot(centre_of(kPanes[a]) - eye, centre_of(kPanes[a]) - eye) >
-               glm::dot(centre_of(kPanes[b]) - eye, centre_of(kPanes[b]) - eye);
-    });
-}
-```
-
-Press <kbd>2</kbd> to turn that off and the panes are drawn in array order instead, which
+Press <kbd>2</kbd> to turn the sort off and the panes are drawn in array order instead, which
 puts the farthest one last:
 
 <figure>
@@ -252,6 +695,8 @@ puts the farthest one last:
   <figcaption>Unsorted: 1.96% of the frame changes, all of it in the regions where two panes
   overlap. The blue pane is the farthest away and is painted on top of both of the others.</figcaption>
 </figure>
+
+1.96% is the 18 055 pixels in the table above, out of 921 600.
 
 ### `depthWriteEnable`, and a prediction that turned out to be wrong
 
@@ -283,6 +728,502 @@ mechanism is the sort. Turning depth writes off is what keeps a *wrong* sort fro
 twice over, and since a correct sort is expensive and often approximate — per-object, not
 per-pixel, and undefined for surfaces that intersect — the insurance is worth carrying.
 
+## The application
+
+`on_start` uploads the same four buffers as 4.1, then goes back to vkcommon's depth buffer:
+
+```cpp title="code/src/4.advanced_vulkan/blending_and_culling/main.cpp"
+class BlendingAndCullingApp : public vkc::App {
+public:
+    using vkc::App::App;
+
+protected:
+    void on_start() override {
+        cube_vertices_ = vkc::upload_to_device_local(context(), kCubeVertices.data(),
+                                                     sizeof(kCubeVertices),
+                                                     VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+        cube_indices_ = vkc::upload_to_device_local(context(), kCubeIndices.data(),
+                                                    sizeof(kCubeIndices),
+                                                    VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+        quad_vertices_ = vkc::upload_to_device_local(context(), kQuadVertices.data(),
+                                                     sizeof(kQuadVertices),
+                                                     VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+        quad_indices_ = vkc::upload_to_device_local(context(), kQuadIndices.data(),
+                                                    sizeof(kQuadIndices),
+                                                    VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+
+        // Back to 1.13's depth-only buffer. 4.1 needed a stencil aspect and wrote its
+        // own chooser; nothing in this chapter tests the stencil, so vkcommon's helpers
+        // are the right ones again.
+        depth_format_ = vkc::choose_depth_format(context().physical_device());
+        depth_ = vkc::create_depth_buffer(context(), depth_format_, swapchain().extent());
+
+        load_textures();
+        create_uniform_buffers();
+        create_descriptors();
+        create_pipelines();
+
+        camera_.position = {0.0F, 2.60F, 12.60F};
+        camera_.pitch = -14.0F;
+
+        spdlog::info("1 cull mode, 2 pane sorting, 3 pane depth writes, 4 fern mode.");
+    }
+
+    void on_resize(VkExtent2D extent) override {
+        context().wait_idle();
+        depth_ = vkc::create_depth_buffer(context(), depth_format_, extent);
+    }
+```
+
+`vkc::choose_depth_format` and `vkc::create_depth_buffer` are 1.13's, and nothing here needs
+a stencil, so they are right again. `vkc::create_depth_buffer` already waits for the device
+to go idle before building the new image, so the `wait_idle()` in `on_resize` is redundant —
+harmless, and a habit worth keeping in any resize path whose helpers you have not read.
+
+Four keys in a `switch`, and an early return for everything that is not a fresh key press:
+
+```cpp title="code/src/4.advanced_vulkan/blending_and_culling/main.cpp"
+    void on_event(const SDL_Event& event) override {
+        camera_.handle_event(event, window().handle());
+
+        if (event.type != SDL_EVENT_KEY_DOWN || event.key.repeat) {
+            return;
+        }
+        switch (event.key.scancode) {
+            case SDL_SCANCODE_1:
+                cull_index_ = (cull_index_ + 1) % kCullModes.size();
+                spdlog::info("Cull mode: {}", kCullModeNames[cull_index_]);
+                break;
+            case SDL_SCANCODE_2:
+                sort_panes_ = !sort_panes_;
+                spdlog::info("Pane sorting {}", sort_panes_ ? "on" : "off");
+                break;
+            case SDL_SCANCODE_3:
+                pane_depth_writes_ = !pane_depth_writes_;
+                spdlog::info("Pane depth writes {}", pane_depth_writes_ ? "on" : "off");
+                break;
+            case SDL_SCANCODE_4:
+                fern_cutout_ = !fern_cutout_;
+                spdlog::info("Ferns: {}", fern_cutout_ ? "alpha tested" : "alpha blended");
+                break;
+            default:
+                break;
+        }
+    }
+```
+
+`(cull_index_ + 1) % kCullModes.size()` is a counter that wraps: 0, 1, 2, 0, … — back, none,
+front, back.
+
+Shutdown, in reverse:
+
+```cpp title="code/src/4.advanced_vulkan/blending_and_culling/main.cpp"
+    void on_shutdown() override {
+        const VkDevice device = context().device();
+
+        vkDestroyPipeline(device, pane_depth_write_pipeline_, nullptr);
+        vkDestroyPipeline(device, pane_pipeline_, nullptr);
+        vkDestroyPipeline(device, fern_blend_pipeline_, nullptr);
+        vkDestroyPipeline(device, fern_cutout_pipeline_, nullptr);
+        for (const VkPipeline pipeline : opaque_pipelines_) {
+            vkDestroyPipeline(device, pipeline, nullptr);
+        }
+        vkDestroyPipelineLayout(device, pipeline_layout_, nullptr);
+        vkDestroyDescriptorPool(device, descriptor_pool_, nullptr);
+        vkDestroyDescriptorSetLayout(device, material_set_layout_, nullptr);
+        vkDestroyDescriptorSetLayout(device, frame_set_layout_, nullptr);
+
+        clamp_sampler_.destroy();
+        sampler_.destroy();
+        fern_map_.destroy();
+        floor_map_.destroy();
+        crate_map_.destroy();
+        for (vkc::Buffer& buffer : uniform_buffers_) {
+            buffer.destroy();
+        }
+        depth_.destroy();
+        quad_indices_.destroy();
+        quad_vertices_.destroy();
+        cube_indices_.destroy();
+        cube_vertices_.destroy();
+    }
+```
+
+## The frame, in three passes
+
+Opaque first, then the cutouts, then the blended glass. That ordering is the whole of what
+this chapter asks of `on_render`:
+
+```cpp title="code/src/4.advanced_vulkan/blending_and_culling/main.cpp"
+    void on_render(const vkc::FrameInfo& frame) override {
+        camera_.update(delta_time());
+
+        const size_t slot = frame.frame_number % vkc::kFramesInFlight;
+        update_globals(slot, frame.extent);
+
+        vkc::begin_rendering(frame.cmd, frame.view, depth_.view(), frame.extent,
+                             {{0.05F, 0.06F, 0.09F, 1.0F}});
+
+        set_viewport(frame);
+
+        vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                pipeline_layout_, 0, 1, &frame_sets_[slot], 0, nullptr);
+
+        // --- opaque, front to back would be ideal and any order is correct ---------
+        //
+        // Nothing here blends, so the depth test settles every overlap however these
+        // are ordered. That freedom is exactly what the transparent passes below lose.
+        const VkPipeline opaque = opaque_pipelines_[cull_index_];
+
+        bind_geometry(frame.cmd, quad_vertices_, quad_indices_);
+        vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, opaque);
+        bind_material(frame.cmd, floor_set_);
+        push(frame.cmd, glm::mat4(1.0F), kWhite);
+        vkCmdDrawIndexed(frame.cmd, kQuadIndexCount, 1, kFloorFirstIndex, 0, 0);
+
+        bind_geometry(frame.cmd, cube_vertices_, cube_indices_);
+        bind_material(frame.cmd, crate_set_);
+        for (const Placement& crate : kCrates) {
+            // The cube is centred on its origin, so it has to be lifted half its height
+            // to stand on the floor rather than be buried to the waist in it.
+            push(frame.cmd,
+                 glm::translate(model_of(crate), glm::vec3(0.0F, 0.5F, 0.0F)), kWhite);
+            vkCmdDrawIndexed(frame.cmd, static_cast<uint32_t>(kCubeIndices.size()), 1, 0,
+                             0, 0);
+        }
+```
+
+vkcommon's `begin_rendering` is back — colour and depth, which is all this chapter needs.
+`glm::translate(model_of(crate), ...)` multiplies the translation on the *right*, so it
+happens first, in the crate's own frame: lift the cube by half a unit so its bottom face
+touches its foot, then place it. On the left it would lift the crate in world space after
+rotating it, which here happens to be the same thing, and in general is not.
+
+"Front to back would be ideal" in the comment is about performance, not correctness: an
+opaque surface drawn first lets the depth test reject what is behind it before its fragment
+shader runs.
+
+The ferns, whichever pipeline <kbd>4</kbd> selects:
+
+```cpp title="code/src/4.advanced_vulkan/blending_and_culling/main.cpp"
+        // --- the ferns ------------------------------------------------------------
+        bind_geometry(frame.cmd, quad_vertices_, quad_indices_);
+        bind_material(frame.cmd, fern_set_);
+        vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                          fern_cutout_ ? fern_cutout_pipeline_ : fern_blend_pipeline_);
+        for (const Placement& fern : kFerns) {
+            push(frame.cmd, model_of(fern), kWhite);
+            vkCmdDrawIndexed(frame.cmd, kQuadIndexCount, 1, kUprightFirstIndex, 0, 0);
+        }
+```
+
+And the glass, sorted:
+
+```cpp title="code/src/4.advanced_vulkan/blending_and_culling/main.cpp"
+        // --- the glass ------------------------------------------------------------
+        //
+        // Blending is not commutative: "draw red over green" and "draw green over red"
+        // are different pictures. The depth test cannot rescue the order the way it does
+        // for opaque geometry, because a pane that is behind another pane still has to
+        // be drawn -- and drawn first.
+        std::array<size_t, kPanes.size()> order{};
+        for (size_t i = 0; i < order.size(); ++i) {
+            order[i] = i;
+        }
+        if (sort_panes_) {
+            const glm::vec3 eye = camera_.position;
+            std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+                // Squared distance is enough: nothing here needs the actual length, and
+                // a sort only ever compares.
+                return glm::dot(centre_of(kPanes[a]) - eye, centre_of(kPanes[a]) - eye) >
+                       glm::dot(centre_of(kPanes[b]) - eye, centre_of(kPanes[b]) - eye);
+            });
+        }
+
+        vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                          pane_depth_writes_ ? pane_depth_write_pipeline_ : pane_pipeline_);
+        for (const size_t index : order) {
+            push(frame.cmd, model_of(kPanes[index]), kPaneColours[index]);
+            vkCmdDrawIndexed(frame.cmd, kQuadIndexCount, 1, kUprightFirstIndex, 0, 0);
+        }
+
+        vkCmdEndRendering(frame.cmd);
+    }
+```
+
+The sort permutes *indices*, not the placements, so the colour array stays paired with its
+panes: `kPanes[index]` and `kPaneColours[index]` are always the same pane. The comparator
+returns `true` when `a` is farther than `b`, so `std::sort` puts the farthest first — the
+painter's order. It runs every frame, because the camera moves and the order it produces can
+change as it does.
+
+`push`, `bind_geometry`, `bind_material`, `set_viewport`, `create_uniform_buffers` and
+`update_globals` are 4.1's, unchanged.
+
+## Three textures, two samplers
+
+```cpp title="code/src/4.advanced_vulkan/blending_and_culling/main.cpp"
+    void load_textures() {
+        crate_map_ = vkc::load_texture(
+            context(), vkc::asset_path("textures/lvk_crate_diffuse.png"),
+            VK_FORMAT_R8G8B8A8_SRGB);
+        // Not 1.11's grid, which every chapter up to here has used. That texture is
+        // loud by design -- it exists to make filtering artefacts obvious -- and this
+        // chapter needs the eye on the glass and the ferns, not on the floor.
+        floor_map_ = vkc::load_texture(context(),
+                                       vkc::asset_path("textures/lvk_ground.png"),
+                                       VK_FORMAT_R8G8B8A8_SRGB);
+        // The fern is the first texture in the series whose alpha carries information.
+        // Loading it as _SRGB is still right: the sRGB transfer function applies to the
+        // three colour channels only, and alpha is left linear by definition.
+        fern_map_ = vkc::load_texture(context(),
+                                      vkc::asset_path("textures/lvk_foliage.png"),
+                                      VK_FORMAT_R8G8B8A8_SRGB);
+
+        sampler_ = vkc::Sampler(context(), vkc::SamplerDesc{});
+        // The fern needs CLAMP_TO_EDGE. Its quad's uvs stay inside 0..1, but a sampler
+        // filtering near the edge reaches past it, and REPEAT would fetch the opposite
+        // side of the leaf and smear a sliver of it around the border.
+        clamp_sampler_ = vkc::Sampler(
+            context(),
+            vkc::SamplerDesc{.address_mode = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE});
+
+        context().name(crate_map_.handle(), VK_OBJECT_TYPE_IMAGE, "crate diffuse map");
+        context().name(floor_map_.handle(), VK_OBJECT_TYPE_IMAGE, "floor grid map");
+        context().name(fern_map_.handle(), VK_OBJECT_TYPE_IMAGE, "fern cutout map");
+    }
+```
+
+`lvk_ground.png` and `lvk_foliage.png` are this project's own, drawn by
+`tools/make_textures.py`. The second sampler is the first time a chapter has needed two:
+`SamplerDesc` is 1.11's aggregate with a default for every field, so a designated initialiser
+changes the one field that differs.
+
+Why clamping matters here: a linear filter at `u = 0.999` blends the texel there with its
+neighbour, and under `REPEAT` the neighbour of the last column is the first. For the grid
+floor that is invisible, because the grid tiles. For a fern it would drag a line of the
+leaf's opposite edge around the quad's border — and the alpha test would then keep it.
+
+`create_descriptors` is 4.1's with one more material set in the budget:
+
+```cpp title="code/src/4.advanced_vulkan/blending_and_culling/main.cpp"
+        const std::array<VkDescriptorPoolSize, 2> pool_sizes{{
+            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, vkc::kFramesInFlight},
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3},
+        }};
+        const VkDescriptorPoolCreateInfo pool_info{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .maxSets = vkc::kFramesInFlight + 3,
+            .poolSizeCount = static_cast<uint32_t>(pool_sizes.size()),
+            .pPoolSizes = pool_sizes.data(),
+        };
+```
+
+and three material sets at the end, the fern's with the clamping sampler:
+
+```cpp title="code/src/4.advanced_vulkan/blending_and_culling/main.cpp"
+        crate_set_ = allocate_material_set(crate_map_, sampler_);
+        floor_set_ = allocate_material_set(floor_map_, sampler_);
+        fern_set_ = allocate_material_set(fern_map_, clamp_sampler_);
+
+        context().name(crate_set_, VK_OBJECT_TYPE_DESCRIPTOR_SET, "crate material");
+        context().name(floor_set_, VK_OBJECT_TYPE_DESCRIPTOR_SET, "floor material");
+        context().name(fern_set_, VK_OBJECT_TYPE_DESCRIPTOR_SET, "fern material");
+    }
+```
+
+`allocate_material_set` takes the sampler as a parameter now, and writes it into the
+descriptor — the only change to 4.1's version:
+
+```cpp title="code/src/4.advanced_vulkan/blending_and_culling/main.cpp"
+    [[nodiscard]] VkDescriptorSet allocate_material_set(const vkc::Image& texture,
+                                                        const vkc::Sampler& sampler) {
+        const VkDevice device = context().device();
+
+        const VkDescriptorSetAllocateInfo alloc{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .pNext = nullptr,
+            .descriptorPool = descriptor_pool_,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &material_set_layout_,
+        };
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        VK_CHECK(vkAllocateDescriptorSets(device, &alloc, &set));
+
+        const VkDescriptorImageInfo image_info{
+            .sampler = sampler.handle(),
+            .imageView = texture.view(),
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
+```
+
+The rest of the function — the `VkWriteDescriptorSet` and the update — is 4.1's.
+
+## Seven pipelines
+
+The vertex input, push range and pipeline layout are 4.1's, character for character. The
+module and the shared opening:
+
+```cpp title="code/src/4.advanced_vulkan/blending_and_culling/main.cpp"
+        const VkShaderModule shader =
+            vkc::load_shader(device, LVK_CHAPTER_ID, "blending_and_culling.slang");
+
+        // Spelled-out return type, for 4.1's reason: the setters hand back a reference to
+        // the builder, and `auto` here would deduce a reference to a dead temporary.
+        const auto base = [&]() -> vkc::PipelineBuilder {
+            return vkc::PipelineBuilder(device)
+                .shaders(shader)
+                .vertex_input(std::span(&binding, 1), attributes)
+                .colour_attachment(swapchain().format())
+                .layout(pipeline_layout_);
+        };
+```
+
+No `stencil_attachment()`: the rendering instance has no stencil attachment this time, so
+the pipelines must not declare one — the mirror image of 4.1's validation error.
+
+The blend state is the `source_over` struct already shown. Then the opaque geometry, three
+times, one pipeline per cull mode:
+
+```cpp title="code/src/4.advanced_vulkan/blending_and_culling/main.cpp"
+        for (size_t i = 0; i < kCullModes.size(); ++i) {
+            opaque_pipelines_[i] =
+                base()
+                    .cull(kCullModes[i], VK_FRONT_FACE_COUNTER_CLOCKWISE)
+                    .depth(depth_format_, /*test=*/true, /*write=*/true)
+                    .build();
+        }
+```
+
+Three pipelines rather than one with dynamic state because cull mode is baked in unless a
+pipeline lists `VK_DYNAMIC_STATE_CULL_MODE` — core since Vulkan 1.3, and a single
+`vkCmdSetCullMode` away. Baking it keeps the lesson in the pipeline object, where 4.1 put
+depth bias.
+
+The quads share a second opening with culling off:
+
+```cpp title="code/src/4.advanced_vulkan/blending_and_culling/main.cpp"
+        const auto quad_base = [&]() -> vkc::PipelineBuilder {
+            return base().cull(VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE);
+        };
+
+        fern_cutout_pipeline_ =
+            quad_base()
+                .shaders(shader, "vertexMain", "cutoutFragmentMain")
+                .depth(depth_format_, /*test=*/true, /*write=*/true)
+                .build();
+```
+
+The cutout ferns are opaque in every respect the pipeline can see: depth test on, depth
+writes on, blending off. The transparency is entirely the fragment shader's `discard`, and
+the pipeline does not know it is happening.
+
+The blended ferns change two things, and they travel together:
+
+```cpp title="code/src/4.advanced_vulkan/blending_and_culling/main.cpp"
+        fern_blend_pipeline_ =
+            quad_base()
+                .shaders(shader, "vertexMain", "foliageBlendFragmentMain")
+                .depth(depth_format_, /*test=*/true, /*write=*/false)
+                .colour_blend(source_over)
+                .build();
+```
+
+Blending on, so the sampled alpha is used rather than thresholded. Depth *writes* off, so a
+fern does not stamp its whole rectangle — empty texels included — into the depth buffer and
+hide the ferns behind it. Depth *testing* stays on: a transparent surface is still occluded
+by the opaque floor and crates in front of it.
+
+The glass, twice — once right, and once with the mistake the <kbd>3</kbd> key shows:
+
+```cpp title="code/src/4.advanced_vulkan/blending_and_culling/main.cpp"
+        pane_pipeline_ = quad_base()
+                             .shaders(shader, "vertexMain", "flatFragmentMain")
+                             .depth(depth_format_, /*test=*/true, /*write=*/false)
+                             .colour_blend(source_over)
+                             .build();
+
+        pane_depth_write_pipeline_ =
+            quad_base()
+                .shaders(shader, "vertexMain", "flatFragmentMain")
+                .depth(depth_format_, /*test=*/true, /*write=*/true)
+                .colour_blend(source_over)
+                .build();
+
+        vkDestroyShaderModule(device, shader, nullptr);
+```
+
+And the names, with the cull-mode pipelines named from the same array the log uses:
+
+```cpp title="code/src/4.advanced_vulkan/blending_and_culling/main.cpp"
+        for (size_t i = 0; i < opaque_pipelines_.size(); ++i) {
+            context().name(opaque_pipelines_[i], VK_OBJECT_TYPE_PIPELINE,
+                           kCullModeNames[i]);
+        }
+        context().name(fern_cutout_pipeline_, VK_OBJECT_TYPE_PIPELINE, "fern (cutout)");
+        context().name(fern_blend_pipeline_, VK_OBJECT_TYPE_PIPELINE, "fern (blended)");
+        context().name(pane_pipeline_, VK_OBJECT_TYPE_PIPELINE, "glass");
+        context().name(pane_depth_write_pipeline_, VK_OBJECT_TYPE_PIPELINE,
+                       "glass (depth writes)");
+    }
+```
+
+## The members, and main
+
+4.1's members, with the stencil buffer back to a plain depth buffer, one more texture, one
+more sampler, one more set, and the four flags:
+
+```cpp title="code/src/4.advanced_vulkan/blending_and_culling/main.cpp"
+    VkFormat depth_format_ = VK_FORMAT_UNDEFINED;
+    vkc::Image depth_;
+
+    vkc::Image fern_map_;
+    vkc::Sampler clamp_sampler_;
+
+    VkDescriptorSet fern_set_ = VK_NULL_HANDLE;
+
+    std::array<VkPipeline, 3> opaque_pipelines_{};
+    VkPipeline fern_cutout_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline fern_blend_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline pane_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline pane_depth_write_pipeline_ = VK_NULL_HANDLE;
+
+    size_t cull_index_ = 0;
+    bool sort_panes_ = true;
+    bool pane_depth_writes_ = false;
+    bool fern_cutout_ = true;
+};
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    try {
+        vkc::App::Options options{};
+        options.title = "LearnVulkan 4.2 - Blending & Culling";
+        BlendingAndCullingApp app(vkc::App::parse_args(argc, argv, options));
+        return app.run();
+    } catch (const std::exception& error) {
+        spdlog::error("{}", error.what());
+        return EXIT_FAILURE;
+    }
+}
+```
+
+Those sit among 4.1's camera, buffers, uniform buffers, frame sets, crate and floor maps,
+default sampler, crate and floor sets, two set layouts, pool and pipeline layout, which are
+declared exactly as 4.1 declared them.
+
+The build file:
+
+```cmake title="code/src/4.advanced_vulkan/blending_and_culling/CMakeLists.txt"
+add_chapter(4.2.blending_and_culling
+    SOURCES main.cpp
+    SHADERS blending_and_culling.slang
+)
+```
+
 :::note[What moved into vkcommon]
 One setter on `PipelineBuilder`, for chapters that need a blend mode the boolean does not
 cover:
@@ -303,30 +1244,57 @@ above. Nothing called that helper yet, so nothing had hit it.
 ## What changed since 4.1
 
 - back to `vkcommon`'s depth-only buffer: nothing here tests the stencil
-- three cull modes as three pipelines, and the measured relationship between `frontFace`
-  and the projection's y-flip
+- three cull modes as three pipelines, and the determinant that ties `frontFace` to the
+  projection's y-flip
 - `discard` in a fragment shader, and the device feature it turns out to require
 - the full `VkPipelineColorBlendAttachmentState`, both equations, via `colour_blend()`
+- the over operator, its order error `a_A · a_B · (C_A − C_B)`, measured to the pixel
 - a back-to-front sort in `on_render`, and the finding that it makes `depthWriteEnable`
   redundant rather than the other way round
 - two new textures, `lvk_foliage.png` and `lvk_ground.png`, both from `tools/make_textures.py`
 - 27 chapters in the build now
+
+## Words introduced in this chapter
+
+| | |
+|---|---|
+| **cull mode** | which facing to discard before rasterisation: none, front, back, or both |
+| **front face** | which sign of a triangle's screen-space area counts as facing the camera |
+| **signed area** | `½·det[b − a, c − a]`; its magnitude is the triangle's area and its sign is the winding |
+| **determinant** | the factor a linear map scales every signed area by; negative means it reverses every winding |
+| **two-sided geometry** | a surface seen from both sides with one set of triangles — drawn unculled, with the normal flipped toward the eye |
+| **alpha cutout** | treating a texel as fully present or fully absent by thresholding its alpha |
+| **discard** | ending a fragment invocation so it writes neither colour nor depth |
+| **alpha blending** | combining the shader's output with the attachment's existing contents, weighted by alpha |
+| **blend factor** | the multiplier on the source or destination term — `SRC_ALPHA`, `ONE_MINUS_SRC_ALPHA`, `ONE`, `ZERO`, … |
+| **blend equation** | `src·factor op dst·factor`, once for colour and once for alpha |
+| **over operator** | `a·C_src + (1 − a)·C_dst`: a layer that blocks the fraction `a` of what is behind it |
+| **order dependence** | swapping two layers changes the result by exactly `a_A·a_B·(C_A − C_B)` |
+| **separate alpha blending** | giving alpha its own factors; the physically right one is `a_src + a_dst(1 − a_src)` |
+| **premultiplied alpha** | storing `a·C` instead of `C`, which makes colour and alpha obey one associative equation |
+| **painter's algorithm** | drawing far things first so nearer ones are blended over them |
 
 ## Exercises
 
 1. Set `colorWriteMask` on the pane pipeline to RGB only, drop the alpha equation back to
    `ONE`/`ZERO`, and capture a screenshot. Explain why the image is opaque again, and which
    of the two fixes you would rather ship.
-2. Give the three panes three different alphas and predict, before running it, which
-   overlap regions change when sorting is turned off. Check yourself against the image.
-3. Make two panes intersect each other in a cross. No per-object sort can order them
+2. Give the three panes three different alphas and predict, from `a_A · a_B · (C_A − C_B)`,
+   which overlap region changes most when sorting is turned off. Then check yourself against
+   the image.
+3. Work out the order error for the triple overlap — all three panes over one pixel, sorted
+   against unsorted. Show that the background still cancels. (This camera never shows a
+   pixel under all three; move it until it does, and measure.)
+4. Make two panes intersect each other in a cross. No per-object sort can order them
    correctly — work out why, and what the smallest unit is that *could* be sorted.
-4. Raise `kCutoutThreshold` to 0.9 and lower it to 0.1. One makes the fern thinner and one
+5. Raise `kCutoutThreshold` to 0.9 and lower it to 0.1. One makes the fern thinner and one
    fatter; explain which, in terms of the texture's alpha gradient, and why a mip level
    makes the effect worse at a distance.
-5. Blend the ferns *and* give their pipeline depth writes. Predict the artefact before you
+6. Blend the ferns *and* give their pipeline depth writes. Predict the artefact before you
    look, then find the camera angle that shows it most clearly.
-6. The crates are drawn with back-face culling and are closed boxes. Open one — delete its
+7. Give one crate a scale of `-1` on x in `model_of`. Its determinant is now negative. Before
+   running it, say which of its faces will be culled and what you will see instead.
+8. The crates are drawn with back-face culling and are closed boxes. Open one — delete its
    top face from the index buffer — and find the cull mode that makes the inside look right.
 
 Next: 4.3 stops rendering into the swapchain. Once a frame can be drawn into an image of

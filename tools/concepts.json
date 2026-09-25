@@ -47,6 +47,10 @@
     "3.1.assimp": ["importer", "post-processing pass", "triangulation", "face normal", "vertex normal", "winding order", "area weighting", "smoothing angle", "vertex deduplication", "axis-aligned bounding box", "post-transform cache"],
     "3.2.mesh": ["mesh", "embedded texture", "compressed texture hint", "fallback texture", "texture atlas", "UV island", "texture coordinate origin", "base colour factor"],
     "3.3.model": ["scene graph", "node", "node transform", "matrix composition", "row-major", "flattening", "draw list", "AABB transform", "world bounds"],
-    "3.4.bindless_materials": ["bindless", "descriptor indexing", "runtime descriptor array", "texture array", "material index", "indirection", "std430", "storage buffer", "texture cache", "dynamically uniform"]
+    "3.4.bindless_materials": ["bindless", "descriptor indexing", "runtime descriptor array", "texture array", "material index", "indirection", "std430", "storage buffer", "texture cache", "dynamically uniform"],
+
+    "4.1.depth_and_stencil": ["depth test", "depth write", "depth compare op", "depth precision", "coplanar geometry", "depth bias", "minimum resolvable difference", "slope-scaled bias", "combined depth-stencil format", "image aspect", "stencil buffer", "stencil test", "stencil operation", "compare mask / write mask", "reference value"],
+    "4.2.blending_and_culling": ["alpha blending", "over operator", "blend factor", "blend equation", "separate alpha blending", "premultiplied alpha", "order dependence", "painter's algorithm", "alpha cutout", "discard", "cull mode", "front face", "signed area", "determinant", "two-sided geometry"],
+    "4.3.offscreen_rendering": ["offscreen rendering", "render target", "render scale", "sampled attachment", "execution dependency", "memory dependency", "access mask", "layout transition", "availability and visibility", "fullscreen triangle", "post-processing", "convolution", "kernel", "kernel normalisation", "texel size"]
   }
 }

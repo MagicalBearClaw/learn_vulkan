@@ -36,8 +36,8 @@ void transition_image(VkCommandBuffer cmd, VkImage image, VkImageLayout from,
 // forbids overlap that was never a problem. That is a fine trade at the top and bottom
 // of a frame, where there is nothing to overlap with. It is the wrong trade in the
 // middle of one -- between two passes that share an image -- because there the masks
-// decide how much of the two passes may run at once. Chapter 4.3 writes this function
-// out and works through both of its calls mask by mask.
+// decide how much of the two passes may run at once. Chapter 4.3 is the first to call
+// it, and works through both of its calls mask by mask.
 void image_barrier(VkCommandBuffer cmd, VkImage image, VkImageLayout from,
                    VkImageLayout to, VkPipelineStageFlags2 src_stage,
                    VkAccessFlags2 src_access, VkPipelineStageFlags2 dst_stage,
