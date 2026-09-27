@@ -1,0 +1,1830 @@
+---
+title: "Instancing"
+description: One mesh, a hundred thousand copies, one draw call. The instance index, per-instance data read two ways, timestamp queries to measure what it saves, and an honest answer to where the saving actually is.
+sidebar:
+  order: 6
+---
+
+<figure>
+  <img src="/img/reference/4.6.instancing.png" alt="A banded orange planet in the middle of a flat ring of grey, faceted rocks, seen from slightly above the ring's plane against a near-black sky" />
+  <figcaption>Chapter 4.6. Five thousand rocks and a planet, in two draw calls. Press
+  <kbd>=</kbd> a few times and it is a hundred thousand rocks, still in two.</figcaption>
+</figure>
+
+4.5 drew two crates and six ferns, and it drew each of them with its own
+`vkCmdDrawIndexed`. The crates are the same mesh with a different model matrix, and so are
+the ferns; the only thing that distinguished one crate's draw from the other's was the
+`draw_index` in the push constant. That is fine for eight objects. This chapter is about
+what happens when there are a hundred thousand.
+
+The scene is an asteroid belt: a planet, and a ring of rocks around it that are all the same
+mesh, each with its own position, orientation, size and colour. Drawing it the 4.5 way means a
+hundred thousand draw calls. **Instancing** means one: `vkCmdDrawIndexed` takes an
+`instanceCount`, the GPU runs the whole mesh that many times, and each run of the vertex
+shader is told which copy — which **instance** — it belongs to. What differs between copies
+is **per-instance data**, and where the shader gets it from is the second half of the
+chapter.
+
+The first half is a measurement. The usual argument for instancing is that draw calls are
+expensive, and that argument was made about OpenGL, where each draw asks the driver to
+validate the whole of the current state. Vulkan moved validation out of the driver, and it is
+worth finding out what a draw call costs once that is gone. The sample draws the rocks three
+ways, and times all three on both the CPU and the GPU:
+
+- <kbd>1</kbd> one draw call per rock
+- <kbd>2</kbd> one draw call, with each rock's data fed in by the vertex input stage
+- <kbd>3</kbd> one draw call, with each rock's data read through a pointer (the default)
+- <kbd>-</kbd> / <kbd>=</kbd> fewer / more rocks, from 1,000 to 100,000
+- <kbd>4</kbd> spin the belt
+
+The three paths draw exactly the same picture — that is checked at the end, pixel for pixel —
+so every difference between them is cost.
+
+The chapter builds on 4.5: vertex pulling, the frame arena and `buffer_address` carry over
+unchanged, and so does `make_sphere`, which is now the planet. The room, the crates, the ferns,
+the textures and the cubemaps are all gone, and with them every descriptor in the sample. The
+build file names one shader:
+
+```cmake title="code/src/4.advanced_vulkan/instancing/CMakeLists.txt"
+add_chapter(4.6.instancing
+    SOURCES main.cpp
+    SHADERS instancing.slang
+)
+```
+
+The file opens with what it is for, and the includes lose 4.5's `<vkc/paths.hpp>` and
+`<filesystem>` — there are no files to load — and gain `<algorithm>` for `std::min`,
+`<chrono>` for the CPU timer, `<map>` for the rock generator, and `<utility>` for
+`std::pair`:
+
+```cpp title="code/src/4.advanced_vulkan/instancing/main.cpp"
+// 4.6 Instancing
+//
+// A planet and a belt of rocks around it -- up to a hundred thousand of them, all the
+// same mesh, each with its own transform and colour.
+//
+// Drawing that the way 4.5 drew its crates means one vkCmdDrawIndexed per rock.
+// Instancing asks for all the copies in one call: instanceCount says how many, and each
+// copy's vertex shader is told which copy it belongs to.
+//
+// The sample draws the rocks three ways, so the difference can be measured rather than
+// asserted:
+//
+//   1  one draw call per rock
+//   2  one draw call, with per-instance vertex attributes (the fixed-function route)
+//   3  one draw call, with the shader reading its instance through a pointer (default)
+//   -  fewer rocks          =  more rocks
+//   4  spin the belt
+//
+// Each second it logs what the rocks cost the CPU to record and the GPU to draw. The GPU
+// figure comes from timestamps, which this chapter also introduces.
+
+#include <vkc/app.hpp>
+#include <vkc/buffer.hpp>
+#include <vkc/camera.hpp>
+#include <vkc/check.hpp>
+#include <vkc/frame.hpp>
+#include <vkc/image.hpp>
+#include <vkc/pipeline.hpp>
+
+#include <SDL3/SDL.h>
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_inverse.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <spdlog/spdlog.h>
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstddef>
+#include <cstdlib>
+#include <cstring>
+#include <exception>
+#include <format>
+#include <map>
+#include <numbers>
+#include <span>
+#include <stdexcept>
+#include <utility>
+#include <vector>
+
+namespace {
+```
+
+## The data the shaders read
+
+The vertex is 4.5's, unchanged. The two structs behind it change a little.
+
+`Globals` loses 4.4's `view_rotation`, which only the skybox read, and gains the belt's
+rotation in its place. A `mat4` for a `mat4`, so the size is still 256 bytes and every offset
+after it is where it was:
+
+```cpp title="code/src/4.advanced_vulkan/instancing/main.cpp"
+// ---------------------------------------------------------------------------
+// What the shaders read through a pointer
+// ---------------------------------------------------------------------------
+
+// 4.5's Globals. The cube-face field is gone and the belt's rotation has taken its
+// place, so the size is still 256.
+struct Globals {
+    glm::mat4 view;           // 0
+    glm::mat4 projection;     // 64
+    glm::mat4 belt;           // 128
+    glm::vec4 view_position;  // 192
+    glm::vec4 sun_direction;  // 208
+    glm::vec4 sun_colour;     // 224
+    glm::vec4 ambient;        // 240, w is the specular exponent
+};
+static_assert(sizeof(Globals) == 256);
+```
+
+4.5's `DrawData` described one draw call's object. It now describes one copy of a mesh, and it
+is renamed `Instance` to say so. The fields and the 116 bytes are the same, and 4.5 derived
+their offsets:
+
+```cpp title="code/src/4.advanced_vulkan/instancing/main.cpp"
+// 4.5's DrawData, renamed. One of these per copy of a mesh.
+struct Instance {
+    glm::mat4 model;          // 0
+    glm::mat3 normal_matrix;  // 64
+    glm::vec4 colour;         // 100
+};
+static_assert(offsetof(Instance, normal_matrix) == 64);
+static_assert(offsetof(Instance, colour) == 100);
+static_assert(sizeof(Instance) == 116);
+```
+
+The push constants lose `draw_index`. In 4.5, the push constant was the only way a draw could
+tell the shader which object it was drawing. Here the draw call itself says so, as the next
+sections show, and the push constants shrink to three addresses:
+
+```cpp title="code/src/4.advanced_vulkan/instancing/main.cpp"
+// 4.5's push constants without draw_index. Which instance a vertex belongs to now comes
+// from the draw call itself.
+struct PushConstants {
+    VkDeviceAddress globals;    // 0
+    VkDeviceAddress instances;  // 8
+    VkDeviceAddress vertices;   // 16
+};
+static_assert(sizeof(PushConstants) == 24);
+```
+
+## The scene
+
+A planet of radius 4 at the origin. A belt that is an annulus — the region between two
+circles — from radius 9 to radius 17 in the xz plane, 0.6 units thick. The rock mesh has a radius of about 1, and each rock is scaled down by a
+factor between 0.04 and 0.22:
+
+```cpp title="code/src/4.advanced_vulkan/instancing/main.cpp"
+// ---------------------------------------------------------------------------
+// The scene
+// ---------------------------------------------------------------------------
+
+constexpr float kPlanetRadius = 4.0F;
+constexpr glm::vec4 kPlanetColour{0.62F, 0.36F, 0.22F, 1.0F};
+
+// The belt is an annulus in the xz plane, with a little thickness in y.
+constexpr float kBeltInner = 9.0F;
+constexpr float kBeltOuter = 17.0F;
+constexpr float kBeltThickness = 0.6F;
+constexpr float kRockMinSize = 0.04F;
+constexpr float kRockMaxSize = 0.22F;
+```
+
+Every copy's data goes into one buffer, the planet included: it is instance 0, and the rocks
+are instances 1 onwards. The buffer is filled once for the largest count, 100,000 rocks, and
+the <kbd>-</kbd> and <kbd>=</kbd> keys choose how much of it to draw — so changing the count
+never touches the buffer:
+
+```cpp title="code/src/4.advanced_vulkan/instancing/main.cpp"
+// Instance 0 is the planet; the rocks follow it. The buffer is filled once for the
+// largest count and the keys choose how much of it to draw.
+constexpr uint32_t kPlanetInstance = 0;
+constexpr uint32_t kFirstRock = 1;
+constexpr std::array<uint32_t, 7> kRockCounts{1'000,  2'000,  5'000,  10'000,
+                                              20'000, 50'000, 100'000};
+constexpr uint32_t kMaxRocks = kRockCounts.back();
+constexpr size_t kDefaultRockCount = 2;  // 5,000
+```
+
+A low sun from the left, very little ambient light — space has no sky to fill the shadows —
+and a slow rotation for the <kbd>4</kbd> key:
+
+```cpp title="code/src/4.advanced_vulkan/instancing/main.cpp"
+constexpr glm::vec3 kSunDirection{-0.8F, -0.35F, -0.45F};
+constexpr glm::vec3 kSunColour{1.0F, 0.95F, 0.86F};
+constexpr glm::vec3 kAmbient{0.05F, 0.055F, 0.07F};
+constexpr float kShininess = 24.0F;
+
+// Radians per second. The belt turns as one rigid disc, so the outer edge moves fastest:
+// 0.05 x 17 = 0.85 units a second.
+constexpr float kBeltSpin = 0.05F;
+
+enum class DrawPath { PerRock, Attributes, Pulled };
+```
+
+`kBeltSpin` turns the whole belt as one rigid disc, at 0.05 radians a second. A point at radius
+*r* on a disc turning at angular speed ω moves at *v* = ω*r*, so the outer edge, at 17, moves at
+0.85 units a second and the inner edge at 0.45. That is the opposite of how a real belt moves —
+the inner rocks of a real one go fastest — and it is the thing chapter 4.9 fixes, because
+fixing it means computing a new matrix for every rock every frame.
+
+`DrawPath` names the three ways of drawing the rocks.
+
+## Random numbers that are the same everywhere
+
+A hundred thousand rocks need a few hundred thousand random numbers: where each one is, how it
+is turned, how big it is, what colour. The obvious tool is `<random>`, and it has a problem
+that is easy to miss.
+
+The C++ standard fixes the output of the generators exactly. `std::mt19937` is fully
+specified, and the standard even gives a check value: "The 10000th consecutive invocation of a
+default-constructed object of type mt19937 produces the value 4123659995" ([rand.predef]/3).
+But nobody uses the generator's raw 32-bit output. They use a distribution —
+`std::uniform_real_distribution<float>(0, 1)` — and of those the standard says: "The
+algorithms for producing each of the specified distributions are implementation-defined"
+([rand.dist.general]/3).
+
+So the same seed produces the same stream of integers on every compiler, and a *different*
+stream of floats on MSVC and on libstdc++. This series builds on both, and quotes pixel counts
+from screenshots. A belt whose rocks are somewhere else on Windows is a belt whose every number
+in this article is wrong on Windows.
+
+The fix is to write the few lines that turn integers into floats, and at that point the
+generator might as well be small too. The sample uses a **hash function**: a function that
+scrambles its input so thoroughly that consecutive inputs give unrelated-looking outputs. This
+one is the PCG hash from Jarzynski and Olano's survey of hash functions for GPU rendering — one
+step of the PCG family of generators, followed by its output permutation:
+
+```cpp title="code/src/4.advanced_vulkan/instancing/main.cpp"
+// ---------------------------------------------------------------------------
+// Random numbers that are the same everywhere
+// ---------------------------------------------------------------------------
+
+// The PCG hash from Jarzynski and Olano, "Hash Functions for GPU Rendering" (JCGT, 2020):
+// one step of a PCG generator followed by its output permutation. Given the same input it
+// returns the same 32 bits on every compiler, which <random> does not promise -- see the
+// article for why.
+[[nodiscard]] constexpr uint32_t pcg_hash(uint32_t input) {
+    const uint32_t state = input * 747796405U + 2891336453U;
+    const uint32_t word = ((state >> ((state >> 28U) + 4U)) ^ state) * 277803737U;
+    return (word >> 22U) ^ word;
+}
+// Checked where it cannot drift: if these ever change, the belt has moved.
+static_assert(pcg_hash(0) == 0x07bb2fe2U);
+static_assert(pcg_hash(1) == 0xa8beea3cU);
+```
+
+Reading it from the top:
+
+```text
+state = input * 747796405 + 2891336453          (mod 2^32)
+```
+
+is a *linear congruential* step: multiply, add, and let unsigned arithmetic wrap at 2³². On its
+own it is a poor generator — its low bits cycle with short periods — which is why PCG never
+outputs the state directly. The second line is the output permutation:
+
+```text
+shift = (state >> 28) + 4                        a number from 4 to 19, chosen by the top 4 bits
+word  = ((state >> shift) ^ state) * 277803737
+out   = (word >> 22) ^ word
+```
+
+The shift amount depends on the state itself, so the bits that end up at the bottom of the
+output are drawn from different places each time, and the final xor-shift folds the
+well-mixed high bits back down into the low ones. What matters for this sample is less how
+good it is than two properties it has by construction: it uses nothing but 32-bit unsigned
+arithmetic, which C++ defines exactly on every platform, and it is `constexpr`. The two
+`static_assert`s pin down its first two outputs at compile time. If an edit ever changes
+them, the belt has moved, and the build says so before a screenshot does.
+
+That is **reproducible randomness**: the same seed giving the same numbers on every compiler,
+every run.
+
+Floats in [0, 1) come from the hash's output:
+
+```cpp title="code/src/4.advanced_vulkan/instancing/main.cpp"
+// A stream of floats in [0, 1). Each call hashes the previous result, so one seed gives
+// as many numbers as are asked for.
+class Random {
+public:
+    explicit Random(uint32_t seed) noexcept : state_(pcg_hash(seed)) {}
+
+    [[nodiscard]] float next() noexcept {
+        state_ = pcg_hash(state_);
+        // The top 24 bits, because a float has 24 bits of precision: every value this
+        // returns is exactly representable, and 1.0 never is.
+        return static_cast<float>(state_ >> 8U) * 0x1.0p-24F;
+    }
+
+    [[nodiscard]] float range(float low, float high) noexcept {
+        return low + (high - low) * next();
+    }
+
+private:
+    uint32_t state_;
+};
+```
+
+`Random` feeds each output back in as the next input, so one seed gives as many numbers as
+are wanted. `next()` keeps the top 24 of the 32 bits and scales by 2⁻²⁴, which C++ writes as
+the hexadecimal float literal `0x1.0p-24F`. The reason for 24 is the float format: a `float`
+has 24 significant bits, so every integer from 0 to 2²⁴ − 1 is exactly representable, and
+multiplying by a power of two is exact. The result is one of 2²⁴ evenly spaced values from 0
+to 1 − 2⁻²⁴, with no rounding anywhere, and never 1.0. Converting all 32 bits instead would
+round the largest outputs up to exactly 1.0f — 2³² − 1 is not representable, and the nearest
+float is 2³² — and a "[0, 1)" function that sometimes returns 1 is how off-by-one texel reads
+are born.
+
+`range(low, high)` stretches that to any interval.
+
+## A rock
+
+LearnOpenGL's asteroid field loads a rock model from a file. This one is generated, because
+generating it is short, and because it makes the geometry something the article can reason
+about exactly.
+
+The recipe is an **icosahedron** — the regular solid with twenty equilateral triangle faces —
+subdivided, with every corner pushed in or out by a random amount:
+
+```cpp title="code/src/4.advanced_vulkan/instancing/main.cpp"
+// A rock: an icosahedron, subdivided, with every corner pushed in or out by a random
+// amount, then drawn flat-shaded.
+//
+// The corners are displaced before the faces are emitted, and the midpoint cache is what
+// makes that work: two faces that share an edge must agree on where its midpoint went,
+// or the rock cracks open along the seam.
+[[nodiscard]] std::pair<std::vector<Vertex>, std::vector<uint16_t>> make_rock(
+    uint32_t subdivisions, float roughness, uint32_t seed) {
+    // The twelve corners of a regular icosahedron are the cyclic permutations of
+    // (0, +-1, +-t), where t is the golden ratio.
+    const float t = std::numbers::phi_v<float>;
+    std::vector<glm::vec3> corners{
+        {-1, t, 0},  {1, t, 0},  {-1, -t, 0}, {1, -t, 0}, {0, -1, t},  {0, 1, t},
+        {0, -1, -t}, {0, 1, -t}, {t, 0, -1},  {t, 0, 1},  {-t, 0, -1}, {-t, 0, 1},
+    };
+    std::vector<glm::uvec3> faces{
+        {0, 11, 5}, {0, 5, 1},  {0, 1, 7},   {0, 7, 10}, {0, 10, 11},
+        {1, 5, 9},  {5, 11, 4}, {11, 10, 2}, {10, 7, 6}, {7, 1, 8},
+        {3, 9, 4},  {3, 4, 2},  {3, 2, 6},   {3, 6, 8},  {3, 8, 9},
+        {4, 9, 5},  {2, 4, 11}, {6, 2, 10},  {8, 6, 7},  {9, 8, 1},
+    };
+    for (glm::vec3& corner : corners) {
+        corner = glm::normalize(corner);
+    }
+```
+
+The twelve corners are the cyclic permutations of (0, ±1, ±φ), where φ is the golden ratio,
+(1 + √5)/2 ≈ 1.618, and `std::numbers::phi_v<float>` is φ as a `float`. That this list is a
+*regular* icosahedron is checkable in two lines. The corners (0, 1, φ) and (1, φ, 0) are
+neighbours, and the square of the distance between them is
+
+```text
+(1 − 0)² + (φ − 1)² + (0 − φ)²  =  1 + φ² − 2φ + 1 + φ²  =  2 + 2φ² − 2φ
+
+and φ² = φ + 1 (that is what makes φ the golden ratio), so
+
+2 + 2(φ + 1) − 2φ  =  4        →  every edge has length 2
+```
+
+and the same substitution works for every pair of neighbours. The twenty faces list which
+corners make each triangle, all wound counter-clockwise seen from outside, so the pipeline's
+back-face culling from 1.13 keeps them. Every corner is then normalised onto the unit sphere
+(which does not change the shape — they were all at the same distance, √(1 + φ²), already).
+
+Twenty triangles is a very angular rock. Each **subdivision** splits every triangle into four
+by adding a corner at the middle of each edge:
+
+```cpp title="code/src/4.advanced_vulkan/instancing/main.cpp"
+    // Each subdivision splits every triangle into four, putting a new corner at the
+    // middle of each edge and pushing it out onto the unit sphere.
+    for (uint32_t level = 0; level < subdivisions; ++level) {
+        std::map<std::pair<uint32_t, uint32_t>, uint32_t> midpoints;
+        const auto midpoint = [&](uint32_t a, uint32_t b) {
+            const std::pair<uint32_t, uint32_t> key{std::min(a, b), std::max(a, b)};
+            const auto found = midpoints.find(key);
+            if (found != midpoints.end()) {
+                return found->second;
+            }
+            corners.push_back(glm::normalize(corners[a] + corners[b]));
+            const auto index = static_cast<uint32_t>(corners.size() - 1);
+            midpoints.emplace(key, index);
+            return index;
+        };
+
+        std::vector<glm::uvec3> split;
+        split.reserve(faces.size() * 4);
+        for (const glm::uvec3& face : faces) {
+            const uint32_t ab = midpoint(face.x, face.y);
+            const uint32_t bc = midpoint(face.y, face.z);
+            const uint32_t ca = midpoint(face.z, face.x);
+            split.insert(split.end(), {{face.x, ab, ca},
+                                       {face.y, bc, ab},
+                                       {face.z, ca, bc},
+                                       {ab, bc, ca}});
+        }
+        faces = std::move(split);
+    }
+```
+
+```text
+        a                        a
+       / \                      / \
+      /   \                   ca---ab
+     /     \        →         / \  / \
+    c-------b                c---bc---b
+```
+
+Each triangle (a, b, c) becomes (a, ab, ca), (b, bc, ab), (c, ca, bc) and the middle one
+(ab, bc, ca), all four keeping the original's winding. New corners are normalised onto the
+sphere too, so each level is rounder than the last.
+
+The `midpoints` map is the part that is easy to leave out. Every edge belongs to two
+triangles, and both will ask for its midpoint. Without the cache, each would get its own new
+corner — at the same position, so the rock looks the same — but the next step displaces every
+corner by its own random amount, and two copies of one point would move apart, opening a crack
+along every edge. The key is the corner pair with the smaller index first, so that the edge
+(a, b) and the edge (b, a) find the same entry. `std::map` works on the `std::pair` key
+directly, because pairs compare lexicographically.
+
+The counts follow from what subdivision does. Every triangle becomes four; every edge is split
+in two and each triangle adds three internal edges; every edge adds one corner:
+
+```text
+level     faces   edges   corners
+  0         20      30       12
+  1         80     120       42
+  2        320     480      162
+
+check: corners − edges + faces = 2 at every level (Euler's formula for a closed surface
+       without holes)
+```
+
+Then the displacement, and the output:
+
+```cpp title="code/src/4.advanced_vulkan/instancing/main.cpp"
+    Random random(seed);
+    for (glm::vec3& corner : corners) {
+        corner *= 1.0F + roughness * (random.next() * 2.0F - 1.0F);
+    }
+
+    // Flat shading: every triangle gets its own three vertices, all carrying the face's
+    // normal. Sharing vertices would average the normals and round the rock off.
+    std::vector<Vertex> vertices;
+    std::vector<uint16_t> indices;
+    vertices.reserve(faces.size() * 3);
+    indices.reserve(faces.size() * 3);
+    for (const glm::uvec3& face : faces) {
+        const glm::vec3 a = corners[face.x];
+        const glm::vec3 b = corners[face.y];
+        const glm::vec3 c = corners[face.z];
+        const glm::vec3 normal = glm::normalize(glm::cross(b - a, c - a));
+        for (const glm::vec3& position : {a, b, c}) {
+            indices.push_back(static_cast<uint16_t>(vertices.size()));
+            vertices.push_back({position, normal, {0.0F, 0.0F}});
+        }
+    }
+    return {std::move(vertices), std::move(indices)};
+}
+```
+
+Each corner is scaled by 1 + `roughness` × a random number in [−1, 1), so with the sample's
+0.18 it ends up between 0.82 and 1.18 from the centre.
+
+Then **flat shading**: every triangle is emitted as its own three vertices, all with the same
+normal, the triangle's own — the cross product of two of its edges, from 1.14, normalised. A
+shared vertex would carry one normal for all the triangles meeting at it, and 2.2's lighting
+would interpolate it across each face, rounding the rock off into a lumpy sphere. Duplicating
+the vertices keeps every facet a single flat colour, which is what makes a rock read as rock.
+The price is three vertices per triangle: 960 of them, 30,720 bytes, where sharing would have
+needed 162. The index buffer is then simply 0, 1, 2, … 959, and the texture coordinates are
+zero because nothing samples a texture.
+
+`on_start` asks for two levels and seed 7: a 320-triangle rock. It is one mesh, and every rock
+in the belt is this mesh.
+
+## Placing a hundred thousand rocks
+
+Each rock's `Instance` is built with 2.2's normal matrix — the inverse transpose of the model
+matrix's upper 3×3:
+
+```cpp title="code/src/4.advanced_vulkan/instancing/main.cpp"
+// ---------------------------------------------------------------------------
+// Instances
+// ---------------------------------------------------------------------------
+
+[[nodiscard]] Instance instance_of(const glm::mat4& model, const glm::vec4& colour) {
+    return Instance{
+        .model = model,
+        .normal_matrix = glm::inverseTranspose(glm::mat3(model)),
+        .colour = colour,
+    };
+}
+```
+
+and the belt is a loop:
+
+```cpp title="code/src/4.advanced_vulkan/instancing/main.cpp"
+// Where every rock is, decided once. Rock i is the same rock whatever the count, because
+// its numbers come from its own seed and not from a shared stream: lowering the count
+// removes rocks from the belt without moving the ones that remain.
+[[nodiscard]] std::vector<Instance> make_instances() {
+    std::vector<Instance> instances;
+    instances.reserve(kFirstRock + kMaxRocks);
+
+    instances.push_back(instance_of(glm::mat4(1.0F), kPlanetColour));
+
+    for (uint32_t i = 0; i < kMaxRocks; ++i) {
+        Random random(i);
+
+        // Uniform over the annulus's area, not its radius. See the article: picking the
+        // radius uniformly would crowd the inner edge.
+        const float radius = std::sqrt(random.range(kBeltInner * kBeltInner,
+                                                    kBeltOuter * kBeltOuter));
+        const float angle = random.range(0.0F, 2.0F * std::numbers::pi_v<float>);
+        const glm::vec3 position{radius * std::cos(angle),
+                                 random.range(-0.5F, 0.5F) * kBeltThickness,
+                                 radius * std::sin(angle)};
+
+        const glm::vec3 axis = glm::normalize(glm::vec3(random.range(-1.0F, 1.0F),
+                                                        random.range(-1.0F, 1.0F),
+                                                        random.range(0.1F, 1.0F)));
+        const float spin = random.range(0.0F, 2.0F * std::numbers::pi_v<float>);
+
+        // Non-uniform: each axis is stretched on its own, which is what makes the normal
+        // matrix necessary.
+        const float size = random.range(kRockMinSize, kRockMaxSize);
+        const glm::vec3 scale = size * glm::vec3(random.range(0.6F, 1.4F),
+                                                 random.range(0.6F, 1.4F),
+                                                 random.range(0.6F, 1.4F));
+
+        const glm::mat4 model = glm::scale(
+            glm::rotate(glm::translate(glm::mat4(1.0F), position), spin, axis), scale);
+
+        const float grey = random.range(0.35F, 0.65F);
+        const float warmth = random.range(0.0F, 0.12F);
+        instances.push_back(
+            instance_of(model, {grey + warmth, grey + warmth * 0.5F, grey, 1.0F}));
+    }
+    return instances;
+}
+```
+
+The planet goes first, as instance 0, with the identity for a model matrix. Then each rock
+takes its numbers from a `Random` seeded with its own index. That is a choice with a visible
+consequence: rock 12 is always the same rock. Had the whole belt drawn from one stream, rock
+12's numbers would depend on how many numbers rocks 0 to 11 had used, and every change to the
+generator would reshuffle the entire belt. Seeding per rock makes each rock independent of
+every other, and it is also the shape the GPU needs in chapter 4.9, where each rock is handled
+by its own thread and there is no "previous rock" to continue from.
+
+### Uniform over the area, not the radius
+
+The position is the part worth deriving. The obvious way to scatter points over an annulus is
+to pick a radius uniformly between 9 and 17 and an angle uniformly around the circle. It puts
+the same number of rocks in every band of equal width — but a band near the inner edge is a
+smaller circle than one near the outer edge, so the same number of rocks is packed into less
+area. The inner edge ends up crowded.
+
+To spread points uniformly over the *area*, the fraction of rocks inside radius *r* has to
+equal the fraction of the annulus's area inside radius *r*:
+
+```text
+                 area between a and r      π(r² − a²)      r² − a²
+P(radius < r) = ─────────────────────── = ──────────── = ─────────
+                 area between a and b      π(b² − a²)      b² − a²
+
+Set that equal to a uniform number u in [0, 1) and solve for r:
+
+    u = (r² − a²) / (b² − a²)
+    r = √( a² + u (b² − a²) )
+```
+
+That is **uniform area sampling**, and it is the `std::sqrt(random.range(kBeltInner *
+kBeltInner, kBeltOuter * kBeltOuter))` in the loop: a uniform number in [a², b²), then its
+square root. The general technique — write down the cumulative distribution you want, set it
+equal to a uniform number, solve — is called inverse transform sampling, and it comes back in
+PBR.
+
+It is measurable. Counting the 5,000 rocks the sample draws by default, in the thinnest and
+thickest one-unit bands of the belt, and dividing by each band's area:
+
+| | rocks in 9 ≤ r < 10 | per unit² | rocks in 16 ≤ r < 17 | per unit² |
+|---|---|---|---|---|
+| r uniform | 621 | 10.40 | 613 | 5.91 |
+| r = √(uniform in [a², b²)) | 458 | **7.67** | 796 | **7.68** |
+
+With a uniform radius, the two bands hold about the same number of rocks, but the inner band
+has 19π units of area against the outer band's 33π, so its rocks are 1.76 times as dense. With
+the square root, the densities agree to within one rock.
+
+The rest of the loop:
+
+- The angle is uniform in [0, 2π), and *y* is a small random offset, so the belt has a little
+  depth.
+- The rock is turned by a random angle about a random axis. The axis's z component is kept at
+  0.1 or more, so the vector handed to `glm::normalize` can never be near zero length. Keeping z
+  positive loses nothing, since a rotation about −*n* is a rotation about *n* by the opposite
+  angle; the 0.1 floor only thins out axes lying almost flat in the xy plane, which nobody
+  looking at a tumbling rock can tell.
+- The scale is **non-uniform**: a random size, then each axis stretched by its own factor
+  between 0.6 and 1.4. This is what makes the normal matrix necessary rather than decorative.
+  As 2.2 showed, a normal transformed by a non-uniformly scaling matrix stops being
+  perpendicular to its surface, and the inverse transpose is what fixes that.
+- The colour is a grey, pushed a little towards warm by a random amount.
+
+The model matrix is built in the order 1.12 taught: `translate`, then `rotate`, then `scale`,
+each multiplied on the right. Applied to a vertex, that is scale first, rotate second,
+translate last.
+
+## The frame arena shrinks
+
+4.5's `FrameArena` class carries over, code unchanged. What changes is how much the frame
+puts in it. 4.5 wrote seven `Globals` and ten `DrawData` into it every frame — 2,952 bytes. Here there is
+one `Globals`, 256 bytes, and the instances are not in it at all:
+
+```cpp title="code/src/4.advanced_vulkan/instancing/main.cpp"
+// One Globals a frame now, so 4.5's 64 KiB is far more than enough; 4 KiB still is.
+constexpr VkDeviceSize kArenaBytes = 4 * 1024;
+```
+
+That split is the design. The arena exists for data that changes every frame, and 4.5
+explained why that data is better written straight into host-visible memory than staged.
+The instances do *not* change — the belt's rotation is one matrix in `Globals`, applied to all
+of them in the shader — so they go the other way: written once, at start-up, into
+device-local memory through 1.8's staging upload, and read from there for every frame after.
+11 MiB of data that every vertex of every rock reads, every frame, belongs in the memory the
+GPU reads fastest.
+
+## Timing the GPU
+
+Measuring a draw path means measuring two things: how long the CPU spends *recording* the
+draws, and how long the GPU spends *executing* them. The first is a `std::chrono` clock around
+the recording code. The second cannot be measured from the CPU at all — by the time the CPU
+could look at a clock, the GPU has not started — so the GPU has to measure itself.
+
+A **timestamp query** does that. It is a command, recorded like any other, that asks the GPU to
+write its own clock's current value into a slot of a **query pool** — a `VkQueryPool`, an array
+of slots the device writes query results into. Two timestamps bracket the work, and the
+difference is how long the GPU spent between them. The sample wraps it in a class:
+
+```cpp title="code/src/4.advanced_vulkan/instancing/main.cpp"
+// ---------------------------------------------------------------------------
+// Timing the GPU
+// ---------------------------------------------------------------------------
+
+// How long a stretch of a command buffer took on the GPU.
+//
+// A timestamp query asks the GPU to write its own clock into a query pool at a point in
+// the command stream. Two of them bracket the work, and the difference -- in ticks, which
+// timestampPeriod converts to nanoseconds -- is how long the GPU spent between them.
+//
+// The answer is not available until the GPU has executed the command buffer, which is a
+// frame or two after it was recorded. So each frame in flight gets its own pair of
+// queries, and a frame reads back the pair its slot wrote last time round: that frame's
+// fence has already been waited on, so the results are there.
+class GpuTimer {
+public:
+```
+
+### Creating it
+
+```cpp title="code/src/4.advanced_vulkan/instancing/main.cpp"
+    void create(vkc::Context& context) {
+        device_ = context.device();
+
+        VkPhysicalDeviceProperties properties{};
+        vkGetPhysicalDeviceProperties(context.physical_device(), &properties);
+        period_ns_ = properties.limits.timestampPeriod;
+
+        // A queue that cannot write timestamps reports zero valid bits. Every desktop
+        // GPU can; the check is what makes the numbers below trustworthy.
+        uint32_t family_count = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(context.physical_device(),
+                                                 &family_count, nullptr);
+        std::vector<VkQueueFamilyProperties> families(family_count);
+        vkGetPhysicalDeviceQueueFamilyProperties(context.physical_device(),
+                                                 &family_count, families.data());
+        const uint32_t valid_bits =
+            families[context.queue_family()].timestampValidBits;
+        if (valid_bits == 0) {
+            throw std::runtime_error("This queue cannot write timestamps.");
+        }
+        mask_ = valid_bits == 64 ? ~uint64_t{0} : (uint64_t{1} << valid_bits) - 1;
+
+        const VkQueryPoolCreateInfo pool_info{
+            .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .queryType = VK_QUERY_TYPE_TIMESTAMP,
+            .queryCount = 2 * vkc::kFramesInFlight,
+            .pipelineStatistics = 0,
+        };
+        VK_CHECK(vkCreateQueryPool(device_, &pool_info, nullptr, &pool_));
+    }
+
+    void destroy() noexcept { vkDestroyQueryPool(device_, pool_, nullptr); }
+```
+
+Two numbers come from the device before anything is created.
+
+`VkPhysicalDeviceProperties::limits.timestampPeriod`, read with
+`vkGetPhysicalDeviceProperties`, is the **timestamp period**: how many nanoseconds one tick of
+the GPU's clock lasts. The clock does not run in nanoseconds; it runs at whatever rate the
+hardware's counter runs at, and this is the conversion. On the RTX 4080 it is exactly 1.0.
+It is a `float` because on other hardware it is not a whole number.
+
+`timestampValidBits` is per queue family, so it comes from `VkQueueFamilyProperties`, the
+array `vkGetPhysicalDeviceQueueFamilyProperties` fills in — the same two-call pattern 1.3 used
+to find the queue family in the first place, and the index to read is the family the context
+chose. It says how many of the 64 bits a timestamp is written into are real counter bits. Zero
+means the queue cannot write timestamps at all, which is worth failing loudly on. Here the
+graphics family reports 64, but some families report fewer (on this GPU, the video decode
+family reports 32), and a counter with fewer bits wraps round to zero sooner. `mask_` keeps
+exactly the valid bits: for *n* valid bits it is 2ⁿ − 1, all ones in the bottom *n* places. The
+`n == 64` case is separate because shifting a 64-bit value by 64 is undefined behaviour in C++.
+
+Then the pool: `VkQueryPoolCreateInfo` with `VK_QUERY_TYPE_TIMESTAMP`, and
+`vkCreateQueryPool`. `queryCount` is two slots for each frame in flight — a begin and an end —
+for a reason the next section gives. `pipelineStatistics` is only for the pipeline statistics
+query type, and is zero here. `vkDestroyQueryPool` destroys it.
+
+### Reading it back
+
+```cpp title="code/src/4.advanced_vulkan/instancing/main.cpp"
+    // What this slot measured the last time it was used, in milliseconds, or a negative
+    // number if it has never been used. Must be called before reset() reuses the slot.
+    [[nodiscard]] double read(uint32_t slot) const {
+        if (!written_[slot]) {
+            return -1.0;
+        }
+        std::array<uint64_t, 2> ticks{};
+        VK_CHECK(vkGetQueryPoolResults(device_, pool_, 2 * slot, 2, sizeof(ticks),
+                                       ticks.data(), sizeof(uint64_t),
+                                       VK_QUERY_RESULT_64_BIT));
+        const uint64_t elapsed = (ticks[1] - ticks[0]) & mask_;
+        return static_cast<double>(elapsed) * period_ns_ * 1e-6;
+    }
+```
+
+A timestamp is written when the GPU executes the command, which is a frame or two after the CPU
+recorded it. So the result of this frame's timestamps is not available this frame. The class
+keeps one pair of slots per frame in flight, and a frame reads back the pair its slot wrote
+*last time round*. By the time 1.6's frame loop hands this slot's command buffer back for
+reuse, it has waited on the slot's fence, so the GPU has finished everything that slot
+recorded — including both timestamps. The results are there to read.
+
+`vkGetQueryPoolResults` copies them out: two queries starting at `2 * slot`, into
+`ticks`, eight bytes apart (`sizeof(uint64_t)` is the stride), with `VK_QUERY_RESULT_64_BIT`
+asking for 64-bit results rather than the default 32. No wait flag is passed, because nothing
+needs waiting for — and if that reasoning were ever wrong, the call would return `VK_NOT_READY`
+and `VK_CHECK` would say so.
+
+The very first time a slot comes round, it has never been written, and reading it would be
+asking for results of queries that were never reset or issued. `written_` tracks that, and
+`read` returns −1 to mean "no measurement yet".
+
+The subtraction is masked:
+
+```text
+elapsed = (end − start) & mask
+```
+
+Unsigned subtraction in C++ is arithmetic modulo 2⁶⁴. If the counter has *n* valid bits and
+wraps from 2ⁿ − 1 back to 0 between the two timestamps, `end` is small and `start` is large, and
+`end − start` wraps round to a huge number whose low *n* bits are still exactly the elapsed
+ticks. The mask throws away everything above them. With 64 valid bits the mask is all ones and
+changes nothing — a 64-bit nanosecond counter wraps after 584 years — but with 32 it would
+matter after about four seconds.
+
+Ticks times `timestampPeriod` is nanoseconds; times 10⁻⁶ again is milliseconds.
+
+### Writing it
+
+```cpp title="code/src/4.advanced_vulkan/instancing/main.cpp"
+    // A query has to be reset before it is written, and the reset is a command like any
+    // other: it happens in order, on the GPU, before the timestamps that follow it. It
+    // is also forbidden inside a rendering pass, which is why it is separate from
+    // begin(): the timestamps may go anywhere, the reset has to go first.
+    void reset(VkCommandBuffer cmd, uint32_t slot) {
+        vkCmdResetQueryPool(cmd, pool_, 2 * slot, 2);
+    }
+
+    void begin(VkCommandBuffer cmd, uint32_t slot) {
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, pool_, 2 * slot);
+    }
+
+    void end(VkCommandBuffer cmd, uint32_t slot) {
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, pool_,
+                             2 * slot + 1);
+        written_[slot] = true;
+    }
+
+private:
+    VkDevice device_ = VK_NULL_HANDLE;
+    VkQueryPool pool_ = VK_NULL_HANDLE;
+    float period_ns_ = 0.0F;
+    uint64_t mask_ = 0;
+    std::array<bool, vkc::kFramesInFlight> written_{};
+};
+```
+
+A query must be reset before it is written, and `vkCmdResetQueryPool` is a command in the
+command buffer, not a host call, so it happens on the GPU, in order, before the timestamps
+recorded after it.
+
+The first version of this class reset the pair inside `begin()`, and `begin()` is called in
+the middle of the frame's rendering. The validation layers stopped it:
+
+```text
+vkCmdResetQueryPool(): It is invalid to issue this call inside an active render pass
+instance begun with vkCmdBeginRendering.
+The Vulkan spec states: This command must only be called outside of a render pass instance
+(https://docs.vulkan.org/spec/latest/chapters/queries.html#VUID-vkCmdResetQueryPool-renderpass)
+```
+
+Timestamps may be written anywhere, including inside a rendering pass, but a reset may not. So
+the reset has its own method, and `on_render` calls it before `vkc::begin_rendering`.
+
+`vkCmdWriteTimestamp2` is the synchronization2 form of the command, and its second argument
+is a pipeline stage. The timestamp is written once every command recorded before it has
+completed that stage. `VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT` is the strictest choice: the
+timestamp is taken only when everything before it has finished entirely. For the begin
+timestamp that means "after the planet is drawn"; for the end timestamp it means "after the
+last rock is drawn". The difference is the rocks.
+
+### Using it
+
+The class is used in the frame, and its numbers are averaged over a second and logged:
+
+```cpp title="code/src/4.advanced_vulkan/instancing/main.cpp"
+    // ---------------------------------------------------------------------------
+    // Measuring
+    // ---------------------------------------------------------------------------
+
+    void reset_stats() {
+        cpu_ms_ = 0.0;
+        gpu_ms_ = 0.0;
+        cpu_samples_ = 0;
+        gpu_samples_ = 0;
+        stats_started_ = elapsed();
+        spdlog::info("{} rocks, {}", rock_count(), path_name());
+    }
+
+    void record_cpu_time(double ms) {
+        cpu_ms_ += ms;
+        ++cpu_samples_;
+    }
+
+    // Averages over a second and logs, so one slow frame does not decide the number.
+    void record_gpu_time(double ms) {
+        if (ms >= 0.0) {
+            gpu_ms_ += ms;
+            ++gpu_samples_;
+        }
+        if (elapsed() - stats_started_ < 1.0F || gpu_samples_ == 0 || cpu_samples_ == 0) {
+            return;
+        }
+        spdlog::info("{:>7} rocks, {:<20} CPU {:7.3f} ms  GPU {:7.3f} ms", rock_count(),
+                     path_name(), cpu_ms_ / cpu_samples_, gpu_ms_ / gpu_samples_);
+        cpu_ms_ = 0.0;
+        gpu_ms_ = 0.0;
+        cpu_samples_ = 0;
+        gpu_samples_ = 0;
+        stats_started_ = elapsed();
+    }
+
+    [[nodiscard]] const char* path_name() const {
+        switch (path_) {
+            case DrawPath::PerRock:
+                return "a draw per rock";
+            case DrawPath::Attributes:
+                return "instance attributes";
+            case DrawPath::Pulled:
+                return "instance pointer";
+        }
+        return "";
+    }
+```
+
+`reset_stats` is called whenever a key changes the path or the count, so a logged average
+never mixes two configurations. It logs the new configuration at once. `record_cpu_time`
+accumulates. `record_gpu_time` accumulates only real measurements — `read` returns −1 for a
+slot that has never been written — and once a second has passed with at least one of each,
+prints the two averages and starts again. The line it prints looks like this:
+
+```text
+   5000 rocks, instance pointer     CPU   0.000 ms  GPU   0.154 ms
+```
+
+`path_name` names the path in that line.
+
+## The instance index
+
+Now the chapter's actual subject. Here is the shader from the top:
+
+```slang title="code/src/4.advanced_vulkan/instancing/instancing.slang"
+// 4.6 Instancing: one mesh, drawn many times, each copy reading its own transform.
+//
+// Everything here is 4.5's scene shader with one new input: the instance index. There
+// are two vertex entry points because the chapter compares two ways of getting a copy's
+// data into the shader -- fetched by the fixed-function vertex input stage, or read
+// through a pointer the shader indexes itself. They produce the same picture, to the
+// pixel; the article shows the comparison.
+
+// 4.5's vertex, read through a pointer.
+struct Vertex {
+    float3 position;
+    float3 normal;
+    float2 uv;
+};
+
+// 4.5's Globals with the cube-face field swapped for the belt's rotation. Still 256
+// bytes.
+struct Globals {
+    float4x4 view;
+    float4x4 projection;
+    float4x4 belt;
+    float4 view_position;
+    float4 sun_direction;
+    float4 sun_colour;
+    float4 ambient;  // rgb ambient, w shininess
+};
+
+// 4.5's DrawData under a new name, because what it describes changed: not one draw
+// call's object, but one copy of a mesh. Same fields, same 116 bytes.
+struct Instance {
+    float4x4 model;
+    float3x3 normal_matrix;
+    float4 colour;
+};
+
+struct PushConstants {
+    Globals* globals;
+    Instance* instances;
+    Vertex* vertices;
+};
+[[vk::push_constant]] PushConstants push;
+
+struct VSOutput {
+    float4 position : SV_Position;
+    [[vk::location(0)]] float3 world_position;
+    [[vk::location(1)]] float3 normal;
+    [[vk::location(2)]] float3 colour;
+};
+
+static const float kSpecularStrength = 0.15;
+```
+
+The structs are the C++ ones, field for field, and 4.5 explained why a struct behind a pointer
+needs no padding to agree. `VSOutput` carries the colour instead of a texture coordinate.
+
+Every vertex, whichever path delivered its data, goes through one function:
+
+```slang title="code/src/4.advanced_vulkan/instancing/instancing.slang"
+VSOutput transform(Vertex vertex, Instance instance) {
+    // The belt's rotation is applied after the instance's own transform, so every copy
+    // turns about the planet's axis together.
+    float4x4 model = mul(push.globals.belt, instance.model);
+
+    VSOutput output;
+    float4 world = mul(model, float4(vertex.position, 1.0));
+    output.world_position = world.xyz;
+    output.position = mul(push.globals.projection, mul(push.globals.view, world));
+    // The belt is a pure rotation, so it is its own normal matrix.
+    output.normal =
+        mul((float3x3)push.globals.belt, mul(instance.normal_matrix, vertex.normal));
+    output.colour = instance.colour.rgb;
+    return output;
+}
+```
+
+The instance's model matrix places the rock in the belt; `push.globals.belt` then turns the
+whole belt about the y axis. Multiplying on the left means applied after, so every rock is
+turned about the planet's axis rather than its own centre. The planet is turned too — it goes
+through the same function — and its bands run around the same axis, so the rotation is
+invisible on it.
+
+The normal gets both halves: the instance's normal matrix, then the belt's rotation. The
+normal matrix of a pure rotation is the rotation itself — for an orthonormal matrix *R*, the
+inverse is the transpose, so the inverse transpose is (Rᵀ)ᵀ = R — which is why the belt needs
+no separate normal matrix. `(float3x3)` takes its upper-left 3×3, dropping the translation
+column, which is zero anyway.
+
+The pointer path's entry point is two lines:
+
+```slang title="code/src/4.advanced_vulkan/instancing/instancing.slang"
+// Instances read through a pointer. SV_VulkanInstanceID is Vulkan's InstanceIndex, which
+// counts from the draw's firstInstance and not from zero -- the same distinction
+// SV_VulkanVertexID makes for vertices. The sample relies on it: the naive path draws one
+// instance at a time and says which one through firstInstance.
+[shader("vertex")]
+VSOutput vertexMain(uint vertex_id : SV_VulkanVertexID,
+                    uint instance_id : SV_VulkanInstanceID) {
+    return transform(push.vertices[vertex_id], push.instances[instance_id]);
+}
+```
+
+`SV_VulkanInstanceID` is Vulkan's `InstanceIndex` built-in: the **instance index** of the copy
+this vertex belongs to. What it counts from matters. A draw call has a `firstInstance`, the
+**first instance**, and a copy's instance index is `firstInstance` plus its position within
+the draw:
+
+```text
+vkCmdDrawIndexed(cmd, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance)
+
+copy i of this draw (0 ≤ i < instanceCount) sees
+    InstanceIndex = firstInstance + i
+```
+
+`instanceCount` is the **instance count**: how many copies this draw produces. The rocks'
+single draw passes `kFirstRock` (1) as the first instance, so its copies see instance indices
+1, 2, 3, … — and `push.instances[instance_id]` reads rock 1, rock 2, rock 3 out of the buffer,
+skipping the planet at index 0.
+
+This is exactly the distinction this series drew between `SV_VulkanVertexID` and
+`SV_VertexID`, and it has the same trap. Slang also has `SV_InstanceID`, which is HLSL's meaning — counted from zero
+within each draw, whatever `firstInstance` was. To produce it, Slang subtracts SPIR-V's
+`BaseInstance` from `InstanceIndex`, and `BaseInstance` needs a device feature this series has
+never enabled. Swapping the semantic in:
+
+```text
+vkCreateShaderModule(): SPIR-V Capability DrawParameters was declared, but one of the
+following requirements is required (VkPhysicalDeviceVulkan11Features::shaderDrawParameters OR
+VK_KHR_shader_draw_parameters [when using Vulkan 1.0]).
+```
+
+That is the best case. With the feature enabled, the shader would compile, every rock would
+read the instance one before its own — the rock draw starts at 1, so its first copy would read
+the planet's entry — and the picture changes by only **14 pixels**. Rocks are anonymous: every
+rock moves into its neighbour's place, which looks the same, and the only visible differences
+are the last rock going missing and one rock-sized lump appearing inside the planet, where
+nobody can see it. It is an off-by-one that no screenshot would catch. Use `SV_VulkanInstanceID`.
+
+## Three ways to draw the rocks
+
+`draw_rocks` is the whole comparison:
+
+```cpp title="code/src/4.advanced_vulkan/instancing/main.cpp"
+private:
+    [[nodiscard]] uint32_t rock_count() const { return kRockCounts[count_index_]; }
+
+    // The whole chapter is these three branches.
+    void draw_rocks(VkCommandBuffer cmd, VkDeviceAddress globals) {
+        const uint32_t count = rock_count();
+        vkCmdBindIndexBuffer(cmd, rock_.indices.handle(), 0, VK_INDEX_TYPE_UINT16);
+
+        switch (path_) {
+            case DrawPath::PerRock:
+                // One draw per rock, each asking for a single instance. firstInstance is
+                // what tells the shader which one, so nothing else changes between
+                // draws -- not the pipeline, not the push constants. What is left is the
+                // cost of a draw call and nothing else.
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, rock_pipeline_);
+                push(cmd, globals, rock_.vertex_address);
+                for (uint32_t i = 0; i < count; ++i) {
+                    vkCmdDrawIndexed(cmd, rock_.index_count, 1, 0, 0, kFirstRock + i);
+                }
+                break;
+
+            case DrawPath::Attributes: {
+                // The instance buffer bound as a vertex buffer. The pipeline's binding
+                // says it advances once per instance rather than once per vertex, so
+                // every vertex of copy i sees element i.
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                  attribute_pipeline_);
+                push(cmd, globals, rock_.vertex_address);
+                const VkBuffer buffer = instances_.handle();
+                const VkDeviceSize offset = 0;
+                vkCmdBindVertexBuffers(cmd, 0, 1, &buffer, &offset);
+                vkCmdDrawIndexed(cmd, rock_.index_count, count, 0, 0, kFirstRock);
+                break;
+            }
+
+            case DrawPath::Pulled:
+                // The same single draw, with the shader indexing the buffer itself.
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, rock_pipeline_);
+                push(cmd, globals, rock_.vertex_address);
+                vkCmdDrawIndexed(cmd, rock_.index_count, count, 0, 0, kFirstRock);
+                break;
+        }
+    }
+```
+
+The index buffer is bound once for all three: every path draws the same rock mesh.
+
+**One draw per rock.** A loop of `vkCmdDrawIndexed` calls, each with `instanceCount` 1 and its
+own `firstInstance`. With a count of 1, instance index = `firstInstance` + 0, so each draw's
+single copy reads exactly the rock it names. The shader and the pipeline are the same ones the
+single-draw path uses, and the push constants are pushed once before the loop and never
+changed. That was deliberate. In 4.5 each draw pushed a new `draw_index`, which is what most
+code does, and then the measurement would include a push per draw. Here, the only thing that
+differs between the three paths is how many draw calls there are — so what the measurement sees
+is the cost of a draw call and nothing else. That cost is the **draw call overhead**.
+
+**One draw, with instance attributes.** The same single call as the pointer path, but through a
+different pipeline, with the instance buffer bound as a vertex buffer. Its own section follows.
+
+**One draw, with a pointer.** `vkCmdDrawIndexed(cmd, rock_.index_count, count, 0, 0,
+kFirstRock)`: `count` copies of the rock, starting at instance 1. The GPU does everything else.
+
+## Instance-rate vertex input
+
+The pointer path is how this series has read data since 4.5. There is an older way, and it is
+the one you will meet in most Vulkan code, and in every OpenGL tutorial as
+`glVertexAttribDivisor`: let the fixed-function vertex input stage fetch the instance's data,
+as 1.8 had it fetch each vertex's.
+
+1.8 described a vertex buffer with a `VkVertexInputBindingDescription`, and its `inputRate` was
+`VK_VERTEX_INPUT_RATE_VERTEX`: step to the next element for every vertex. The other value is
+`VK_VERTEX_INPUT_RATE_INSTANCE`: step to the next element for every *instance*, so all the
+vertices of one copy see the same element. That is **instance-rate vertex input**, and the
+fetch address is the same formula with a different index:
+
+```text
+address of attribute a  =  buffer offset + stride × index + a.offset
+
+    index = VertexIndex      for VK_VERTEX_INPUT_RATE_VERTEX
+    index = InstanceIndex    for VK_VERTEX_INPUT_RATE_INSTANCE     (firstInstance + i)
+```
+
+The same `InstanceIndex`, with the same `firstInstance` in it — so binding the whole instance
+buffer at offset 0 and drawing from first instance 1 skips the planet here too. The pipeline
+describes it:
+
+```cpp title="code/src/4.advanced_vulkan/instancing/main.cpp"
+        // One binding, stepping once per instance, and eight attributes that carve an
+        // Instance into the pieces the shader declares. A mat4 is four vec4 columns and
+        // a mat3 is three vec3 columns: vertex input has no matrix formats.
+        const std::array<VkVertexInputBindingDescription, 1> bindings{{
+            {.binding = 0,
+             .stride = sizeof(Instance),
+             .inputRate = VK_VERTEX_INPUT_RATE_INSTANCE},
+        }};
+        std::array<VkVertexInputAttributeDescription, 8> attributes{};
+        for (uint32_t column = 0; column < 4; ++column) {
+            attributes[column] = {
+                .location = column,
+                .binding = 0,
+                .format = VK_FORMAT_R32G32B32A32_SFLOAT,
+                .offset = static_cast<uint32_t>(offsetof(Instance, model) +
+                                                column * sizeof(glm::vec4)),
+            };
+        }
+        for (uint32_t column = 0; column < 3; ++column) {
+            attributes[4 + column] = {
+                .location = 4 + column,
+                .binding = 0,
+                .format = VK_FORMAT_R32G32B32_SFLOAT,
+                .offset = static_cast<uint32_t>(offsetof(Instance, normal_matrix) +
+                                                column * sizeof(glm::vec3)),
+            };
+        }
+        attributes[7] = {
+            .location = 7,
+            .binding = 0,
+            .format = VK_FORMAT_R32G32B32A32_SFLOAT,
+            .offset = static_cast<uint32_t>(offsetof(Instance, colour)),
+        };
+
+        attribute_pipeline_ = base()
+                                  .shaders(shader, "attributeVertexMain", "fragmentMain")
+                                  .vertex_input(bindings, attributes)
+                                  .build();
+```
+
+One binding: binding 0, a stride of `sizeof(Instance)` — 116 bytes — advancing per instance.
+Then the attributes, and here the vertex input stage shows its age. It has formats for scalars
+and vectors of up to four components, and no formats for matrices. A `mat4` has to be sent as
+four `vec4` attributes, one per column, each `VK_FORMAT_R32G32B32A32_SFLOAT`, and a `mat3` as
+three `vec3`s, each `VK_FORMAT_R32G32B32_SFLOAT`. glm stores columns one after another, so the
+offsets step through the struct:
+
+| location | what | format | offset |
+|---|---|---|---|
+| 0–3 | `model` columns 0–3 | `R32G32B32A32_SFLOAT` | 0, 16, 32, 48 |
+| 4–6 | `normal_matrix` columns 0–2 | `R32G32B32_SFLOAT` | 64, 76, 88 |
+| 7 | `colour` | `R32G32B32A32_SFLOAT` | 100 |
+
+Eight locations for one struct. Vulkan guarantees only 16 vertex attributes
+(`maxVertexInputAttributes` has a required minimum of 16), so this approach runs out of room
+quickly — another reason the series prefers pointers. The offsets are computed with `offsetof`
+rather than typed in, so they cannot disagree with the `static_assert`s.
+
+The buffer has to be allowed to be bound as a vertex buffer, which is why `on_start` creates it
+with `VK_BUFFER_USAGE_VERTEX_BUFFER_BIT` as well as `VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT`.
+`draw_rocks` binds it with `vkCmdBindVertexBuffers`: first binding 0, one buffer, at offset 0.
+
+The shader receives the eight attributes and reassembles the `Instance`:
+
+```slang title="code/src/4.advanced_vulkan/instancing/instancing.slang"
+// The same Instance, delivered by the vertex input stage instead. Every field arrives as
+// an attribute, and a matrix is not an attribute: a float4x4 takes four locations, one
+// per column, and a float3x3 takes three.
+struct InstanceAttributes {
+    [[vk::location(0)]] float4 model0;
+    [[vk::location(1)]] float4 model1;
+    [[vk::location(2)]] float4 model2;
+    [[vk::location(3)]] float4 model3;
+    [[vk::location(4)]] float3 normal0;
+    [[vk::location(5)]] float3 normal1;
+    [[vk::location(6)]] float3 normal2;
+    [[vk::location(7)]] float4 colour;
+};
+
+[shader("vertex")]
+VSOutput attributeVertexMain(uint vertex_id : SV_VulkanVertexID,
+                             InstanceAttributes attributes) {
+    // Each attribute is one column of a glm matrix. Slang's matrix constructor takes
+    // rows, so the columns go in as rows and the transpose puts them back.
+    Instance instance;
+    instance.model = transpose(float4x4(attributes.model0, attributes.model1,
+                                        attributes.model2, attributes.model3));
+    instance.normal_matrix = transpose(
+        float3x3(attributes.normal0, attributes.normal1, attributes.normal2));
+    instance.colour = attributes.colour;
+    return transform(push.vertices[vertex_id], instance);
+}
+```
+
+The `transpose` calls are not decoration. Slang's `float4x4(a, b, c, d)` constructor treats its
+four vectors as *rows*, whatever the layout setting — the column-major setting from 1.7 governs how
+a matrix is stored in memory, not what its constructor means. The attributes are columns. Built
+straight from them, every matrix comes out transposed: the translation, which should be the
+fourth column, lands in the bottom row, where it multiplies into the *w* of every vertex and
+turns the perspective divide into nonsense. Without the transposes, every one of the 921,600
+pixels but 220 changes, and the rocks fill the screen:
+
+<figure>
+  <img src="/img/4.6/no-transpose.png" alt="Large flat grey and near-black polygons slashing across the whole frame, with no planet or belt recognisable" />
+  <figcaption>The attribute path with the two <code>transpose</code> calls removed. Every
+  rock's matrix is transposed, its translation has become a projective term, and the rocks
+  are smeared across the whole view.</figcaption>
+</figure>
+
+The pointer path never meets this, because it reads a whole `float4x4` from memory and the
+layout rule does the right thing.
+
+## Lighting and the planet
+
+The rest of the shader is 4.5's lighting with the texture sample removed, and a banded planet:
+
+```slang title="code/src/4.advanced_vulkan/instancing/instancing.slang"
+float3 shade(VSOutput input, float3 albedo) {
+    float3 normal = normalize(input.normal);
+    float3 to_eye = normalize(push.globals.view_position.xyz - input.world_position);
+    float3 to_sun = normalize(-push.globals.sun_direction.xyz);
+
+    float diffuse_amount = max(dot(normal, to_sun), 0.0);
+    float3 diffuse = push.globals.sun_colour.rgb * diffuse_amount * albedo;
+
+    float3 reflected = reflect(-to_sun, normal);
+    float specular_amount =
+        pow(max(dot(to_eye, reflected), 0.0), push.globals.ambient.w);
+    float3 specular = push.globals.sun_colour.rgb * specular_amount * kSpecularStrength;
+
+    return push.globals.ambient.rgb * albedo + diffuse + specular;
+}
+
+[shader("fragment")]
+float4 fragmentMain(VSOutput input) : SV_Target {
+    return float4(shade(input, input.colour), 1.0);
+}
+
+// The planet has no texture. Its bands are a function of latitude, and for a sphere
+// centred on the origin the normalised position's y is the sine of the latitude --
+// which serves just as well, since all that matters is that it is constant along a
+// parallel.
+[shader("fragment")]
+float4 planetFragmentMain(VSOutput input) : SV_Target {
+    float height = normalize(input.world_position).y;
+    float band = 0.5 + 0.5 * sin(height * 14.0 + 1.3 * sin(height * 5.0));
+    float3 albedo = lerp(input.colour, float3(0.93, 0.83, 0.66), band * 0.55);
+    return float4(shade(input, albedo), 1.0);
+}
+```
+
+`shade` is 2.2's Phong model, two-sidedness removed since there are no ferns. The rocks' albedo
+is just their instance colour. The planet's bands come from `normalize(world_position).y`,
+which for a sphere at the origin is the sine of the latitude: constant along every parallel,
+so a function of it paints stripes around the planet. The inner `sin` wobbles the stripe
+spacing so the bands do not look ruled, and the result blends the instance colour towards a
+pale cream.
+
+## The application
+
+`on_start` builds the two meshes and the instance buffer, and everything else:
+
+```cpp title="code/src/4.advanced_vulkan/instancing/main.cpp"
+// ---------------------------------------------------------------------------
+// The sample
+// ---------------------------------------------------------------------------
+
+class InstancingApp : public vkc::App {
+public:
+    using vkc::App::App;
+
+protected:
+    void on_start() override {
+        const auto [sphere_vertices, sphere_indices] = make_sphere(48, 96, kPlanetRadius);
+        planet_ = upload_mesh(context(), sphere_vertices, sphere_indices);
+
+        const auto [rock_vertices, rock_indices] = make_rock(2, 0.18F, 7);
+        rock_ = upload_mesh(context(), rock_vertices, rock_indices);
+
+        // Written once and never again, so it is staged into device-local memory. 4.5's
+        // arena was host-visible because its contents changed every frame; these do
+        // not. VERTEX_BUFFER as well as SHADER_DEVICE_ADDRESS, because draw path 2 binds
+        // this same buffer as a vertex buffer.
+        const std::vector<Instance> instances = make_instances();
+        instances_ = vkc::upload_to_device_local(
+            context(), instances.data(), instances.size() * sizeof(Instance),
+            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+        instances_address_ = buffer_address(context().device(), instances_.handle());
+
+        depth_format_ = vkc::choose_depth_format(context().physical_device());
+
+        for (FrameArena& arena : arenas_) {
+            arena.create(context(), kArenaBytes);
+        }
+        timer_.create(context());
+        create_depth_buffer(swapchain().extent());
+        create_pipelines();
+
+        camera_.position = {0.0F, 7.5F, 30.0F};
+        camera_.pitch = -14.0F;
+        camera_.speed = 8.0F;
+
+        spdlog::info("rock: {} triangles; instance buffer: {} x {} B = {:.1f} MiB",
+                     rock_.index_count / 3, instances.size(), sizeof(Instance),
+                     static_cast<double>(instances.size() * sizeof(Instance)) /
+                         (1024.0 * 1024.0));
+        spdlog::info("1 a draw per rock, 2 instance attributes, 3 instance pointer, "
+                     "-/= rock count, 4 spin the belt.");
+    }
+```
+
+`vkc::upload_to_device_local` is 1.8's staging upload into device-local memory; the instance
+buffer's usage flags are the two just discussed. It logs the sizes, which for the full buffer
+is 100,001 × 116 = 11,600,116 bytes:
+
+```text
+rock: 320 triangles; instance buffer: 100001 x 116 B = 11.1 MiB
+```
+
+The camera starts above the belt's plane, looking down at it, and flies faster than 1.14's
+default, because the scene is bigger.
+
+The keys:
+
+```cpp title="code/src/4.advanced_vulkan/instancing/main.cpp"
+    void on_resize(VkExtent2D extent) override { create_depth_buffer(extent); }
+
+    void on_event(const SDL_Event& event) override {
+        camera_.handle_event(event, window().handle());
+
+        if (event.type != SDL_EVENT_KEY_DOWN || event.key.repeat) {
+            return;
+        }
+        switch (event.key.scancode) {
+            case SDL_SCANCODE_1:
+                path_ = DrawPath::PerRock;
+                break;
+            case SDL_SCANCODE_2:
+                path_ = DrawPath::Attributes;
+                break;
+            case SDL_SCANCODE_3:
+                path_ = DrawPath::Pulled;
+                break;
+            case SDL_SCANCODE_MINUS:
+                count_index_ = count_index_ > 0 ? count_index_ - 1 : 0;
+                break;
+            case SDL_SCANCODE_EQUALS:
+                count_index_ = std::min(count_index_ + 1, kRockCounts.size() - 1);
+                break;
+            case SDL_SCANCODE_4:
+                spinning_ = !spinning_;
+                break;
+            default:
+                return;
+        }
+        reset_stats();
+    }
+```
+
+The count keys clamp at both ends of `kRockCounts`. Every key that does something resets the
+statistics; any other key returns before that happens.
+
+Shutdown destroys everything in reverse order of creation:
+
+```cpp title="code/src/4.advanced_vulkan/instancing/main.cpp"
+    void on_shutdown() override {
+        const VkDevice device = context().device();
+
+        vkDestroyPipeline(device, attribute_pipeline_, nullptr);
+        vkDestroyPipeline(device, planet_pipeline_, nullptr);
+        vkDestroyPipeline(device, rock_pipeline_, nullptr);
+        vkDestroyPipelineLayout(device, pipeline_layout_, nullptr);
+
+        timer_.destroy();
+        for (FrameArena& arena : arenas_) {
+            arena.destroy();
+        }
+        depth_.destroy();
+        instances_.destroy();
+        rock_.destroy();
+        planet_.destroy();
+    }
+```
+
+And the frame:
+
+```cpp title="code/src/4.advanced_vulkan/instancing/main.cpp"
+    void on_render(const vkc::FrameInfo& frame) override {
+        camera_.update(delta_time());
+        if (spinning_) {
+            belt_angle_ += kBeltSpin * delta_time();
+        }
+
+        const uint32_t slot = frame.frame_number % vkc::kFramesInFlight;
+        record_gpu_time(timer_.read(slot));
+
+        FrameArena& arena = arenas_[slot];
+        arena.reset();
+        const VkDeviceAddress globals = write_globals(arena, frame.extent);
+
+        timer_.reset(frame.cmd, slot);
+        vkc::begin_rendering(frame.cmd, frame.view, depth_.view(), frame.extent,
+                             {{0.01F, 0.012F, 0.02F, 1.0F}});
+        set_viewport(frame.cmd, frame.extent);
+
+        push(frame.cmd, globals, planet_.vertex_address);
+        vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, planet_pipeline_);
+        vkCmdBindIndexBuffer(frame.cmd, planet_.indices.handle(), 0,
+                             VK_INDEX_TYPE_UINT16);
+        vkCmdDrawIndexed(frame.cmd, planet_.index_count, 1, 0, 0, kPlanetInstance);
+
+        // Only the rocks are timed. The planet is one draw whichever path is chosen.
+        timer_.begin(frame.cmd, slot);
+        const auto cpu_start = std::chrono::steady_clock::now();
+        draw_rocks(frame.cmd, globals);
+        const auto cpu_end = std::chrono::steady_clock::now();
+        timer_.end(frame.cmd, slot);
+
+        vkCmdEndRendering(frame.cmd);
+
+        record_cpu_time(
+            std::chrono::duration<double, std::milli>(cpu_end - cpu_start).count());
+    }
+```
+
+In order: the camera and the belt angle advance; this slot's timer pair from last time round
+is read, before anything reuses it; the arena is reset and this frame's `Globals` written;
+the timer pair is reset — outside the rendering pass, as the validation message insisted;
+rendering begins. The planet is drawn first with the pointer pipeline's planet variant, one
+instance, `firstInstance` 0. Then the rocks, between two timestamps on the GPU and two clock
+reads on the CPU.
+
+`write_globals` is 4.5's, filling the one `Globals` with the belt rotation in place of
+`view_rotation`:
+
+```cpp title="code/src/4.advanced_vulkan/instancing/main.cpp"
+    [[nodiscard]] VkDeviceAddress write_globals(FrameArena& arena, VkExtent2D extent) {
+        const Globals globals{
+            .view = camera_.view(),
+            .projection = projection(extent),
+            .belt = glm::rotate(glm::mat4(1.0F), belt_angle_,
+                                glm::vec3(0.0F, 1.0F, 0.0F)),
+            .view_position = glm::vec4(camera_.position, 1.0F),
+            .sun_direction = glm::vec4(glm::normalize(kSunDirection), 0.0F),
+            .sun_colour = glm::vec4(kSunColour, 1.0F),
+            .ambient = glm::vec4(kAmbient, kShininess),
+        };
+        return arena.write(&globals, sizeof(globals));
+    }
+```
+
+`push` is 4.5's minus the index:
+
+```cpp title="code/src/4.advanced_vulkan/instancing/main.cpp"
+    void push(VkCommandBuffer cmd, VkDeviceAddress globals, VkDeviceAddress vertices) {
+        const PushConstants constants{
+            .globals = globals,
+            .instances = instances_address_,
+            .vertices = vertices,
+        };
+        vkCmdPushConstants(cmd, pipeline_layout_,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                           sizeof(constants), &constants);
+    }
+```
+
+`set_viewport` is 4.5's. `projection` is 4.5's `screen_projection` renamed, with the far plane
+moved from 100 to 200, because the belt is 34 units across and the camera can back away from
+it; the one-line `create_depth_buffer` is 4.5's:
+
+```cpp title="code/src/4.advanced_vulkan/instancing/main.cpp"
+    [[nodiscard]] static glm::mat4 projection(VkExtent2D extent) {
+        const float aspect =
+            static_cast<float>(extent.width) / static_cast<float>(extent.height);
+        glm::mat4 projection =
+            glm::perspective(glm::radians(45.0F), aspect, 0.1F, 200.0F);
+        projection[1][1] *= -1.0F;  // Vulkan's clip-space y points down.
+        return projection;
+    }
+
+    void create_depth_buffer(VkExtent2D extent) {
+        depth_ = vkc::create_depth_buffer(context(), depth_format_, extent);
+    }
+```
+
+### Pipelines
+
+```cpp title="code/src/4.advanced_vulkan/instancing/main.cpp"
+    // ---------------------------------------------------------------------------
+    // Pipelines
+    // ---------------------------------------------------------------------------
+
+    void create_pipelines() {
+        const VkDevice device = context().device();
+
+        // No descriptor set layouts at all. 4.5's only descriptors were its textures,
+        // and this scene has none.
+        const VkPushConstantRange push_range{
+            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+            .offset = 0,
+            .size = sizeof(PushConstants),
+        };
+        const VkPipelineLayoutCreateInfo layout_info{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .setLayoutCount = 0,
+            .pSetLayouts = nullptr,
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &push_range,
+        };
+        VK_CHECK(
+            vkCreatePipelineLayout(device, &layout_info, nullptr, &pipeline_layout_));
+
+        const VkShaderModule shader =
+            vkc::load_shader(device, LVK_CHAPTER_ID, "instancing.slang");
+
+        const auto base = [&]() -> vkc::PipelineBuilder {
+            return vkc::PipelineBuilder(device)
+                .colour_attachment(swapchain().format())
+                .cull(VK_CULL_MODE_BACK_BIT, VK_FRONT_FACE_COUNTER_CLOCKWISE)
+                .depth(depth_format_, /*test=*/true, /*write=*/true)
+                .layout(pipeline_layout_);
+        };
+
+        rock_pipeline_ = base().shaders(shader).build();
+        planet_pipeline_ =
+            base().shaders(shader, "vertexMain", "planetFragmentMain").build();
+```
+
+A pipeline layout with no descriptor set layouts at all — `setLayoutCount` is 0. 4.5 kept its
+descriptors only for its textures, and this scene has none, so for the first time since 1.10 a
+sample reaches every piece of data it uses without a single descriptor.
+
+All three pipelines share everything but their shaders and vertex input, so a small lambda
+starts each builder the same way. The rock and planet pipelines use the pointer entry point
+with the two fragment shaders; the attribute pipeline was shown above. The remaining lines
+destroy the module and name the pipelines:
+
+```cpp title="code/src/4.advanced_vulkan/instancing/main.cpp"
+        vkDestroyShaderModule(device, shader, nullptr);
+
+        context().name(rock_pipeline_, VK_OBJECT_TYPE_PIPELINE, "rocks (pointer)");
+        context().name(attribute_pipeline_, VK_OBJECT_TYPE_PIPELINE,
+                       "rocks (instance attributes)");
+        context().name(planet_pipeline_, VK_OBJECT_TYPE_PIPELINE, "planet");
+    }
+```
+
+The members, and `main`:
+
+```cpp title="code/src/4.advanced_vulkan/instancing/main.cpp"
+    vkc::Camera camera_;
+
+    Mesh planet_;
+    Mesh rock_;
+    vkc::Buffer instances_;
+    VkDeviceAddress instances_address_ = 0;
+
+    VkFormat depth_format_ = VK_FORMAT_UNDEFINED;
+    vkc::Image depth_;
+
+    std::array<FrameArena, vkc::kFramesInFlight> arenas_;
+    GpuTimer timer_;
+
+    VkPipelineLayout pipeline_layout_ = VK_NULL_HANDLE;
+    VkPipeline rock_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline planet_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline attribute_pipeline_ = VK_NULL_HANDLE;
+
+    DrawPath path_ = DrawPath::Pulled;
+    size_t count_index_ = kDefaultRockCount;
+    bool spinning_ = false;
+    float belt_angle_ = 0.0F;
+
+    double cpu_ms_ = 0.0;
+    double gpu_ms_ = 0.0;
+    uint32_t cpu_samples_ = 0;
+    uint32_t gpu_samples_ = 0;
+    float stats_started_ = 0.0F;
+};
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    try {
+        vkc::App::Options options{};
+        options.title = "LearnVulkan 4.6 - Instancing";
+        InstancingApp app(vkc::App::parse_args(argc, argv, options));
+        return app.run();
+    } catch (const std::exception& error) {
+        spdlog::error("{}", error.what());
+        return EXIT_FAILURE;
+    }
+}
+```
+
+## What it costs
+
+These are measurements from one machine — an RTX 4080 on Linux — and the shape of them is the
+point, not the digits. They are averages over at least a second, from the release build
+(`linux-release`) run with `--no-validation`, and they vary by up to about 15% from run to run
+as the GPU's clocks move. The CPU column is the time to *record* the rock draws; the GPU
+column is the time between the two timestamps.
+
+With the 320-triangle rock:
+
+| rocks | path | CPU | GPU |
+|---|---|---|---|
+| 1,000 | a draw per rock | 0.014 ms | 0.025 ms |
+| 1,000 | instance attributes | 0.000 ms | 0.029 ms |
+| 1,000 | instance pointer | 0.000 ms | 0.024 ms |
+| 10,000 | a draw per rock | 0.143 ms | 0.311 ms |
+| 10,000 | instance attributes | 0.000 ms | 0.342 ms |
+| 10,000 | instance pointer | 0.000 ms | 0.310 ms |
+| 100,000 | a draw per rock | 1.218 ms | 3.175 ms |
+| 100,000 | instance attributes | 0.001 ms | 3.461 ms |
+| 100,000 | instance pointer | 0.000 ms | 3.082 ms |
+
+Read the CPU column first. Recording a draw call costs a fixed amount, so the time to record *N*
+of them should be a straight line, *a* + *b*·*N*. From the three rows, *b* is about 12
+nanoseconds: 0.143 ms for 10,000, 1.218 ms for 100,000, and (1.218 − 0.143) / 90,000 ≈ 11.9 ns
+per extra draw. Instancing makes the CPU cost constant and effectively zero — one call, however
+many rocks.
+
+Twelve nanoseconds is very little. The specification makes incorrect use undefined behaviour
+rather than something the driver must detect, so a driver is not required to check anything
+when a draw is recorded, and this one evidently does very little. A hundred thousand draw
+calls cost 1.2 ms of a 16.7 ms frame. The OpenGL-era claim
+that draw calls are ruinously expensive is, in a release Vulkan build, simply not true at this
+scale.
+
+Now the GPU column. With a 320-triangle rock, the three paths are within a few percent of each
+other: a hundred thousand rocks is 32 million triangles, and that is what the GPU spends its
+3 milliseconds on. A draw call does have a GPU cost too — the GPU's front end has to fetch the
+draw, set it up and dispatch its work — but it is hidden behind 320 triangles of real work per
+draw.
+
+Make the rock smaller and the cost comes out. With no subdivision at all — the bare 20-triangle
+icosahedron:
+
+| rocks | path | CPU | GPU |
+|---|---|---|---|
+| 10,000 | a draw per rock | 0.126 ms | 0.088 ms |
+| 10,000 | instance pointer | 0.000 ms | 0.023 ms |
+| 100,000 | a draw per rock | 1.171 ms | **0.901 ms** |
+| 100,000 | instance pointer | 0.000 ms | **0.226 ms** |
+| 100,000 | instance attributes | 0.000 ms | 0.229 ms |
+
+Now one draw per rock is four times slower on the GPU than one instanced draw of the same
+triangles. The difference, 0.675 ms over 100,000 draws, is about 7 ns of GPU time per draw
+call. That is a fixed cost per draw that the GPU pays whatever is in it, and when the draw is
+small, it is most of the cost.
+
+And there is one more cost, which matters more than either while you are writing the code. The
+debug build, with the validation layers on — the configuration this series has run in since
+1.2:
+
+| rocks | path | CPU |
+|---|---|---|
+| 10,000 | a draw per rock | 7.09 ms |
+| 100,000 | a draw per rock | **70.9 ms** |
+| 100,000 | instance pointer | 0.004 ms |
+
+The validation layers check every command as it is recorded, and a draw call is where there is
+the most to check. That is about 710 ns per draw, sixty times the release cost, and at 100,000
+draws it holds the sample to at most 14 frames a second before it has done anything else.
+Validation moved out of the driver, but it did not go away; it moved into the layers you
+develop with.
+
+So the honest summary of why to instance is not the one usually given:
+
+- **CPU**: in a release build, not much, until the counts are very large. Twelve nanoseconds
+  per draw on this machine.
+- **GPU**: a fixed cost per draw, around 7 ns here, that dominates when the meshes are small.
+  Rocks, grass, particles, foliage — the things you have tens of thousands of — are exactly
+  the small meshes.
+- **Development**: under the validation layers, per-draw cost is sixty times higher, and a
+  scene with a hundred thousand draws is unusable while you debug it.
+
+And the two instanced paths? The pointer path was a little faster than the attribute path with
+the 320-triangle rock (3.08 against 3.46 ms at 100,000) and the same with the small one. That is
+one GPU's behaviour and not a rule; on other hardware the fixed-function path can win. The
+choice between them in this series is made on other grounds: the pointer path has no
+16-attribute limit, no matrix reassembly, and no second pipeline to keep in step with the
+first.
+
+## Checking the three paths against each other
+
+All three paths are supposed to draw the same picture. That is checkable. Screenshots of the
+default view at frame 120, one per path, compared with the pointer path's:
+
+| path | pixels that differ | largest difference in any channel |
+|---|---|---|
+| a draw per rock | 0 | 0 |
+| instance attributes | 0 | 0 |
+
+Zero, not "nearly zero". The same vertices go through the same `transform` function with the
+same matrices, whether those matrices arrived as eight attributes or through a pointer, and
+floating-point arithmetic done the same way in the same order gives the same answer.
+
+That check is also what caught the transpose. Before the two `transpose` calls were written,
+the attribute path was the one that differed in 921,380 pixels.
+
+:::note[What moved into vkcommon]
+Nothing. Everything this chapter uses from `vkcommon` was already there:
+`upload_to_device_local` from 1.8, and `PipelineBuilder::vertex_input` from 1.7, which 1.8 used
+with a per-vertex binding and this chapter uses with a per-instance one.
+
+`GpuTimer` is new here and stays in this chapter's `main.cpp`. The next chapter times
+multisampling with it, and by the rule this series follows, that is when it moves into
+`vkcommon`.
+:::
+
+## What changed since 4.5
+
+- one draw call for many copies of a mesh: `instanceCount` and `firstInstance`
+- `SV_VulkanInstanceID`, and why not `SV_InstanceID`
+- per-instance data in a device-local buffer written once, next to 4.5's per-frame arena
+- instance-rate vertex input: `VK_VERTEX_INPUT_RATE_INSTANCE`, matrices as column attributes,
+  and the transpose that reassembles them
+- timestamp queries: a query pool, `vkCmdResetQueryPool` outside rendering, and
+  `vkCmdWriteTimestamp2`, `timestampPeriod` and `timestampValidBits`
+- a reproducible hash-based random number generator, and uniform area sampling
+- a procedural icosphere rock, flat-shaded
+- no descriptors at all
+- 31 chapters in the build now
+
+## Words introduced in this chapter
+
+| | |
+|---|---|
+| **instancing** | drawing many copies of one mesh with a single draw call |
+| **instance count** | `instanceCount`: how many copies one draw call produces |
+| **first instance** | `firstInstance`: the instance index the draw's first copy sees |
+| **instance index** | `InstanceIndex`, `SV_VulkanInstanceID`: which copy a vertex belongs to, counted from `firstInstance` |
+| **instance-rate vertex input** | a vertex buffer binding that advances once per instance instead of once per vertex |
+| **per-instance data** | what differs between copies — here a model matrix, a normal matrix and a colour |
+| **draw call overhead** | the fixed cost of one draw, on the CPU to record it and on the GPU to set it up |
+| **timestamp query** | a command that makes the GPU write its clock into a query pool when earlier work completes |
+| **query pool** | a `VkQueryPool`: an array of slots the device writes query results into |
+| **timestamp period** | nanoseconds per tick of the GPU's timestamp counter |
+| **hash function** | a function that scrambles its input so that nearby inputs give unrelated outputs |
+| **reproducible randomness** | random-looking numbers that are identical on every compiler and every run |
+| **uniform area sampling** | choosing points so that equal areas receive equal numbers of them; for a disc, r = √u |
+| **icosahedron** | the regular solid with 20 triangular faces, 12 corners and 30 edges |
+| **flat shading** | one normal per triangle, by giving each triangle its own vertices |
+
+## Exercises
+
+1. Change `SV_VulkanInstanceID` to `SV_InstanceID`, read the validation message, and then work
+   out on paper which instance each of the first three rocks reads. Confirm your answer
+   explains why the frame changes by only 14 pixels.
+2. Make the per-rock path push a fresh `PushConstants` before every draw, as 4.5 did, and
+   measure again in the release build. How much of a draw call's cost was the draw, and how
+   much is the push?
+3. Replace `std::sqrt(random.range(a², b²))` with `random.range(a, b)` and look at the belt from
+   directly above. Then work out the ratio of densities at the inner and outer edges from the
+   formula, and compare it with the table.
+4. Give the rocks three meshes instead of one — seeds 7, 8 and 9 — and draw them with three
+   instanced draws, each covering a third of the instance buffer through `firstInstance`. How
+   many draw calls is that, and what does it cost?
+5. Remove `written_` and the check on it, and run under the validation layers. What does the
+   first frame's `vkGetQueryPoolResults` return, and what do the layers say?
+6. The planet is instance 0 of the same buffer. Move it out into its own `Instance` pushed
+   through the frame arena instead. Which is simpler, and which would you rather have if there
+   were ten planets?
+
+Next: 4.7 turns to the edges of those rocks. At 1280×720 a rock is a few pixels across, and
+every one of its silhouette edges is a staircase that crawls as the belt turns — press
+<kbd>4</kbd> and watch. Multisampling is the fix, and `GpuTimer` is how the chapter measures
+what the fix costs.

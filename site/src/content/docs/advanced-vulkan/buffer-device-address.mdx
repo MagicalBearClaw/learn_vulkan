@@ -846,7 +846,7 @@ report every declared attribute a shader does not consume. Here the question can
 the pipeline describes no vertex layout, and each shader reads the fields it wants.
 
 The environment shader repeats the four struct declarations — Slang has no shared header
-between the two files yet, which 4.6 is about — and binds its cubemap at set 0:
+between the two files yet, which 4.8 is about — and binds its cubemap at set 0:
 
 ```slang title="code/src/4.advanced_vulkan/buffer_device_address/environment.slang"
 // 4.5 The sky and the mirrored sphere, reading their vertices and their frame constants
@@ -1588,7 +1588,7 @@ chapter that needs them can say so.
    answer for a scene this size is "no difference you can measure", and understanding why the
    technique is still worth it is the point of the exercise.
 
-Next: 4.6 turns to Slang itself — modules, generics and interfaces — because the scene
-shader and the environment shader in this chapter contain the same four struct declarations
-copied word for word, and that is exactly the kind of thing that stops being acceptable once
-the structs are the only contract left holding the two sides together.
+Next: 4.6 draws a hundred thousand copies of one mesh in a single call. The scene shader
+and the environment shader here still contain the same four struct declarations copied word
+for word — a problem 4.8 takes on with Slang's modules, generics and interfaces, once 4.9's
+compute shader makes a third file that has to agree with them.

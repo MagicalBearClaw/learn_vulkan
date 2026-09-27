@@ -178,6 +178,12 @@
       "sample": "4.advanced_vulkan/buffer_device_address",
       "previous": "4.advanced_vulkan/cubemaps",
       "article": "advanced-vulkan/buffer-device-address.mdx"
+    },
+    {
+      "id": "4.6.instancing",
+      "sample": "4.advanced_vulkan/instancing",
+      "previous": "4.advanced_vulkan/buffer_device_address",
+      "article": "advanced-vulkan/instancing.mdx"
     }
   ]
 }

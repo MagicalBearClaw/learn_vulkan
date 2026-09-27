@@ -110,7 +110,7 @@ cd site && npx astro build < /dev/null
   output that a distro's version bump can invalidate, so the library set has to be
   pinned. A missing library is a vcpkg error, not something CMake works around.
 - **Two presets on each platform.** `linux-debug` / `linux-release` and
-  `x64-debug` / `x64-release`. All of them build **all 30 chapters**, Part 3 included.
+  `x64-debug` / `x64-release`. All of them build **all 31 chapters**, Part 3 included.
   Verified by building every chapter warning-free and running `tools/capture.py --all`
   against the build tree: every chapter renders 0.00% different.
 - **Part 3 is no longer gated.** Assimp was once optional, because it is large and slow
