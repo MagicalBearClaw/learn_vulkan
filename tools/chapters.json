@@ -190,6 +190,12 @@
       "sample": "4.advanced_vulkan/anti_aliasing",
       "previous": "4.advanced_vulkan/instancing",
       "article": "advanced-vulkan/anti-aliasing.mdx"
+    },
+    {
+      "id": "4.8.slang_modules",
+      "sample": "4.advanced_vulkan/slang_modules",
+      "previous": "4.advanced_vulkan/anti_aliasing",
+      "article": "advanced-vulkan/slang-modules.mdx"
     }
   ]
 }

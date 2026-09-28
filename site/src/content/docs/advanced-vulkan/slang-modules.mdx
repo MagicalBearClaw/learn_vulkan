@@ -1,0 +1,805 @@
+---
+title: "Slang Modules"
+description: Shader code that is written once and imported everywhere it is needed. Modules and what `public` means in them, interfaces and generics for materials, a starfield that needs both — and a look at the SPIR-V to see what generics cost.
+sidebar:
+  order: 8
+---
+
+<figure>
+  <img src="/img/reference/4.8.slang_modules.png" alt="The banded planet and its belt of rocks against a black sky scattered with small white stars" />
+  <figcaption>Chapter 4.8. 4.7's belt, now in front of a sky of stars. The stars are the
+  visible change; the reason for them is a second shader file that has to agree with the
+  first.</figcaption>
+</figure>
+
+4.5 ended with a problem it did not solve. Its scene shader and its environment shader each
+declared the same four structs — the vertex, the globals, the per-object data and the push
+constants — word for word, and the C++ declared them a third time. With descriptors gone,
+those declarations were the only thing holding the three sides together, and nothing checked
+that the two shader copies agreed. Chapters 4.6 and 4.7 dodged the problem by having one
+shader file each.
+
+This chapter stops dodging it. The scene gains a second shader — a sky full of stars, drawn
+behind everything — which needs the same globals and push constants as the rocks and the
+planet. And 4.9's compute shader will need the instance struct as well. So the shared
+declarations move into a Slang **module**: a file compiled once, which any other shader file
+brings in with `import`. The chapter then uses two more Slang features, **interfaces** and
+**generics**, to write the lighting once for any material, and checks in the SPIR-V what that
+costs.
+
+Nothing about the rocks or the planet changes. With the stars switched off, this chapter's
+frame is 4.7's, pixel for pixel — that is checked at the end.
+
+- <kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd> <kbd>4</kbd> 1×, 2×, 4× or 8× multisampling
+- <kbd>5</kbd> sample shading
+- <kbd>6</kbd> spin the belt
+- <kbd>7</kbd> stars on or off
+- <kbd>-</kbd> / <kbd>=</kbd> fewer / more rocks
+
+## Four files
+
+4.7 had one shader file. This chapter has four, and the build file stages all of them:
+
+```cmake title="code/src/4.advanced_vulkan/slang_modules/CMakeLists.txt"
+add_chapter(4.8.slang_modules
+    SOURCES main.cpp
+    SHADERS scene.slang random.slang surfaces.slang stars.slang
+)
+```
+
+- `scene.slang` — a module: the shared structs, the push constants, the vertex transform
+  and the lighting.
+- `random.slang` — a module: 4.6's PCG hash, in Slang.
+- `surfaces.slang` — the rocks and the planet: two vertex-and-fragment programs, importing
+  `scene`.
+- `stars.slang` — the sky: importing `scene` and `random`.
+
+Only the last two have entry points, and only they are passed to `vkc::load_shader`. The
+modules are found by the compiler when something imports them.
+
+## A module
+
+Here is `scene.slang` from the top:
+
+```slang title="code/src/4.advanced_vulkan/slang_modules/scene.slang"
+// 4.8 The scene module: everything more than one shader file needs to agree on.
+//
+// A file that begins with `module` is a module, and other files bring it in with
+// `import scene;`. Two things change once a file says `module`: it is compiled as a unit
+// of its own rather than pasted into each file that imports it, and nothing in it is
+// visible to them unless it is marked `public` -- types, their fields, functions and
+// globals alike. What is not public is the module's own business.
+module scene;
+
+// The vertex, globals, instance and push constants that 4.7 declared in its one shader
+// file. They are declared once now, here, and every shader imports them. The C++ side
+// still has its own copies, and its static_asserts are still what keep the two in step.
+```
+
+`module scene;` makes the file a module named `scene`. Another file writes `import scene;`
+and every public declaration in it becomes visible there, as if it had been written in that
+file. Slang finds the file by the module name — `scene` is `scene.slang` — by looking along
+the session's **search path**, the list of directories to look in. 1.7 set that list when it
+wrote `vkc::load_shader`:
+
+```cpp title="code/common/scaffold/src/pipeline.cpp"
+const std::string search_path = shader_dir(chapter_id).string();
+const char* search_paths[]{search_path.c_str()};
+```
+
+It is the directory the chapter's shaders are staged into, `bin/shaders/4.8.slang_modules/`.
+That is why every module has to be in the `SHADERS` list: a module that is not staged is not
+there to be found, and the import fails.
+
+An `import` is not a textual include. C's `#include` pastes one file into another, so a header
+included by four files is compiled four times, and every name in it lands in the including
+file whether it wanted it or not. A Slang module is compiled as a unit of its own, and a
+session that has loaded it reuses it for every later import. (`vkc::load_shader` creates a
+fresh session for each file it is given, so in this sample `scene.slang` is in fact compiled
+twice — once for `surfaces.slang` and once for `stars.slang`. Sharing one session between
+loads would make it once; at this size it is not worth the change.) What the importing file
+can see is decided by the module, through an **access modifier** on each declaration.
+
+### `public`
+
+Once a file says `module`, its declarations are internal by default: usable inside the
+module and invisible outside it. A declaration another file is meant to use has to say
+**`public`**, and that includes a struct's fields, not just the struct:
+
+```slang title="code/src/4.advanced_vulkan/slang_modules/scene.slang"
+public struct Vertex {
+    public float3 position;
+    public float3 normal;
+    public float2 uv;
+};
+
+public struct Globals {
+    public float4x4 view;
+    public float4x4 projection;
+    public float4x4 belt;
+    public float4 view_position;
+    public float4 sun_direction;
+    public float4 sun_colour;
+    public float4 ambient;  // rgb ambient, w shininess
+};
+
+public struct Instance {
+    public float4x4 model;
+    public float3x3 normal_matrix;
+    public float4 colour;
+};
+
+public struct PushConstants {
+    public Globals* globals;
+    public Instance* instances;
+    public Vertex* vertices;
+};
+```
+
+Leave one `public` off — say the one on `PushConstants::vertices` — and the file that uses it
+is rejected:
+
+```text
+error[E30600]: declaration not accessible
+ --> surfaces.slang:8:27
+  |
+8 | return transform(push.vertices[vertex_id], push.instances[instance_id]);
+  |                       ^^^^^^^^ 'vertices' is not accessible from the current context.
+```
+
+The other way round is an error too. A public field inside a struct that is not public is
+refused with "cannot have a higher visibility than" its parent, because nothing outside could
+ever name the struct to reach the field.
+
+There is one more rule worth knowing, because it explains why earlier chapters never needed
+`public`. A file with no `module` line and no access modifiers anywhere in it is treated the
+old way: everything in it is visible to anything that imports it. The first `public` or
+`module` switches the file to the new rules, and then everything else in it becomes internal.
+Tested with Slang 2026.7.1, which is what this series builds against.
+
+These are the same structs as 4.7's, field for field. The C++ still declares its own copies,
+and its `static_assert`s on sizes and offsets are still what keeps the two languages in step.
+What the module removes is the duplication between shader files — which is the kind nothing
+was checking.
+
+### Globals in a module
+
+The push-constant block is declared in the module too:
+
+```slang title="code/src/4.advanced_vulkan/slang_modules/scene.slang"
+
+// One push-constant block for the whole program, whichever file declares the entry
+// point. A global declared in a module is still a global of every program that imports
+// it: the stars shader and the surface shader both reach this same block.
+public [[vk::push_constant]] PushConstants push;
+```
+
+A module can declare a global shader parameter, and every program that imports the module
+gets it. `surfaces.slang` and `stars.slang` are compiled into two different SPIR-V modules
+for two different pipelines, and each of them has a push-constant block with this layout.
+That is exactly what is wanted: both pipelines share one pipeline layout, with one
+24-byte push-constant range, and a push made for one is laid out correctly for the other.
+
+The vertex shader's output and the transform are 4.7's, now public:
+
+```slang title="code/src/4.advanced_vulkan/slang_modules/scene.slang"
+public struct VSOutput {
+    public float4 position : SV_Position;
+    [[vk::location(0)]] public float3 world_position;
+    [[vk::location(1)]] public float3 normal;
+    [[vk::location(2)]] public float3 colour;
+};
+
+public VSOutput transform(Vertex vertex, Instance instance) {
+    float4x4 model = mul(push.globals.belt, instance.model);
+
+    VSOutput output;
+    float4 world = mul(model, float4(vertex.position, 1.0));
+    output.world_position = world.xyz;
+    output.position = mul(push.globals.projection, mul(push.globals.view, world));
+    output.normal =
+        mul((float3x3)push.globals.belt, mul(instance.normal_matrix, vertex.normal));
+    output.colour = instance.colour.rgb;
+    return output;
+}
+```
+
+## An interface for materials
+
+4.7 had two fragment shaders, one for rocks and one for the planet, and they were the same
+lighting code with a different albedo. The shared part should be written once. What varies is
+two things: what colour the surface is at a point, and how strong its highlight is.
+
+An **interface** names exactly that and nothing else:
+
+```slang title="code/src/4.advanced_vulkan/slang_modules/scene.slang"
+// ---------------------------------------------------------------------------
+// Materials
+// ---------------------------------------------------------------------------
+
+// What a surface needs to say for the lighting to shade it. An interface names
+// requirements and nothing else: any struct that declares it conforms, and provides
+// these, can be handed to shade() below.
+public interface IMaterial {
+    // The surface's colour at this point, before lighting.
+    float3 albedo(VSOutput input);
+    // How much of the sun's colour the highlight reflects.
+    float specular_strength();
+};
+```
+
+`IMaterial` declares two methods and gives neither a body. Each is an **interface
+requirement**: something a type must provide to be a material. A struct becomes one by
+declaring it after a colon and then providing every requirement — that is **conformance**.
+
+The lighting is written against the interface:
+
+```slang title="code/src/4.advanced_vulkan/slang_modules/scene.slang"
+// 4.7's lighting, written once for every material. `M : IMaterial` makes shade() a
+// generic: one function per material type, generated by the compiler where it is used,
+// with the calls to albedo() and specular_strength() resolved at compile time. There is
+// no table of function pointers at run time; the article checks the SPIR-V to confirm it.
+public float3 shade<M : IMaterial>(M material, VSOutput input) {
+    float3 albedo = material.albedo(input);
+    float3 normal = normalize(input.normal);
+    float3 to_eye = normalize(push.globals.view_position.xyz - input.world_position);
+    float3 to_sun = normalize(-push.globals.sun_direction.xyz);
+
+    float diffuse_amount = max(dot(normal, to_sun), 0.0);
+    float3 diffuse = push.globals.sun_colour.rgb * diffuse_amount * albedo;
+
+    float3 reflected = reflect(-to_sun, normal);
+    float specular_amount =
+        pow(max(dot(to_eye, reflected), 0.0), push.globals.ambient.w);
+    float3 specular =
+        push.globals.sun_colour.rgb * specular_amount * material.specular_strength();
+
+    return push.globals.ambient.rgb * albedo + diffuse + specular;
+}
+```
+
+`shade<M : IMaterial>` is a **generic** function. `M` is a **type parameter**: a stand-in for a
+type that will be supplied at each call, with the constraint that whatever it is must conform
+to `IMaterial`. Inside the function, `M` is only known to be *some* material, so the only
+things that can be done with `material` are the things the interface promised:
+`material.albedo(input)` and `material.specular_strength()`. The rest is 4.7's lighting,
+unchanged except that `kSpecularStrength` has become the material's answer.
+
+The materials themselves live with the shaders that use them:
+
+```slang title="code/src/4.advanced_vulkan/slang_modules/surfaces.slang"
+// 4.8 The rocks and the planet: 4.7's shader, with its shared parts moved into `scene`.
+import scene;
+
+// 4.6's pointer path.
+[shader("vertex")]
+VSOutput vertexMain(uint vertex_id : SV_VulkanVertexID,
+                    uint instance_id : SV_VulkanInstanceID) {
+    return transform(push.vertices[vertex_id], push.instances[instance_id]);
+}
+
+// A rock is its instance's colour, with 4.6's modest highlight.
+struct RockMaterial : IMaterial {
+    float3 albedo(VSOutput input) { return input.colour; }
+    float specular_strength() { return 0.15; }
+};
+
+// 4.6's bands, as a material.
+struct BandedMaterial : IMaterial {
+    float3 albedo(VSOutput input) {
+        float height = normalize(input.world_position).y;
+        float band = 0.5 + 0.5 * sin(height * 14.0 + 1.3 * sin(height * 5.0));
+        return lerp(input.colour, float3(0.93, 0.83, 0.66), band * 0.55);
+    }
+    float specular_strength() { return 0.15; }
+};
+
+[shader("fragment")]
+float4 fragmentMain(VSOutput input) : SV_Target {
+    RockMaterial material;
+    return float4(shade(material, input), 1.0);
+}
+
+[shader("fragment")]
+float4 planetFragmentMain(VSOutput input) : SV_Target {
+    BandedMaterial material;
+    return float4(shade(material, input), 1.0);
+}
+```
+
+`RockMaterial` is the instance colour and a 0.15 highlight, which is exactly what 4.7 did for
+rocks. `BandedMaterial` is 4.6's latitude bands, moved out of the fragment shader into the
+material, with the same 0.15. Each fragment entry point makes its material and hands it to
+`shade`. Slang works out `M` from the argument, so `shade(material, input)` needs no `<...>`.
+
+The file starts with `import scene;` and no `module` line of its own. It is not imported by
+anything; it is what `vkc::load_shader` is given, and its three entry points are what the two
+pipelines use.
+
+Conformance is checked when the material is declared, not when it is used. Take
+`specular_strength` out of `BandedMaterial` and:
+
+```text
+error[E38100]: missing interface member
+  --> surfaces.slang:18:25
+   |
+18 | struct BandedMaterial : IMaterial {
+   |                         ^^^^^^^^^ type 'BandedMaterial' does not provide required interface member 'specular_strength'
+```
+
+### What a generic costs
+
+A generic function in C++ is a template, and each use with a new type stamps out a new copy.
+A generic in Slang is type-checked once, against the interface — which is why the error above
+names the interface requirement rather than failing somewhere inside `shade` — and then, when
+compiling to SPIR-V, each use with a concrete type is turned into its own copy of the
+function: **generic specialisation**. The call `material.albedo(input)` in the `RockMaterial`
+copy is a call to `RockMaterial.albedo`, known at compile time. That is **static dispatch**: no
+table of functions to look up at run time, because there is nothing left to decide at run time.
+
+It is checkable. Compiling `surfaces.slang` with the same options `vkc::load_shader` uses —
+SPIR-V 1.6, direct emission, entry-point names kept, column-major matrices, standard debug
+information — and disassembling the result with `spirv-dis`:
+
+```text
+ %vertexMain = OpFunction %void None %18
+%fragmentMain = OpFunction %void None %18
+%planetFragmentMain = OpFunction %void None %18
+```
+
+Those are the only three functions in the module, and it contains no `OpFunctionCall` at all.
+`shade`, both materials' `albedo` and `specular_strength`, and `transform` from the vertex
+shader have all been **inlined**: their bodies copied into the entry points that call them.
+The interface and the generic exist in the source and nowhere in what the GPU runs. They cost
+nothing at run time; what they cost is compile time and binary size, one copy per material.
+
+## A module of random numbers
+
+The stars need random numbers, and they need them on the GPU. 4.6 wrote a PCG hash in C++;
+here it is in Slang, as a module of its own:
+
+```slang title="code/src/4.advanced_vulkan/slang_modules/random.slang"
+// 4.8 The PCG hash from 4.6, in Slang.
+//
+// The same three constants and the same shifts as pcg_hash() in main.cpp, so the same
+// input gives the same 32 bits on the GPU as on the CPU -- unsigned arithmetic wraps at
+// 2^32 in both languages. A module of its own, because nothing about hashing belongs to
+// the scene: 4.8's stars use it, and 4.9's compute shader will.
+module random;
+
+public uint pcg_hash(uint input) {
+    uint state = input * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+// A float in [0, 1) from a hash, by the same 24-bit route as the C++ Random::next().
+public float unit_float(uint hash) {
+    return float(hash >> 8u) * (1.0 / 16777216.0);
+}
+```
+
+The same constants, the same shifts. A Slang `uint` is 32 bits, and SPIR-V's integer
+arithmetic keeps the low 32 bits of each result, which is exactly C++'s unsigned wrap-around —
+so the two functions should agree bit for bit. That was checked on the GPU, with a temporary
+fragment shader that painted the sky red if `pcg_hash(0)`, `pcg_hash(1)` and
+`pcg_hash(pcg_hash(7))` equalled the C++ values (the first two are 4.6's `static_assert`s;
+the third, `0x80a6e29d`, came from the Python mirror of the function), and blue if not. It
+was red.
+
+`unit_float` is 4.6's `Random::next()` conversion: the top 24 bits, scaled by 2⁻²⁴.
+`1.0 / 16777216.0` is that scale written out, because 2²⁴ = 16,777,216.
+
+It is a separate module rather than part of `scene` because hashing has nothing to do with
+the scene. A module is the unit of reuse: a file that wants random numbers should not have to
+take the planet's lighting with them. 4.9's compute shader will import it.
+
+## The stars
+
+```slang title="code/src/4.advanced_vulkan/slang_modules/stars.slang"
+// 4.8 A procedural starfield behind everything, from one triangle.
+import scene;
+import random;
+
+struct StarsOutput {
+    float4 position : SV_Position;
+    [[vk::location(0)]] float2 ndc;
+};
+
+// 4.3's fullscreen triangle, placed on the far plane: z = w = 1 is depth 1.0, which the
+// depth test lets through only where nothing nearer was drawn.
+[shader("vertex")]
+StarsOutput starsVertexMain(uint vertex_id : SV_VulkanVertexID) {
+    float2 uv = float2((vertex_id << 1) & 2, vertex_id & 2);
+    StarsOutput output;
+    output.ndc = uv * 2.0 - 1.0;
+    output.position = float4(output.ndc, 1.0, 1.0);
+    return output;
+}
+```
+
+The stars are drawn as 4.3 drew its post-processing pass: one triangle big enough to cover the
+screen, made by the vertex shader from its index, with no vertex buffer. The difference is
+the depth. The position's *z* and *w* are both 1, so after the perspective divide the
+triangle is at depth 1.0 — the far plane, and also the value the depth buffer is cleared to.
+Drawn last, with a depth test of less-or-equal, it survives only where nothing was drawn in
+front of it: the sky. `ndc` passes the pixel's normalised device coordinates to the fragment
+shader, interpolated across the triangle.
+
+### A ray through every pixel
+
+The fragment shader needs to know which direction in the world each pixel looks along — its
+**view ray** — because a star is a direction, not a position: it is infinitely far away and
+does not move when the camera does, only when it turns.
+
+```slang title="code/src/4.advanced_vulkan/slang_modules/stars.slang"
+// The space around the eye is cut into cubes 1/kCells on a side. A unit direction lands
+// in exactly one of them, and each cube holds a star with probability kStarChance.
+static const float kCells = 240.0;
+static const float kStarChance = 0.08;
+
+[shader("fragment")]
+float4 starsFragmentMain(StarsOutput input) : SV_Target {
+    // The direction through this pixel, in view space and then in world space. For a
+    // symmetric perspective projection, NDC x and y are the view-space direction's x/-z
+    // and y/-z scaled by the projection's two diagonal terms, so dividing by them undoes
+    // it. The view matrix's rotation is orthonormal, so its inverse is its transpose.
+    float4x4 projection = push.globals.projection;
+    float3 view_direction =
+        float3(input.ndc.x / projection[0][0], input.ndc.y / projection[1][1], -1.0);
+    float3 direction =
+        normalize(mul(transpose((float3x3)push.globals.view), view_direction));
+```
+
+1.13's perspective projection maps a view-space point (*x*, *y*, *z*) to clip space with its
+two diagonal terms, `P[0][0]` for *x* and `P[1][1]` for *y*, and puts −*z* in *w*:
+
+```text
+clip.x = P00 · x          clip.w = −z
+clip.y = P11 · y
+
+ndc.x = clip.x / clip.w = P00 · x / (−z)
+ndc.y = clip.y / clip.w = P11 · y / (−z)
+```
+
+For the direction with *z* = −1 — one unit straight ahead — the divide by −*z* disappears,
+and each line solves for the direction:
+
+```text
+x = ndc.x / P00        y = ndc.y / P11        z = −1
+```
+
+That is the `view_direction` line. `P11` carries the sign of 1.13's y-flip, so the division
+undoes the flip too. This only works for a symmetric projection like `glm::perspective`'s,
+where the other terms in the first two rows are zero.
+
+Then from view space to world space. The view matrix's upper 3×3 is a rotation, from world
+to view; the inverse rotation takes view to world, and for a rotation the inverse is the
+transpose, as 4.6 used for the belt. The camera's translation plays no part, because a
+direction has no position. `normalize` makes it a unit vector.
+
+### A star in every so many cells
+
+```slang title="code/src/4.advanced_vulkan/slang_modules/stars.slang"
+    // The cell this direction lands in, and that cell's star, if it has one.
+    int3 cell = int3(floor(direction * kCells));
+    uint seed = pcg_hash(uint(cell.x) ^ pcg_hash(uint(cell.y) ^ pcg_hash(uint(cell.z))));
+    if (unit_float(seed) > kStarChance) {
+        return float4(0.0, 0.0, 0.0, 0.0);
+    }
+    uint h1 = pcg_hash(seed);
+    uint h2 = pcg_hash(h1);
+    uint h3 = pcg_hash(h2);
+    float3 centre = normalize((float3(cell) +
+                               float3(unit_float(h1), unit_float(h2), unit_float(h3))) /
+                              kCells);
+
+    // Brightness falls off with the angle from the star's centre, measured in cells.
+    float distance = length(direction - centre) * kCells;
+    float brightness = unit_float(pcg_hash(h3));
+    float glow = saturate(1.0 - distance * 3.0) *
+                 (0.15 + 0.85 * brightness * brightness * brightness);
+    return float4(glow.xxx, 1.0);
+}
+```
+
+The space around the eye is cut into cubes 1/240 of a unit on a side. The unit direction
+lands in one of them, and `floor(direction * kCells)` names it by three integers. Hashing the
+three together — each hashed into the next — gives a number that is the same for every pixel
+whose ray lands in that cube, and unrelated for its neighbours. If that number, as a float,
+is above `kStarChance`, the cube is empty and the pixel returns black. Otherwise the cube has
+a star: three more hashes place its centre at a random point in the cube, and a fourth picks
+its brightness, cubed so that most stars are faint and a few are bright.
+
+The glow falls off with the distance between the ray and the star's direction, measured in
+cells, and reaches zero a third of a cell out. A cell is 1/240 of a unit across at a distance
+of about one unit, so it subtends roughly 0.24°; the 45° field of view spread over 720 rows
+puts a pixel at 0.0625°. A cell is about four pixels, and a star, a third of a cell in radius,
+is two or three pixels across. It is a sketch rather than a sky: a star near the edge of
+its cube is cut off where its neighbours' rays start looking in different cubes, and fixing
+that means checking the neighbouring cubes too, which is exercise 4.
+
+Every pixel's result is deterministic — a function of its direction and nothing else — so the
+sky is the same every run and on every machine, and it turns with the camera as a sky should.
+
+## The C++
+
+Very little changes. The file opens with its new keys:
+
+```cpp title="code/src/4.advanced_vulkan/slang_modules/main.cpp"
+// 4.8 Slang modules
+//
+// 4.7's belt, with a sky full of stars behind it -- and underneath, shaders that stop
+// repeating themselves.
+//
+// Until now each chapter had one shader file, or two that declared the same structs word
+// for word. This chapter's shaders are four files: two modules that hold what is shared,
+// and two that import them. The C++ changes very little: which files it loads, and one
+// more pipeline for the stars.
+//
+//   1 2 3 4   1x, 2x, 4x, 8x multisampling
+//   5         sample shading
+//   6         spin the belt
+//   7         stars on or off
+//   - =       fewer / more rocks
+```
+
+The class is renamed for the chapter:
+
+```cpp title="code/src/4.advanced_vulkan/slang_modules/main.cpp"
+// ---------------------------------------------------------------------------
+// The sample
+// ---------------------------------------------------------------------------
+
+class SlangModulesApp : public vkc::App {
+public:
+    using vkc::App::App;
+
+protected:
+```
+
+`on_start` logs the new key:
+
+```cpp title="code/src/4.advanced_vulkan/slang_modules/main.cpp"
+        spdlog::info("1-4 1x/2x/4x/8x, 5 sample shading, 6 spin the belt, 7 stars, "
+                     "-/= rock count.");
+```
+
+and <kbd>7</kbd> toggles a flag:
+
+```cpp title="code/src/4.advanced_vulkan/slang_modules/main.cpp"
+            case SDL_SCANCODE_6:
+                spinning_ = !spinning_;
+                break;
+            case SDL_SCANCODE_7:
+                stars_ = !stars_;
+                break;
+```
+
+The stars are drawn last, inside the same rendering pass:
+
+```cpp title="code/src/4.advanced_vulkan/slang_modules/main.cpp"
+        vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, rock_pipeline_);
+        vkCmdBindIndexBuffer(frame.cmd, rock_.indices.handle(), 0, VK_INDEX_TYPE_UINT16);
+        push(frame.cmd, globals, rock_.vertex_address);
+        vkCmdDrawIndexed(frame.cmd, rock_.index_count, rock_count(), 0, 0, kFirstRock);
+
+        // Last, so the depth test can reject every pixel something nearer already covers.
+        // Three vertices and no buffers: the shader makes the triangle from its index.
+        if (stars_) {
+            vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                              stars_pipeline_);
+            vkCmdDraw(frame.cmd, 3, 1, 0, 0);
+        }
+
+        vkCmdEndRendering(frame.cmd);
+        timer_.end(frame.cmd, slot);
+    }
+```
+
+`vkCmdDraw` rather than `vkCmdDrawIndexed`: three vertices, one instance, no index buffer.
+The push constants were pushed for the rocks and have not changed, and the stars read only
+`push.globals` from them — the same address, in the same block, which is the module's promise
+kept.
+
+### Pipelines
+
+```cpp title="code/src/4.advanced_vulkan/slang_modules/main.cpp"
+    // 4.7's pipelines, from the shader files that import the modules. load_shader is
+    // given the file with the entry points; Slang finds `scene` and `random` itself, in
+    // the same directory, because that directory is the session's search path.
+    void create_pipelines() {
+        const VkDevice device = context().device();
+        const VkShaderModule shader =
+            vkc::load_shader(device, LVK_CHAPTER_ID, "surfaces.slang");
+
+        const auto base = [&]() -> vkc::PipelineBuilder {
+            return vkc::PipelineBuilder(device)
+                .colour_attachment(swapchain().format())
+                .cull(VK_CULL_MODE_BACK_BIT, VK_FRONT_FACE_COUNTER_CLOCKWISE)
+                .depth(depth_format_, /*test=*/true, /*write=*/true)
+                .multisample(samples_, sample_shading_ ? 1.0F : 0.0F)
+                .layout(pipeline_layout_);
+        };
+
+        rock_pipeline_ = base().shaders(shader).build();
+        planet_pipeline_ =
+            base().shaders(shader, "vertexMain", "planetFragmentMain").build();
+
+        vkDestroyShaderModule(device, shader, nullptr);
+
+        // The stars add light to whatever is behind them rather than replacing it:
+        // colour = 1 x star + 1 x background, so a pixel with no star in it, whose
+        // shader returns zero, is left exactly as the clear colour made it. No depth
+        // write, and LESS_OR_EQUAL, because the stars sit at depth 1.0, which is also
+        // what the depth buffer was cleared to.
+        const VkPipelineColorBlendAttachmentState additive{
+            .blendEnable = VK_TRUE,
+            .srcColorBlendFactor = VK_BLEND_FACTOR_ONE,
+            .dstColorBlendFactor = VK_BLEND_FACTOR_ONE,
+            .colorBlendOp = VK_BLEND_OP_ADD,
+            .srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
+            .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+            .alphaBlendOp = VK_BLEND_OP_ADD,
+            .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                              VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+        };
+        const VkShaderModule stars_shader =
+            vkc::load_shader(device, LVK_CHAPTER_ID, "stars.slang");
+        stars_pipeline_ =
+            vkc::PipelineBuilder(device)
+                .shaders(stars_shader, "starsVertexMain", "starsFragmentMain")
+                .colour_attachment(swapchain().format())
+                .cull(VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE)
+                .depth(depth_format_, /*test=*/true, /*write=*/false,
+                       VK_COMPARE_OP_LESS_OR_EQUAL)
+                .colour_blend(additive)
+                .multisample(samples_, sample_shading_ ? 1.0F : 0.0F)
+                .layout(pipeline_layout_)
+                .build();
+        vkDestroyShaderModule(device, stars_shader, nullptr);
+
+        context().name(rock_pipeline_, VK_OBJECT_TYPE_PIPELINE, "rocks");
+        context().name(planet_pipeline_, VK_OBJECT_TYPE_PIPELINE, "planet");
+        context().name(stars_pipeline_, VK_OBJECT_TYPE_PIPELINE, "stars");
+    }
+
+    void destroy_pipelines() {
+        vkDestroyPipeline(context().device(), stars_pipeline_, nullptr);
+        vkDestroyPipeline(context().device(), planet_pipeline_, nullptr);
+        vkDestroyPipeline(context().device(), rock_pipeline_, nullptr);
+    }
+```
+
+The surfaces load from `surfaces.slang`, which is the only change to 4.7's two pipelines. The
+stars get a pipeline of their own from `stars.slang`, with four differences from the others:
+
+- No culling. One triangle, and which way it winds does not matter.
+- Depth test on, depth write off, compare `VK_COMPARE_OP_LESS_OR_EQUAL`. Less-or-equal because
+  the triangle is at exactly the cleared depth, 1.0, and plain less would reject it everywhere.
+  No write because nothing is drawn after it that could care.
+- **Additive blending**. 4.2 built blend states for transparency, where the new colour replaces
+  some fraction of the old. Here `VK_BLEND_FACTOR_ONE` on both sides with `VK_BLEND_OP_ADD`
+  makes the result the sum: star plus whatever was there. A pixel without a star returns zero
+  and is left exactly as it was — so the background stays the clear colour, and a star on a
+  partly covered edge pixel adds only to the samples that see sky. Alpha is kept as it was:
+  zero times the source, one times the destination. `VK_COLOR_COMPONENT_R_BIT` through
+  `VK_COLOR_COMPONENT_A_BIT` enable writing all four channels.
+- The same sample count and sample shading as the rest, because every pipeline in a rendering
+  pass must match its attachments.
+
+It uses 4.2's `colour_blend()` pass-through to hand `PipelineBuilder` the whole
+`VkPipelineColorBlendAttachmentState`.
+
+The members gain the pipeline and the flag, and `main` names the chapter:
+
+```cpp title="code/src/4.advanced_vulkan/slang_modules/main.cpp"
+    bool sample_shading_ = false;
+    vkc::Image colour_;
+    vkc::Image depth_;
+
+    std::array<FrameArena, vkc::kFramesInFlight> arenas_;
+    vkc::GpuTimer timer_;
+
+    VkPipelineLayout pipeline_layout_ = VK_NULL_HANDLE;
+    VkPipeline rock_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline planet_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline stars_pipeline_ = VK_NULL_HANDLE;
+
+    size_t count_index_ = kDefaultRockCount;
+    bool spinning_ = false;
+    bool stars_ = true;
+    float belt_angle_ = 0.0F;
+
+    double gpu_ms_ = 0.0;
+    uint32_t gpu_samples_ = 0;
+    float stats_started_ = 0.0F;
+};
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    try {
+        vkc::App::Options options{};
+        options.title = "LearnVulkan 4.8 - Slang modules";
+        SlangModulesApp app(vkc::App::parse_args(argc, argv, options));
+        return app.run();
+    } catch (const std::exception& error) {
+        spdlog::error("{}", error.what());
+        return EXIT_FAILURE;
+    }
+}
+```
+
+## Checking it against the previous chapter
+
+The rocks and the planet went through a complete restructuring of their shader code: new
+files, a module, an interface, a generic. The claim is that none of it changed a single
+computation.
+
+With the stars switched off, this chapter's frame against 4.7's reference image: **0 of
+921,600 pixels differ.**
+
+With the stars on, 14,988 pixels differ, and in every one of them every channel is brighter
+than or equal to 4.7's — never darker, as additive blending promises. 14,662 of them were pure
+background colour in 4.7. The other 326 were edge pixels, part rock or planet and part sky;
+with 4× multisampling, depth is tested per sample, so a star adds light to the sky samples of
+such a pixel and not to the rest.
+
+:::note[What moved into vkcommon]
+Nothing. `vkc::load_shader` has set the chapter's shader directory as the Slang search path
+since 1.7, which is all `import` needs, and `PipelineBuilder::colour_blend` is 4.2's.
+:::
+
+## What changed since 4.7
+
+- the shared structs, the push-constant block, the transform and the lighting in a module,
+  `scene.slang`, imported by both shader files
+- `module`, `import` and `public`, and how a module's declarations become visible
+- an `IMaterial` interface, two conforming materials, and a generic `shade<M : IMaterial>`
+- the PCG hash in Slang, as a module of its own, checked bit for bit against the C++
+- a procedural starfield: a fullscreen triangle at the far plane, view rays from the
+  projection's diagonal, hashed cells, and additive blending
+- 33 chapters in the build now
+
+## Words introduced in this chapter
+
+| | |
+|---|---|
+| **module** | a Slang file declared with `module name;`, compiled once and brought into others with `import` |
+| **import** | `import name;`: make a module's public declarations visible in this file |
+| **search path** | the directories Slang looks in to find a module by name |
+| **access modifier** | a keyword that sets who can see a declaration: `public`, `internal`, `private` |
+| **public** | visible to any file that imports the module; needed on types and their fields alike |
+| **interface** | a named set of requirements a type can promise to meet |
+| **interface requirement** | one method (or other member) an interface demands |
+| **conformance** | a type declaring an interface and providing all its requirements |
+| **generic** | a function or type written once over a type parameter |
+| **type parameter** | the stand-in type in a generic, like `M` in `shade<M : IMaterial>` |
+| **generic specialisation** | the compiler producing a separate copy of a generic for each concrete type used |
+| **static dispatch** | a call whose target is decided at compile time, with no run-time lookup |
+| **inlining** | replacing a call with a copy of the called function's body |
+| **additive blending** | blending with factors one and one, so the new colour is added to the old |
+| **view ray** | the direction in the world that one pixel looks along |
+
+## Exercises
+
+1. Remove `public` from `Globals::sun_colour` and predict which file the error names. Then
+   remove it from `IMaterial` instead. Then remove the `module scene;` line and every `public`
+   from `scene.slang`, and explain why it compiles again.
+2. Add a third material — ice, with a pale blue albedo and a highlight of 0.6 — and give it to
+   every tenth rock. You will need a way to tell a rock which material it is; the instance
+   colour's alpha is unused.
+3. Disassemble your build of `surfaces.slang` after exercise 2 and count the functions. Does
+   adding a material add a function, and if not, where did its code go?
+4. Fix the stars cut off at cube edges: look up the star in the neighbouring cubes as well as
+   the ray's own, and keep the brightest glow. How many neighbours does a star within a third
+   of a cell of the edge need?
+5. Turn the camera slowly and watch the faintest stars. Then press <kbd>5</kbd> and do it
+   again. Why can sample shading make a difference to the stars when it made almost none to
+   the rocks?
+
+Next: 4.9 makes the belt move the way a belt should. Every rock follows its own orbit, at its
+own speed, which means a new matrix for every rock every frame — a hundred thousand of them.
+That is work for the GPU's other kind of pipeline: compute. Its shader will `import scene;`
+for the `Instance` it writes and `import random;` for the orbits it invents.
