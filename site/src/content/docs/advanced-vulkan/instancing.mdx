@@ -548,17 +548,19 @@ and the belt is a loop:
                                  random.range(-0.5F, 0.5F) * kBeltThickness,
                                  radius * std::sin(angle)};
 
-        const glm::vec3 axis = glm::normalize(glm::vec3(random.range(-1.0F, 1.0F),
+        const glm::vec3 axis = glm::normalize(glm::vec3{random.range(-1.0F, 1.0F),
                                                         random.range(-1.0F, 1.0F),
-                                                        random.range(0.1F, 1.0F)));
+                                                        random.range(0.1F, 1.0F)});
         const float spin = random.range(0.0F, 2.0F * std::numbers::pi_v<float>);
 
         // Non-uniform: each axis is stretched on its own, which is what makes the normal
-        // matrix necessary.
+        // matrix necessary. Braces, not parentheses, around every list of random.range()
+        // calls: the order a function's arguments are evaluated in is unspecified, and the
+        // order of a braced list's elements is not. See the article.
         const float size = random.range(kRockMinSize, kRockMaxSize);
-        const glm::vec3 scale = size * glm::vec3(random.range(0.6F, 1.4F),
+        const glm::vec3 scale = size * glm::vec3{random.range(0.6F, 1.4F),
                                                  random.range(0.6F, 1.4F),
-                                                 random.range(0.6F, 1.4F));
+                                                 random.range(0.6F, 1.4F)};
 
         const glm::mat4 model = glm::scale(
             glm::rotate(glm::translate(glm::mat4(1.0F), position), spin, axis), scale);
@@ -634,6 +636,31 @@ The rest of the loop:
   As 2.2 showed, a normal transformed by a non-uniformly scaling matrix stops being
   perpendicular to its surface, and the inverse transpose is what fixes that.
 - The colour is a grey, pushed a little towards warm by a random amount.
+
+Look at how the axis and the scale are built: `glm::vec3{...}`, with braces, around three calls
+to `random.range`. With parentheses it would still compile, and it would quietly undo this
+section's point. The three calls each advance the generator, so which one runs first decides
+which number lands in *x*. For a function call — and `glm::vec3(a, b, c)` is a constructor
+call — the standard leaves that open: "The initialization of a parameter … is indeterminately
+sequenced with respect to that of any other parameter" ([expr.call]/8). For a braced list it
+does not: "the initializer-clauses … are evaluated in the order in which they appear"
+([dcl.init.list]/4), and a note there adds that this holds even when the list becomes the
+arguments of a constructor.
+
+It is not a theoretical difference. A three-line test that builds one vector each way from a
+counter:
+
+```text
+clang++ 22.1.8:   parentheses 0 1 2    braces 0 1 2
+g++ 16.2.1:       parentheses 2 1 0    braces 0 1 2
+```
+
+GCC evaluates the parenthesised arguments right to left. This series builds with clang, so
+the belt would have looked right here and been a different belt on a GCC build — every rock's
+axis and stretch with their *x* and *z* swapped — which is exactly what reproducible randomness
+was supposed to rule out. With braces both compilers agree, as every conforming compiler must,
+and the screenshots did not change by a
+pixel when the parentheses were replaced, because clang had been using this order all along.
 
 The model matrix is built in the order 1.12 taught: `translate`, then `rotate`, then `scale`,
 each multiplied on the right. Applied to a vertex, that is scale first, rotate second,

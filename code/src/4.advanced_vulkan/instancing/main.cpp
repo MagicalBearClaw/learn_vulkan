@@ -352,17 +352,19 @@ struct Mesh {
                                  random.range(-0.5F, 0.5F) * kBeltThickness,
                                  radius * std::sin(angle)};
 
-        const glm::vec3 axis = glm::normalize(glm::vec3(random.range(-1.0F, 1.0F),
+        const glm::vec3 axis = glm::normalize(glm::vec3{random.range(-1.0F, 1.0F),
                                                         random.range(-1.0F, 1.0F),
-                                                        random.range(0.1F, 1.0F)));
+                                                        random.range(0.1F, 1.0F)});
         const float spin = random.range(0.0F, 2.0F * std::numbers::pi_v<float>);
 
         // Non-uniform: each axis is stretched on its own, which is what makes the normal
-        // matrix necessary.
+        // matrix necessary. Braces, not parentheses, around every list of random.range()
+        // calls: the order a function's arguments are evaluated in is unspecified, and the
+        // order of a braced list's elements is not. See the article.
         const float size = random.range(kRockMinSize, kRockMaxSize);
-        const glm::vec3 scale = size * glm::vec3(random.range(0.6F, 1.4F),
+        const glm::vec3 scale = size * glm::vec3{random.range(0.6F, 1.4F),
                                                  random.range(0.6F, 1.4F),
-                                                 random.range(0.6F, 1.4F));
+                                                 random.range(0.6F, 1.4F)};
 
         const glm::mat4 model = glm::scale(
             glm::rotate(glm::translate(glm::mat4(1.0F), position), spin, axis), scale);
