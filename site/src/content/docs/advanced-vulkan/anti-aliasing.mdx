@@ -1,0 +1,1161 @@
+---
+title: "Anti-aliasing"
+description: Why every edge so far has been a staircase, what a pixel ought to be instead, and multisampling — coverage per sample, shading per pixel, a resolve at the end — measured for what it fixes and what it costs.
+sidebar:
+  order: 7
+---
+
+<figure>
+  <img src="/img/reference/4.7.anti_aliasing.png" alt="The banded planet and its belt of rocks, as in the previous chapter, with smooth rather than stepped silhouettes" />
+  <figcaption>Chapter 4.7. 4.6's belt at 4× multisampling. Nothing about the scene changed;
+  every silhouette in it did.</figcaption>
+</figure>
+
+Look closely at any screenshot in this series and every edge is a staircase. The planet's
+limb climbs in one-pixel steps; a rock against the sky is a cluster of hard-edged squares.
+Press <kbd>4</kbd> in 4.6 to spin the belt and it gets worse: the steps crawl along each
+edge as the rocks move, and small rocks flicker in and out as they slip between pixel
+centres.
+
+That is **aliasing**, and this chapter is about the standard hardware fix for it. The scene
+is 4.6's, untouched — the belt, the rocks, the timer — and the whole change is in how the
+frame is rendered and what happens to it at the end. The keys:
+
+- <kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd> <kbd>4</kbd> render at 1, 2, 4 or 8 samples per
+  pixel (counts the GPU does not support are refused)
+- <kbd>5</kbd> sample shading: run the fragment shader for every sample, not every pixel
+- <kbd>6</kbd> spin the belt
+- <kbd>-</kbd> / <kbd>=</kbd> fewer / more rocks
+
+The build file names the new shader:
+
+```cmake title="code/src/4.advanced_vulkan/anti_aliasing/CMakeLists.txt"
+add_chapter(4.7.anti_aliasing
+    SOURCES main.cpp
+    SHADERS anti_aliasing.slang
+)
+```
+
+and the file opens with its purpose. The includes gain `<vkc/timer.hpp>`, because 4.6's
+`GpuTimer` has moved into `vkcommon`, and lose `<chrono>`, because this chapter times only
+the GPU:
+
+```cpp title="code/src/4.advanced_vulkan/anti_aliasing/main.cpp"
+// 4.7 Anti-aliasing
+//
+// 4.6's belt, with its edges fixed.
+//
+// A pixel is a square, and a rasteriser that asks one question per pixel -- is the
+// centre inside the triangle? -- can only answer yes or no. Every silhouette becomes a
+// staircase, and the staircase crawls as anything moves. Multisampling asks the
+// question at several points per pixel, keeps a colour and a depth for each, and
+// averages them at the end: an edge that covers three of four sample points comes out
+// three quarters of the way from the background to the rock.
+//
+//   1 2 3 4   1x, 2x, 4x, 8x multisampling (counts this GPU cannot do are refused)
+//   5         sample shading: run the fragment shader per sample, not per pixel
+//   6         spin the belt
+//   - =       fewer / more rocks
+//
+// Each second it logs what the whole frame's rendering, resolve included, cost the GPU.
+
+#include <vkc/app.hpp>
+#include <vkc/buffer.hpp>
+#include <vkc/camera.hpp>
+#include <vkc/check.hpp>
+#include <vkc/frame.hpp>
+#include <vkc/image.hpp>
+#include <vkc/pipeline.hpp>
+#include <vkc/timer.hpp>
+
+#include <SDL3/SDL.h>
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_inverse.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <spdlog/spdlog.h>
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstddef>
+#include <cstdlib>
+#include <cstring>
+#include <exception>
+#include <format>
+#include <map>
+#include <numbers>
+#include <span>
+#include <stdexcept>
+#include <utility>
+#include <vector>
+
+namespace {
+```
+
+`anti_aliasing.slang` is 4.6's shader without `attributeVertexMain` and its
+`InstanceAttributes`. Nothing in it changes for multisampling: which samples a triangle
+covers is decided by the rasteriser, the averaging by the attachment, and whether the
+fragment shader runs per pixel or per sample by the pipeline. The shader cannot tell.
+
+## What a pixel ought to be
+
+Every chapter so far has decided each pixel's colour by asking one question: is the pixel's
+*centre* inside the triangle? If yes, the fragment shader runs and the pixel takes its
+colour; if no, the pixel keeps whatever was there. A **sample** is a point at which that
+question is asked, and so far there has been one per pixel, at (0.5, 0.5) within it.
+
+But a pixel is not a point. It is a small square of the screen, and an edge crossing it covers
+some fraction of it. Call that fraction the pixel's **coverage**, *c*. The colour the square
+"should" have, if it is to show the average of what lies inside it, is
+
+```text
+pixel = c × rock + (1 − c) × background        0 ≤ c ≤ 1
+```
+
+One sample per pixel can only answer yes or no, so it rounds *c* to 0 or 1:
+
+```text
+one sample:   c is replaced by  0  if the centre is outside
+                                1  if the centre is inside
+              error in c:  up to 0.5 of the full contrast, at every edge pixel
+```
+
+That is where the staircase comes from. Along a nearly horizontal edge, *c* in successive
+pixels creeps from 0 to 1 over many pixels, and one sample per pixel turns that smooth ramp
+into a single jump at whichever pixel's centre the edge happens to cross. Move the edge by a
+fraction of a pixel and the jump moves by a whole pixel, which is the crawl. A rock smaller
+than a pixel covers no pixel centre at all for some positions and one for others, which is
+the flicker. The general name for this — detail finer than the sample spacing turning into
+false, coarser detail — is aliasing. **Anti-aliasing** is anything that reduces it.
+
+With *N* sample points per pixel, the estimate of *c* is the fraction of them inside the
+triangle:
+
+```text
+N samples:    c is replaced by  k / N,   k = number of samples inside, 0 … N
+              possible values:  N + 1
+              1×: 0, 1       2×: 0, ½, 1       4×: 0, ¼, ½, ¾, 1       8×: 0, ⅛, … , 1
+```
+
+Each doubling halves the size of the steps between edge levels. It does not make the edge
+exact — a 4× edge still has only five levels — but a staircase of five-level steps reads as
+a smooth line at normal viewing distance, and the crawl is a quarter the size.
+
+## Multisampling
+
+The obvious way to get *N* samples per pixel is to render at *N* times the resolution and
+average down. That is **supersampling**, and it works on everything: edges, textures,
+specular highlights. It also costs *N* times the fragment shading, because every one of
+those samples runs the fragment shader. 4.3's render-scale key did exactly this at 200%, for
+four times the pixels.
+
+**Multisampling** is the cheaper, narrower version the hardware supports directly:
+
+- The rasteriser tests **coverage** at *N* sample points per pixel. Each covered sample is
+  depth-tested on its own, against its own depth value.
+- The fragment shader still runs **once per pixel** — once per triangle per pixel, to be
+  exact — and its one output colour is written to every sample of that pixel that the
+  triangle covered and that passed its depth test.
+- At the end, a **resolve** averages each pixel's *N* samples into one colour.
+
+The effect is that edges get *N* samples' worth of coverage and depth, while the shading
+cost stays at one invocation per pixel. The storage does not stay the same: every sample
+keeps its own colour and its own depth, so the attachments are *N* times the size.
+
+Where the samples are is fixed, for the counts that matter here. When a device reports
+`VkPhysicalDeviceLimits::standardSampleLocations` as true — the RTX 4080 does — the
+specification lists the **sample pattern** each count uses, in fractions of a pixel from
+its top-left corner:
+
+```text
+1×:  (0.5, 0.5)
+2×:  (0.75, 0.75)  (0.25, 0.25)
+4×:  (0.375, 0.125)  (0.875, 0.375)  (0.125, 0.625)  (0.625, 0.875)
+
+      0    ¼    ½    ¾    1
+    0 ┌────┬────┬────┬────┐
+      │    │ •  │    │    │      the 4× pattern is a rotated grid: no two
+    ¼ ├────┼────┼────┼────┤      samples share a row or a column, so a
+      │    │    │    │ •  │      nearly horizontal or nearly vertical edge
+    ½ ├────┼────┼────┼────┤      crosses them one at a time and gets all
+      │ •  │    │    │    │      five coverage levels
+    ¾ ├────┼────┼────┼────┤
+      │    │    │ •  │    │
+    1 └────┴────┴────┴────┘
+```
+
+The rotation is the design. A plain 2×2 grid would put two samples on every row, and a
+horizontal edge would cross them in pairs, giving only three levels instead of five.
+
+## What vkcommon gains
+
+Three things in `vkcommon` assumed one sample per pixel, and each gains a way to ask for
+more. An image's sample count is part of how it is created, so `ImageDesc` gets a field:
+
+```cpp title="code/common/scaffold/include/vkc/image.hpp"
+    bool cube = false;
+    // Samples per pixel. Anything above 1 makes a multisampled image, which can be
+    // rendered into and resolved but not sampled like a texture. Chapter 4.7 is the
+    // first to ask for more than one.
+    VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
+};
+```
+
+and `vkc::Image` passes it into `VkImageCreateInfo`, where 1.11 had hard-coded
+`VK_SAMPLE_COUNT_1_BIT`:
+
+```cpp title="code/common/scaffold/src/image.cpp"
+        .mipLevels = desc_.mip_levels,
+        .arrayLayers = desc_.array_layers,
+        .samples = desc_.samples,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = desc_.usage,
+```
+
+A pipeline's sample count is baked into it too, in the
+`VkPipelineMultisampleStateCreateInfo` that 1.7 filled in with one sample and left alone
+since. `PipelineBuilder` gains a setter:
+
+```cpp title="code/common/scaffold/include/vkc/pipeline.hpp"
+    // Samples per pixel, which must match the attachments the pipeline renders into, and
+    // the fraction of them the fragment shader runs for. 0 leaves sample shading off:
+    // the shader runs once per pixel however many samples there are. Chapter 4.7
+    // explains both.
+    PipelineBuilder& multisample(VkSampleCountFlagBits samples,
+                                 float min_sample_shading = 0.0F);
+```
+
+```cpp title="code/common/scaffold/include/vkc/pipeline.hpp"
+    VkSampleCountFlagBits samples_ = VK_SAMPLE_COUNT_1_BIT;
+    float min_sample_shading_ = 0.0F;
+```
+
+```cpp title="code/common/scaffold/src/pipeline.cpp"
+PipelineBuilder& PipelineBuilder::multisample(VkSampleCountFlagBits samples,
+                                              float min_sample_shading) {
+    samples_ = samples;
+    min_sample_shading_ = min_sample_shading;
+    return *this;
+}
+```
+
+and `build()` uses what it was given:
+
+```cpp title="code/common/scaffold/src/pipeline.cpp"
+    const VkPipelineMultisampleStateCreateInfo multisample{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .rasterizationSamples = samples_,
+        .sampleShadingEnable = min_sample_shading_ > 0.0F ? VK_TRUE : VK_FALSE,
+        .minSampleShading = min_sample_shading_,
+        .pSampleMask = nullptr,
+        .alphaToCoverageEnable = VK_FALSE,
+        .alphaToOneEnable = VK_FALSE,
+    };
+```
+
+`rasterizationSamples` is the sample count, and must equal the sample count of every
+attachment the pipeline renders into. `sampleShadingEnable` and `minSampleShading` are the
+last section's subject; with the default of 0, sample shading stays off.
+
+The last is a device feature. Sample shading is optional hardware, and the pipeline that
+turns it on is rejected unless the device was created with it:
+
+```cpp title="code/common/scaffold/src/device.cpp"
+    features2.features.samplerAnisotropy = VK_TRUE;
+    // Running the fragment shader once per sample rather than once per pixel. Chapter
+    // 4.7 turns it on for one of its pipelines and measures what it costs.
+    features2.features.sampleRateShading = VK_TRUE;
+```
+
+`VkPhysicalDeviceFeatures::sampleRateShading` is in the Vulkan 1.0 feature struct, which
+chapter 1.3's device creation reaches through `VkPhysicalDeviceFeatures2::features`. Every chapter's device now has it,
+and every earlier chapter still renders exactly what it did — `tools/capture.py --all`
+finds all 31 unchanged.
+
+## Choosing a sample count
+
+Which counts a device supports is a limit, and there are two of them that matter here:
+
+```cpp title="code/src/4.advanced_vulkan/anti_aliasing/main.cpp"
+constexpr std::array<uint32_t, 7> kRockCounts{1'000,  2'000,  5'000,  10'000,
+                                              20'000, 50'000, 100'000};
+constexpr uint32_t kMaxRocks = kRockCounts.back();
+constexpr size_t kDefaultRockCount = 2;  // 5,000
+
+// What keys 1 to 4 ask for. VkSampleCountFlagBits values are the counts themselves, one
+// bit each, which is what lets a device report every count it supports as one mask.
+constexpr std::array<VkSampleCountFlagBits, 4> kSampleCounts{
+    VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_2_BIT, VK_SAMPLE_COUNT_4_BIT,
+    VK_SAMPLE_COUNT_8_BIT};
+constexpr VkSampleCountFlagBits kDefaultSamples = VK_SAMPLE_COUNT_4_BIT;
+```
+
+`VkSampleCountFlagBits` is an enum whose values are the counts themselves:
+`VK_SAMPLE_COUNT_1_BIT` is 1, `VK_SAMPLE_COUNT_2_BIT` is 2, `VK_SAMPLE_COUNT_4_BIT` is 4,
+`VK_SAMPLE_COUNT_8_BIT` is 8, each a single bit. That is what lets a device describe every count it supports as one mask
+— `VkSampleCountFlags` — and it is why the sample can print a count with a plain cast.
+
+`on_start` reads both masks. `framebufferColorSampleCounts` is what colour attachments
+support, `framebufferDepthSampleCounts` what depth attachments support, and a frame with
+both needs a count in both, so they are intersected with `&`:
+
+```cpp title="code/src/4.advanced_vulkan/anti_aliasing/main.cpp"
+// ---------------------------------------------------------------------------
+// The sample
+// ---------------------------------------------------------------------------
+
+class AntiAliasingApp : public vkc::App {
+public:
+    using vkc::App::App;
+
+protected:
+    void on_start() override {
+        const auto [sphere_vertices, sphere_indices] = make_sphere(48, 96, kPlanetRadius);
+        planet_ = upload_mesh(context(), sphere_vertices, sphere_indices);
+
+        const auto [rock_vertices, rock_indices] = make_rock(2, 0.18F, 7);
+        rock_ = upload_mesh(context(), rock_vertices, rock_indices);
+
+        const std::vector<Instance> instances = make_instances();
+        // Only SHADER_DEVICE_ADDRESS now: the instance-attribute path is gone, and
+        // nothing binds this buffer as a vertex buffer any more.
+        instances_ = vkc::upload_to_device_local(
+            context(), instances.data(), instances.size() * sizeof(Instance),
+            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+        instances_address_ = buffer_address(context().device(), instances_.handle());
+
+        depth_format_ = vkc::choose_depth_format(context().physical_device());
+
+        // Which sample counts this device can render with. A count has to be supported
+        // by both kinds of attachment the frame uses, so the two masks are intersected.
+        VkPhysicalDeviceProperties properties{};
+        vkGetPhysicalDeviceProperties(context().physical_device(), &properties);
+        supported_samples_ = properties.limits.framebufferColorSampleCounts &
+                             properties.limits.framebufferDepthSampleCounts;
+        spdlog::info("sample counts supported for colour and depth: mask 0x{:x}",
+                     supported_samples_);
+
+        for (FrameArena& arena : arenas_) {
+            arena.create(context(), kArenaBytes);
+        }
+        timer_.create(context());
+        create_layout();
+        create_targets(swapchain().extent());
+        create_pipelines();
+
+        camera_.position = {0.0F, 7.5F, 30.0F};
+        camera_.pitch = -14.0F;
+        camera_.speed = 8.0F;
+
+        spdlog::info("1-4 1x/2x/4x/8x, 5 sample shading, 6 spin the belt, "
+                     "-/= rock count.");
+    }
+
+    void on_resize(VkExtent2D extent) override { create_targets(extent); }
+```
+
+On the RTX 4080 the result is `0xf`: bits 1, 2, 4 and 8, so 1× to 8× are all available.
+16× is not in the mask. The default is 4×.
+
+The rest of `on_start` is 4.6's, with the instance buffer losing
+`VK_BUFFER_USAGE_VERTEX_BUFFER_BIT` — 4.6's instance-attribute path has served its purpose
+and is gone, along with the per-rock path and the CPU timer — and the pipeline layout split
+out of pipeline creation, because pipelines are now rebuilt at run time and the layout does
+not need to be.
+
+## The multisampled targets
+
+At 1×, the frame renders straight into the swapchain image, with a one-sample depth buffer,
+as every chapter so far has. At *N*×, it needs an *N*-sample colour image and an *N*-sample
+depth image of its own:
+
+```cpp title="code/src/4.advanced_vulkan/anti_aliasing/main.cpp"
+    // The attachments for the current sample count and window size.
+    //
+    // TRANSIENT_ATTACHMENT says the contents never outlive a rendering pass: they are
+    // cleared at the start, and not stored at the end. A GPU that renders in tiles can
+    // keep such an image entirely in on-chip memory and never give it real memory at all,
+    // if it is bound to a memory type with VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT. The
+    // article looks at whether this GPU has one.
+    void create_targets(VkExtent2D extent) {
+        context().wait_idle();
+
+        depth_ = vkc::Image(context(),
+                            vkc::ImageDesc{
+                                .format = depth_format_,
+                                .extent = extent,
+                                .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                                         VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT,
+                                .mip_levels = 1,
+                                .aspect = VK_IMAGE_ASPECT_DEPTH_BIT,
+                                .samples = samples_,
+                            });
+        colour_.destroy();
+        if (multisampled()) {
+            colour_ = vkc::Image(context(),
+                                 vkc::ImageDesc{
+                                     .format = swapchain().format(),
+                                     .extent = extent,
+                                     .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                              VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT,
+                                     .mip_levels = 1,
+                                     .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
+                                     .samples = samples_,
+                                 });
+        }
+
+        // Into their attachment layouts once, as 1.13 did for the depth buffer. Every
+        // frame clears them, so nothing they held before matters.
+        vkc::immediate_submit(context(), [&](VkCommandBuffer cmd) {
+            depth_.transition(cmd, VK_IMAGE_LAYOUT_UNDEFINED,
+                              VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
+            if (multisampled()) {
+                colour_.transition(cmd, VK_IMAGE_LAYOUT_UNDEFINED,
+                                   VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+            }
+        });
+    }
+```
+
+Both are ordinary `vkc::Image`s with `.samples` set. The colour image has the swapchain's
+format, so the resolve can write straight into the swapchain image — a resolve requires the
+two formats to match. The depth image is now created here rather than by 1.13's
+`vkc::create_depth_buffer`, which has no sample count to give. Both go into their attachment
+layouts once, through 1.8's `immediate_submit`, exactly as `create_depth_buffer` does it:
+every frame clears them, so their contents never need to survive a layout change.
+
+`VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT` is new. It promises that the image's contents never
+outlive a rendering pass — cleared when it begins, not stored when it ends — which is true of
+both images here. The promise matters on a **tile-based renderer**, the kind of GPU found in
+phones, which renders the screen in small tiles held in on-chip memory and writes each tile
+out only when it is finished. For a transient attachment it need not write anything out at
+all, and if the image is bound to a memory type with `VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT`
+— **lazily allocated memory** — it may never be given real memory in the first place. Eight
+samples of colour and depth would then cost nothing.
+
+On this GPU that does not happen: `vulkaninfo` lists no memory type with
+`LAZILY_ALLOCATED` at all, and the attachments get real memory. `vkGetImageMemoryRequirements`
+reports how much:
+
+| samples | colour image | depth image (`D32_SFLOAT`) |
+|---|---|---|
+| 1× | — (the swapchain image) | 3,932,160 B |
+| 2× | 7,864,320 B | 7,864,320 B |
+| 4× | 15,728,640 B | 15,728,640 B |
+| 8× | 31,457,280 B | 31,457,280 B |
+
+1280 × 720 × 4 bytes would be 3,686,400. The one-sample depth image is 3,932,160, which is
+1280 × 768 × 4: the driver has rounded the height up to 768 rows. From there the size is
+exactly proportional to the sample count, and at 8× the two attachments are 60 MiB — sixteen
+times what a 1× frame needs. On a desktop GPU with 16 GiB that is affordable. It is the
+first cost of multisampling, and the one no clever driver can remove here.
+
+The usage flag is still worth setting where the GPU ignores it: it is true, it costs nothing,
+and the same code run on a tiler gets the saving.
+
+`set_samples` refuses a count the device cannot do, and otherwise rebuilds both the
+attachments and the pipelines, because a pipeline's sample count must match its attachments'
+and cannot be changed after it is built:
+
+```cpp title="code/src/4.advanced_vulkan/anti_aliasing/main.cpp"
+    // A pipeline's sample count is baked in and has to match its attachments', so
+    // changing it means new attachments and new pipelines.
+    void set_samples(VkSampleCountFlagBits samples) {
+        if ((supported_samples_ & samples) == 0) {
+            spdlog::info("{}x is not supported here", static_cast<uint32_t>(samples));
+            return;
+        }
+        samples_ = samples;
+        create_targets(swapchain().extent());
+        rebuild_pipelines();
+    }
+```
+
+## Rendering, and resolving
+
+`vkc::begin_rendering` from 1.13 fills in a `VkRenderingAttachmentInfo` for colour and one for
+depth, and it has no way to ask for a resolve. So this chapter writes the rendering info out
+again, as 1.13 did before it moved into `vkcommon`:
+
+```cpp title="code/src/4.advanced_vulkan/anti_aliasing/main.cpp"
+private:
+    [[nodiscard]] uint32_t rock_count() const { return kRockCounts[count_index_]; }
+
+    [[nodiscard]] bool multisampled() const { return samples_ != VK_SAMPLE_COUNT_1_BIT; }
+
+    // ---------------------------------------------------------------------------
+    // Rendering into many samples, and resolving them into one
+    // ---------------------------------------------------------------------------
+
+    // vkc::begin_rendering from 1.13 cannot say "resolve", so the rendering info is
+    // written out here, as it was in 1.13 before it moved into vkcommon.
+    //
+    // At 1x the swapchain image is the colour attachment, as it has been all series.
+    // Multisampled, the frame renders into colour_ -- several samples per pixel -- and
+    // the resolve fields say what to do with them when rendering ends: average each
+    // pixel's samples and write the result into the swapchain image. After that the
+    // samples themselves are never read again, so they are not stored.
+    void begin_rendering(const vkc::FrameInfo& frame) {
+        const VkRenderingAttachmentInfo colour{
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .pNext = nullptr,
+            .imageView = multisampled() ? colour_.view() : frame.view,
+            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .resolveMode =
+                multisampled() ? VK_RESOLVE_MODE_AVERAGE_BIT : VK_RESOLVE_MODE_NONE,
+            .resolveImageView = multisampled() ? frame.view : VK_NULL_HANDLE,
+            .resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp = multisampled() ? VK_ATTACHMENT_STORE_OP_DONT_CARE
+                                      : VK_ATTACHMENT_STORE_OP_STORE,
+            .clearValue = {.color = {{0.01F, 0.012F, 0.02F, 1.0F}}},
+        };
+
+        // Depth is multisampled too -- each sample is depth-tested on its own -- and is
+        // never resolved. Nothing reads it after the pass.
+        const VkRenderingAttachmentInfo depth{
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .pNext = nullptr,
+            .imageView = depth_.view(),
+            .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+            .resolveMode = VK_RESOLVE_MODE_NONE,
+            .resolveImageView = VK_NULL_HANDLE,
+            .resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            .clearValue = {.depthStencil = {1.0F, 0}},
+        };
+
+        const VkRenderingInfo rendering{
+            .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .renderArea = {{0, 0}, frame.extent},
+            .layerCount = 1,
+            .viewMask = 0,
+            .colorAttachmentCount = 1,
+            .pColorAttachments = &colour,
+            .pDepthAttachment = &depth,
+            .pStencilAttachment = nullptr,
+        };
+        vkCmdBeginRendering(frame.cmd, &rendering);
+    }
+```
+
+The colour attachment's fields that 1.13 left at their "no resolve" values now matter:
+
+- `imageView` is the multisampled image when there is one, and the swapchain image when not.
+- `resolveMode` is `VK_RESOLVE_MODE_AVERAGE_BIT`: when rendering ends, average each pixel's
+  samples. At 1× it is `VK_RESOLVE_MODE_NONE`, which is what it has always been.
+- `resolveImageView` is where the averages go — the swapchain image, the **resolve
+  attachment** — and `resolveImageLayout` is the layout it will be in: the
+  `VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL` that `vkcommon`'s frame loop has put it in since
+  1.5. A resolve writes to the swapchain image as a colour attachment write, at the colour
+  attachment output stage, and the barrier `vkcommon` records after each frame's rendering
+  waits on `VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT` and `VK_ACCESS_2_MEMORY_WRITE_BIT`, so it
+  covers the resolve without change.
+- `storeOp`, the **store op** — what happens to the attachment's contents when rendering ends
+  — is `VK_ATTACHMENT_STORE_OP_DONT_CARE` for the multisampled image. The resolve has already
+  taken everything wanted from the samples, and nothing reads them afterwards. Storing them
+  would write 15 MiB a frame at 4× for nobody. At 1× the attachment *is* the swapchain image,
+  so it is `VK_ATTACHMENT_STORE_OP_STORE`, as always.
+
+The depth attachment is never resolved and never stored. Each sample's depth was needed to
+decide which samples each triangle wrote, and once the pass ends there is no use for it.
+
+`VkRenderingInfo` is 1.13's, pointing at the two.
+
+### The resolve averages light, not numbers
+
+The swapchain's format is `_SRGB`: the numbers stored in it are gamma-encoded, as 2.4
+explained. Averaging encoded numbers is not averaging light. A pixel that is half white
+and half black should, as light, be half as bright as white — linear 0.5, which encodes to
+188. The average of the encoded values 255 and 0 is 128, which is much darker.
+
+The specification says an implementation *should* decode sRGB samples to linear before
+averaging and encode the result again — "should", not "must". So it is worth checking what
+this one does, and it is checkable. For one run, the planet's fragment shader was made to
+output pure white, the rocks were left out and the clear colour set to black. Every pixel on
+the planet's limb is then a mix of white and black, and its value says exactly what the
+resolve did. The distinct values strictly between 0 and 255 in each frame:
+
+| samples | edge pixels | values found |
+|---|---|---|
+| 1× | 0 | none — every pixel is 0 or 255 |
+| 2× | 311 | 188 |
+| 4× | 508 | 137, 188, 225 |
+| 8× | 647 | 99, 137, 165, 188, 207, 225, 241 — and 25 pixels one level off one of these |
+
+and the sRGB encodings of the coverage fractions:
+
+```text
+coverage    linear    sRGB-encoded × 255
+  1/8       0.125          99.1
+  2/8       0.25          137.0
+  3/8       0.375         164.8
+  4/8       0.5           187.5
+  5/8       0.625         207.2
+  6/8       0.75          224.6
+  7/8       0.875         240.4
+```
+
+Every level is there and nothing else: two sample points give one intermediate level, four
+give three, eight give seven — *N* − 1 intermediate levels, *N* + 1 in all, as derived above.
+And 2×'s only intermediate value is 188, not 128, so the resolve averaged linear light. The
+25 stragglers at 8× sit one level either side of a predicted value, which the specification
+allows: it says the average is computed "with implementation-defined numerical precision".
+
+<figure>
+  <img src="/img/4.7/limb-levels.png" alt="Two enlarged crops of a white disc's edge on black: on the left a hard two-tone staircase, on the right the same staircase with each step softened by one to three intermediate greys" />
+  <figcaption>The top of the white planet, enlarged ten times, at 1× (left) and 4× (right).
+  At 4× each step of the staircase gains up to three intermediate greys, which are 137, 188
+  and 225.</figcaption>
+</figure>
+
+## The frame
+
+```cpp title="code/src/4.advanced_vulkan/anti_aliasing/main.cpp"
+    void on_render(const vkc::FrameInfo& frame) override {
+        camera_.update(delta_time());
+        if (spinning_) {
+            belt_angle_ += kBeltSpin * delta_time();
+        }
+
+        const uint32_t slot = frame.frame_number % vkc::kFramesInFlight;
+        record_gpu_time(timer_.read(slot));
+
+        FrameArena& arena = arenas_[slot];
+        arena.reset();
+        const VkDeviceAddress globals = write_globals(arena, frame.extent);
+
+        // The whole rendering pass is timed this time, because the resolve happens at
+        // its end, inside vkCmdEndRendering, and is part of what multisampling costs.
+        timer_.reset(frame.cmd, slot);
+        timer_.begin(frame.cmd, slot);
+        begin_rendering(frame);
+        set_viewport(frame.cmd, frame.extent);
+
+        push(frame.cmd, globals, planet_.vertex_address);
+        vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, planet_pipeline_);
+        vkCmdBindIndexBuffer(frame.cmd, planet_.indices.handle(), 0,
+                             VK_INDEX_TYPE_UINT16);
+        vkCmdDrawIndexed(frame.cmd, planet_.index_count, 1, 0, 0, kPlanetInstance);
+
+        vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, rock_pipeline_);
+        vkCmdBindIndexBuffer(frame.cmd, rock_.indices.handle(), 0, VK_INDEX_TYPE_UINT16);
+        push(frame.cmd, globals, rock_.vertex_address);
+        vkCmdDrawIndexed(frame.cmd, rock_.index_count, rock_count(), 0, 0, kFirstRock);
+
+        vkCmdEndRendering(frame.cmd);
+        timer_.end(frame.cmd, slot);
+    }
+```
+
+4.6's frame, with three changes. The rocks are drawn with the pointer path only, in one
+instanced draw. `begin_rendering` is the one above. And the timestamps now bracket the whole
+rendering pass, from before `begin_rendering` to after `vkCmdEndRendering`, because the
+resolve happens inside `vkCmdEndRendering` and is part of what multisampling costs. Both are
+outside the pass, and the reset still comes first.
+
+The keys:
+
+```cpp title="code/src/4.advanced_vulkan/anti_aliasing/main.cpp"
+    void on_event(const SDL_Event& event) override {
+        camera_.handle_event(event, window().handle());
+
+        if (event.type != SDL_EVENT_KEY_DOWN || event.key.repeat) {
+            return;
+        }
+        switch (event.key.scancode) {
+            case SDL_SCANCODE_1:
+            case SDL_SCANCODE_2:
+            case SDL_SCANCODE_3:
+            case SDL_SCANCODE_4:
+                set_samples(kSampleCounts[event.key.scancode - SDL_SCANCODE_1]);
+                break;
+            case SDL_SCANCODE_5:
+                sample_shading_ = !sample_shading_;
+                rebuild_pipelines();
+                break;
+            case SDL_SCANCODE_6:
+                spinning_ = !spinning_;
+                break;
+            case SDL_SCANCODE_MINUS:
+                count_index_ = count_index_ > 0 ? count_index_ - 1 : 0;
+                break;
+            case SDL_SCANCODE_EQUALS:
+                count_index_ = std::min(count_index_ + 1, kRockCounts.size() - 1);
+                break;
+            default:
+                return;
+        }
+        reset_stats();
+    }
+```
+
+Keys 1 to 4 are adjacent scancodes, so `event.key.scancode - SDL_SCANCODE_1` is 0 to 3, an
+index into `kSampleCounts`. Key 5 toggles sample shading and rebuilds the pipelines.
+
+Shutdown gains the colour image and loses the attribute pipeline:
+
+```cpp title="code/src/4.advanced_vulkan/anti_aliasing/main.cpp"
+    void on_shutdown() override {
+        const VkDevice device = context().device();
+
+        destroy_pipelines();
+        vkDestroyPipelineLayout(device, pipeline_layout_, nullptr);
+
+        timer_.destroy();
+        for (FrameArena& arena : arenas_) {
+            arena.destroy();
+        }
+        colour_.destroy();
+        depth_.destroy();
+        instances_.destroy();
+        rock_.destroy();
+        planet_.destroy();
+    }
+```
+
+The statistics log only the GPU now, with the sample count and whether sample shading is on:
+
+```cpp title="code/src/4.advanced_vulkan/anti_aliasing/main.cpp"
+    // ---------------------------------------------------------------------------
+    // Measuring
+    // ---------------------------------------------------------------------------
+
+    void reset_stats() {
+        gpu_ms_ = 0.0;
+        gpu_samples_ = 0;
+        stats_started_ = elapsed();
+        spdlog::info("{} rocks, {}x{}", rock_count(), static_cast<uint32_t>(samples_),
+                     sample_shading_ ? ", sample shading" : "");
+    }
+
+    void record_gpu_time(double ms) {
+        if (ms >= 0.0) {
+            gpu_ms_ += ms;
+            ++gpu_samples_;
+        }
+        if (elapsed() - stats_started_ < 1.0F || gpu_samples_ == 0) {
+            return;
+        }
+        spdlog::info("{:>7} rocks, {}x{:<16} GPU {:7.3f} ms", rock_count(),
+                     static_cast<uint32_t>(samples_),
+                     sample_shading_ ? ", sample shading" : "", gpu_ms_ / gpu_samples_);
+        gpu_ms_ = 0.0;
+        gpu_samples_ = 0;
+        stats_started_ = elapsed();
+    }
+```
+
+## Pipelines, and sample shading
+
+The layout is 4.6's, in a function of its own, created once:
+
+```cpp title="code/src/4.advanced_vulkan/anti_aliasing/main.cpp"
+    // ---------------------------------------------------------------------------
+    // Pipelines
+    // ---------------------------------------------------------------------------
+
+    void create_layout() {
+        const VkPushConstantRange push_range{
+            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+            .offset = 0,
+            .size = sizeof(PushConstants),
+        };
+        const VkPipelineLayoutCreateInfo layout_info{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .setLayoutCount = 0,
+            .pSetLayouts = nullptr,
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &push_range,
+        };
+        VK_CHECK(vkCreatePipelineLayout(context().device(), &layout_info, nullptr,
+                                        &pipeline_layout_));
+    }
+```
+
+The pipelines are 4.6's two pointer-path pipelines with the sample count added, and they can
+be torn down and built again:
+
+```cpp title="code/src/4.advanced_vulkan/anti_aliasing/main.cpp"
+    // 4.6's two pointer-path pipelines, now told the sample count. With sample shading
+    // on, the minimum fraction is 1: the fragment shader runs for every sample.
+    void create_pipelines() {
+        const VkDevice device = context().device();
+        const VkShaderModule shader =
+            vkc::load_shader(device, LVK_CHAPTER_ID, "anti_aliasing.slang");
+
+        const auto base = [&]() -> vkc::PipelineBuilder {
+            return vkc::PipelineBuilder(device)
+                .colour_attachment(swapchain().format())
+                .cull(VK_CULL_MODE_BACK_BIT, VK_FRONT_FACE_COUNTER_CLOCKWISE)
+                .depth(depth_format_, /*test=*/true, /*write=*/true)
+                .multisample(samples_, sample_shading_ ? 1.0F : 0.0F)
+                .layout(pipeline_layout_);
+        };
+
+        rock_pipeline_ = base().shaders(shader).build();
+        planet_pipeline_ =
+            base().shaders(shader, "vertexMain", "planetFragmentMain").build();
+
+        vkDestroyShaderModule(device, shader, nullptr);
+
+        context().name(rock_pipeline_, VK_OBJECT_TYPE_PIPELINE, "rocks");
+        context().name(planet_pipeline_, VK_OBJECT_TYPE_PIPELINE, "planet");
+    }
+
+    void destroy_pipelines() {
+        vkDestroyPipeline(context().device(), planet_pipeline_, nullptr);
+        vkDestroyPipeline(context().device(), rock_pipeline_, nullptr);
+    }
+
+    void rebuild_pipelines() {
+        context().wait_idle();
+        destroy_pipelines();
+        create_pipelines();
+    }
+```
+
+`rebuild_pipelines` waits for the device to go idle first, because a pipeline must not be
+destroyed while a command buffer that uses it may still be executing.
+
+The members gain the sample count, the supported mask, the sample-shading switch and the
+multisampled colour image, and the timer is `vkcommon`'s now:
+
+```cpp title="code/src/4.advanced_vulkan/anti_aliasing/main.cpp"
+    vkc::Camera camera_;
+
+    Mesh planet_;
+    Mesh rock_;
+    vkc::Buffer instances_;
+    VkDeviceAddress instances_address_ = 0;
+
+    VkFormat depth_format_ = VK_FORMAT_UNDEFINED;
+    VkSampleCountFlags supported_samples_ = 0;
+    VkSampleCountFlagBits samples_ = kDefaultSamples;
+    bool sample_shading_ = false;
+    vkc::Image colour_;
+    vkc::Image depth_;
+
+    std::array<FrameArena, vkc::kFramesInFlight> arenas_;
+    vkc::GpuTimer timer_;
+
+    VkPipelineLayout pipeline_layout_ = VK_NULL_HANDLE;
+    VkPipeline rock_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline planet_pipeline_ = VK_NULL_HANDLE;
+
+    size_t count_index_ = kDefaultRockCount;
+    bool spinning_ = false;
+    float belt_angle_ = 0.0F;
+
+    double gpu_ms_ = 0.0;
+    uint32_t gpu_samples_ = 0;
+    float stats_started_ = 0.0F;
+};
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    try {
+        vkc::App::Options options{};
+        options.title = "LearnVulkan 4.7 - Anti-aliasing";
+        AntiAliasingApp app(vkc::App::parse_args(argc, argv, options));
+        return app.run();
+    } catch (const std::exception& error) {
+        spdlog::error("{}", error.what());
+        return EXIT_FAILURE;
+    }
+}
+```
+
+The second argument to `multisample` is `minSampleShading`. With sample shading enabled, the
+specification requires the fragment shader to run at least
+
+```text
+max( ⌈ minSampleShading × rasterizationSamples ⌉ , 1 )   times per pixel
+```
+
+so 1.0 means once for every sample — each sample gets its own shading, at its own position
+— and 0.25 at 8× would mean at least twice. That is **sample shading**: multisampling's
+coverage, with supersampling's shading. It exists because multisampling does nothing for
+aliasing *inside* a triangle. A texture with fine detail, or a specular highlight so tight
+it is smaller than a pixel, is sampled once per pixel at the centre, and aliases exactly as
+it did at 1×.
+
+In this scene there is almost nothing of that kind. The rocks are flat-shaded, so each
+facet's shading changes slowly across it, and the planet's bands are wide. Comparing
+screenshots of the default view:
+
+| comparison | pixels that differ | largest difference in any channel |
+|---|---|---|
+| 1× → 2× | 119,528 | 197 |
+| 1× → 4× | 152,267 | 164 |
+| 1× → 8× | 165,149 | 167 |
+| 4× → 4× with sample shading | 15,194 | 35 |
+| 8× → 8× with sample shading | 10,801 | 13 |
+
+Multisampling changes one pixel in six, some of them by most of the brightness range — those
+are the silhouettes. Sample shading on top changes far fewer, by small amounts: slightly
+different specular and band values where each sample now shades at its own position. That
+is the expected result for this scene, and not a general one. Exercise 3 changes the scene
+so that sample shading earns its keep.
+
+## What it costs
+
+GPU time for the whole rendering pass, resolve included, in the release build with
+`--no-validation`, averaged over a second, on the RTX 4080. As in 4.6, the shape matters
+more than the digits.
+
+The default view, 5,000 rocks:
+
+| samples | GPU | with sample shading |
+|---|---|---|
+| 1× | 0.166 ms | 0.165 ms |
+| 2× | 0.185 ms | 0.188 ms |
+| 4× | 0.193 ms | 0.203 ms |
+| 8× | 0.200 ms | 0.241 ms |
+
+Close to the planet, so that it fills most of the screen and the frame is mostly fragments —
+the camera moved to (0, 0, 6.5):
+
+| samples | GPU | with sample shading |
+|---|---|---|
+| 1× | 0.151 ms | 0.151 ms |
+| 2× | 0.157 ms | 0.166 ms |
+| 4× | 0.158 ms | 0.183 ms |
+| 8× | 0.161 ms | 0.220 ms |
+
+and with 100,000 rocks in the default view, where the frame is 32 million triangles:
+
+| samples | GPU | with sample shading |
+|---|---|---|
+| 1× | 3.087 ms | 3.091 ms |
+| 2× | 3.648 ms | 3.652 ms |
+| 4× | 3.767 ms | 3.777 ms |
+| 8× | 3.802 ms | 3.866 ms |
+
+Three things are visible:
+
+- **Multisampling is cheap here.** 8× costs 20% more than 1× in the default view, and 7%
+  close to the planet. The fragment shader still runs once per pixel; what grows is
+  per-sample depth testing, colour writes, and the resolve.
+- **Sample shading's cost follows the fragment work.** Close to the planet, 8× with sample
+  shading is 37% slower than 8× without, because the shader now runs up to eight times per
+  pixel. With 100,000 rocks it adds almost nothing, because that frame is spent on vertices
+  and triangles, not on shading. This shader is also very cheap; with a real material the
+  gap would be far larger.
+- **The biggest step is the first.** With 100,000 rocks, going from 1× to 2× costs 0.56 ms,
+  and 2× to 8× costs 0.15 ms more. A frame full of tiny triangles has edges everywhere, and
+  the per-sample work is paid on every edge pixel.
+
+So on a desktop GPU, 4× multisampling is close to free at this resolution, and the price
+that matters is 30 MiB of attachments. On a tile-based GPU the balance is the other way round:
+the memory can cost nothing, if lazily allocated, and bandwidth is what is scarce.
+
+<figure>
+  <img src="/img/4.7/sample-counts.png" alt="Four enlarged crops of the planet's edge and a cluster of rocks against the sky: top left hard and stepped, top right, bottom left and bottom right progressively smoother" />
+  <figcaption>The same 112 × 80 pixels, enlarged three times, at 1× (top left), 2× (top
+  right), 4× (bottom left) and 8× (bottom right).</figcaption>
+</figure>
+
+## Checking it against the previous chapter
+
+At 1×, this chapter renders with a one-sample depth image it made itself, through rendering
+info it wrote itself, instead of 4.6's `vkc::create_depth_buffer` and `vkc::begin_rendering`.
+That is a claim that nothing changed, and it is checkable: 4.7 at 1× against 4.6's reference
+image differs in **0 of 921,600 pixels**.
+
+:::note[What moved into vkcommon]
+**`GpuTimer`**, from 4.6, as `vkc::GpuTimer` in a new piece of the library, `vkc_timer`. The
+code is unchanged; only its shape is new, split into a header:
+
+```cpp title="code/common/scaffold/include/vkc/timer.hpp"
+#pragma once
+
+#include "vkc/frame.hpp"
+
+#include <volk.h>
+
+#include <array>
+#include <cstdint>
+
+namespace vkc {
+
+class Context;
+
+// How long a stretch of a command buffer took on the GPU, from a pair of timestamp
+// queries per frame in flight.
+//
+// Chapter 4.6 wrote every line of this by hand: why the answer arrives a frame late,
+// why each frame slot gets its own pair of queries, why the reset has to be recorded
+// outside a rendering pass, and what timestampPeriod and timestampValidBits are for. From 4.7 it
+// lives here, unchanged except for being split into a header and a source file.
+class GpuTimer {
+public:
+    void create(Context& context);
+    void destroy() noexcept;
+
+    // What this slot measured the last time it was used, in milliseconds, or a negative
+    // number if it has never been used. Must be called before reset() reuses the slot.
+    [[nodiscard]] double read(uint32_t slot) const;
+
+    // Outside a rendering pass, before begin().
+    void reset(VkCommandBuffer cmd, uint32_t slot);
+    void begin(VkCommandBuffer cmd, uint32_t slot);
+    void end(VkCommandBuffer cmd, uint32_t slot);
+
+private:
+    VkDevice device_ = VK_NULL_HANDLE;
+    VkQueryPool pool_ = VK_NULL_HANDLE;
+    float period_ns_ = 0.0F;
+    uint64_t mask_ = 0;
+    std::array<bool, kFramesInFlight> written_{};
+};
+
+}  // namespace vkc
+```
+
+and a source file, where each member function is defined outside the class, qualified with
+`GpuTimer::`:
+
+```cpp title="code/common/scaffold/src/timer.cpp"
+#include "vkc/timer.hpp"
+
+#include "vkc/check.hpp"
+#include "vkc/context.hpp"
+
+#include <stdexcept>
+#include <vector>
+
+namespace vkc {
+
+void GpuTimer::create(Context& context) {
+    device_ = context.device();
+
+    VkPhysicalDeviceProperties properties{};
+    vkGetPhysicalDeviceProperties(context.physical_device(), &properties);
+    period_ns_ = properties.limits.timestampPeriod;
+
+    // A queue that cannot write timestamps reports zero valid bits.
+    uint32_t family_count = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(context.physical_device(),
+                                             &family_count, nullptr);
+    std::vector<VkQueueFamilyProperties> families(family_count);
+    vkGetPhysicalDeviceQueueFamilyProperties(context.physical_device(),
+                                             &family_count, families.data());
+    const uint32_t valid_bits =
+        families[context.queue_family()].timestampValidBits;
+    if (valid_bits == 0) {
+        throw std::runtime_error("This queue cannot write timestamps.");
+    }
+    mask_ = valid_bits == 64 ? ~uint64_t{0} : (uint64_t{1} << valid_bits) - 1;
+
+    const VkQueryPoolCreateInfo pool_info{
+        .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .queryType = VK_QUERY_TYPE_TIMESTAMP,
+        .queryCount = 2 * kFramesInFlight,
+        .pipelineStatistics = 0,
+    };
+    VK_CHECK(vkCreateQueryPool(device_, &pool_info, nullptr, &pool_));
+}
+
+void GpuTimer::destroy() noexcept { vkDestroyQueryPool(device_, pool_, nullptr); }
+
+double GpuTimer::read(uint32_t slot) const {
+    if (!written_[slot]) {
+        return -1.0;
+    }
+    std::array<uint64_t, 2> ticks{};
+    VK_CHECK(vkGetQueryPoolResults(device_, pool_, 2 * slot, 2, sizeof(ticks),
+                                   ticks.data(), sizeof(uint64_t),
+                                   VK_QUERY_RESULT_64_BIT));
+    const uint64_t elapsed = (ticks[1] - ticks[0]) & mask_;
+    return static_cast<double>(elapsed) * period_ns_ * 1e-6;
+}
+
+void GpuTimer::reset(VkCommandBuffer cmd, uint32_t slot) {
+    vkCmdResetQueryPool(cmd, pool_, 2 * slot, 2);
+}
+
+void GpuTimer::begin(VkCommandBuffer cmd, uint32_t slot) {
+    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, pool_, 2 * slot);
+}
+
+void GpuTimer::end(VkCommandBuffer cmd, uint32_t slot) {
+    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, pool_,
+                         2 * slot + 1);
+    written_[slot] = true;
+}
+
+}  // namespace vkc
+```
+
+`kFramesInFlight` no longer needs its `vkc::` inside `vkc`, and the header includes
+`vkc/frame.hpp` for it.
+
+**Multisampling**, as three additions shown above: `ImageDesc::samples`,
+`PipelineBuilder::multisample()`, and the `sampleRateShading` device feature.
+:::
+
+## What changed since 4.6
+
+- `VkSampleCountFlagBits`, and choosing a count from `framebufferColorSampleCounts` and
+  `framebufferDepthSampleCounts`
+- multisampled colour and depth images, with `VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT`
+- `rasterizationSamples`, `sampleShadingEnable` and `minSampleShading` in the pipeline
+- a resolve at the end of dynamic rendering: `resolveMode`, `resolveImageView`,
+  `resolveImageLayout`, and `VK_ATTACHMENT_STORE_OP_DONT_CARE` for the samples
+- the rendering info written out again, because `vkc::begin_rendering` cannot resolve
+- pipelines and attachments rebuilt at run time when the sample count changes
+- `GpuTimer` moved into `vkcommon`; the instance-attribute and per-rock paths removed
+- 32 chapters in the build now
+
+## Words introduced in this chapter
+
+| | |
+|---|---|
+| **aliasing** | detail finer than the sample spacing turning into false, coarser detail: staircases, crawling, flicker |
+| **anti-aliasing** | anything that reduces aliasing |
+| **sample** | a point within a pixel at which coverage and depth are evaluated |
+| **coverage** | the fraction of a pixel a primitive covers; with *N* samples, the fraction of them it covers |
+| **multisampling** | coverage and depth per sample, fragment shading per pixel, and a resolve at the end |
+| **sample count** | samples per pixel, a `VkSampleCountFlagBits` whose value is the count |
+| **resolve** | combining each pixel's samples into one value, here by averaging |
+| **resolve attachment** | the single-sample image a resolve writes into |
+| **store op** | what happens to an attachment's contents when rendering ends: stored, or not |
+| **transient attachment** | an image whose contents never outlive a rendering pass |
+| **lazily allocated memory** | memory a transient attachment may be bound to that need never physically exist |
+| **tile-based renderer** | a GPU that renders the screen tile by tile in on-chip memory, common in phones |
+| **sample shading** | running the fragment shader once per sample, or a set fraction of samples |
+| **supersampling** | rendering at more samples than pixels and shading every one of them |
+| **sample pattern** | where the sample points sit within a pixel; standardised for 1× to 16× |
+
+## Exercises
+
+1. Put `VK_ATTACHMENT_STORE_OP_STORE` on the multisampled colour attachment and measure the
+   difference at 8× in the release build. What did storing 30 MiB of samples a frame cost?
+2. Work out, sample by sample, how a horizontal edge crossing a pixel would be counted by a
+   plain 2×2 grid of samples at (¼, ¼), (¾, ¼), (¼, ¾) and (¾, ¾), and show that it can only
+   ever produce three coverage levels. Then do the same for the rotated 4× pattern above and
+   find all five.
+3. Make the planet's bands far finer — multiply `height` by 400 instead of 14 — and move the
+   camera close to the planet. Compare 4× with and without sample shading. This is the scene
+   sample shading exists for.
+4. Try `minSampleShading` of 0.25 and 0.5 at 8× in the scene from exercise 3. Predict the
+   minimum number of shader invocations per pixel for each, from the formula, before you
+   look.
+5. Resize the window while at 8×. What does `on_resize` rebuild, and what would go wrong if
+   it rebuilt only the depth image?
+
+Next: 4.8 takes on something this series has been putting off since 4.5. The C++ and the
+Slang each declare `Vertex`, `Globals`, `Instance` and `PushConstants`, and so does every
+shader file that needs them — and in 4.9, a compute shader will need them too. Slang's
+modules, generics and interfaces are how shader code stops being copied from file to file.

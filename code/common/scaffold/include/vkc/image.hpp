@@ -31,6 +31,10 @@ struct ImageDesc {
     // +X, -X, +Y, -Y, +Z, -Z. Chapter 4.4 is the first to use one and explains
     // every field of it.
     bool cube = false;
+    // Samples per pixel. Anything above 1 makes a multisampled image, which can be
+    // rendered into and resolved but not sampled like a texture. Chapter 4.7 is the
+    // first to ask for more than one.
+    VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
 };
 
 // A VkImage, the VMA allocation behind it, and a view covering all of it.

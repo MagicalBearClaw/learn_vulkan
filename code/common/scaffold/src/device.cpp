@@ -201,6 +201,9 @@ void Device::create_device() {
     features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     features2.pNext = &features12;
     features2.features.samplerAnisotropy = VK_TRUE;
+    // Running the fragment shader once per sample rather than once per pixel. Chapter
+    // 4.7 turns it on for one of its pipelines and measures what it costs.
+    features2.features.sampleRateShading = VK_TRUE;
 
     const VkDeviceCreateInfo create_info{
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,

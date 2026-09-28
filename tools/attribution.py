@@ -53,6 +53,8 @@ FENCE = re.compile(r"^\s*(```|~~~)")
 #   * pipeline.cpp has to be 1.7: chapter 1.8 already calls both `vkc::load_shader`
 #     and `PipelineBuilder`.
 #   * image.cpp splits -- create/upload/mips/samplers in 1.11, depth in 1.13.
+#   * 4.7 adds multisampling: a sample count on ImageDesc and PipelineBuilder, and the
+#     sampleRateShading feature in device.cpp. Its article shows those lines.
 OWNERS: dict[str, list[str]] = {
     "base/include/vkc/capture.hpp": ["1.1", "1.5"],
     # parse_args belongs with the Args struct in 1.1; the Capture class is 1.5's.
@@ -68,23 +70,27 @@ OWNERS: dict[str, list[str]] = {
     "scaffold/include/vkc/instance.hpp": ["1.2"],
     "scaffold/src/instance.cpp": ["1.2"],
     "scaffold/include/vkc/device.hpp": ["1.3"],
-    "scaffold/src/device.cpp": ["1.3"],
+    "scaffold/src/device.cpp": ["1.3", "4.7"],
     "scaffold/include/vkc/swapchain.hpp": ["1.4"],
     "scaffold/src/swapchain.cpp": ["1.4"],
     "scaffold/include/vkc/context.hpp": ["1.5"],
     "scaffold/src/context.cpp": ["1.5"],
     "scaffold/include/vkc/frame.hpp": ["1.5", "1.6", "1.7"],
     "scaffold/src/frame.cpp": ["1.5", "1.6", "1.7"],
-    "scaffold/include/vkc/pipeline.hpp": ["1.7"],
-    "scaffold/src/pipeline.cpp": ["1.7"],
+    "scaffold/include/vkc/pipeline.hpp": ["1.7", "4.7"],
+    "scaffold/src/pipeline.cpp": ["1.7", "4.7"],
     "scaffold/include/vkc/app.hpp": ["1.8"],
     "scaffold/src/app.cpp": ["1.8"],
     "scaffold/include/vkc/buffer.hpp": ["1.8"],
     "scaffold/src/buffer.cpp": ["1.8"],
-    "scaffold/include/vkc/image.hpp": ["1.11", "1.13"],
-    "scaffold/src/image.cpp": ["1.11", "1.13"],
+    "scaffold/include/vkc/image.hpp": ["1.11", "1.13", "4.7"],
+    "scaffold/src/image.cpp": ["1.11", "1.13", "4.7"],
     "scaffold/include/vkc/camera.hpp": ["1.14"],
     "scaffold/src/camera.cpp": ["1.14"],
+    # GpuTimer is written out in 4.6 and promoted in 4.7, which shows the lines the split
+    # into a header and a source file changed.
+    "scaffold/include/vkc/timer.hpp": ["4.6", "4.7"],
+    "scaffold/src/timer.cpp": ["4.6", "4.7"],
 }
 
 

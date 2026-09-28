@@ -96,6 +96,13 @@ public:
     // Bakes constant values into the fragment shader at pipeline-creation time.
     // Chapter 1.9 builds the entries and the data block; this only carries them
     // through to VkPipelineShaderStageCreateInfo::pSpecializationInfo.
+    // Samples per pixel, which must match the attachments the pipeline renders into, and
+    // the fraction of them the fragment shader runs for. 0 leaves sample shading off:
+    // the shader runs once per pixel however many samples there are. Chapter 4.7
+    // explains both.
+    PipelineBuilder& multisample(VkSampleCountFlagBits samples,
+                                 float min_sample_shading = 0.0F);
+
     PipelineBuilder& fragment_specialisation(
         std::span<const VkSpecializationMapEntry> entries,
         std::span<const std::byte> data);
@@ -133,6 +140,9 @@ private:
     bool stencil_test_ = false;
     VkStencilOpState stencil_front_{};
     VkStencilOpState stencil_back_{};
+
+    VkSampleCountFlagBits samples_ = VK_SAMPLE_COUNT_1_BIT;
+    float min_sample_shading_ = 0.0F;
 
     bool blending_ = false;
     bool custom_blend_ = false;

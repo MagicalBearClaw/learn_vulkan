@@ -40,7 +40,7 @@ Image::Image(Context& context, const ImageDesc& desc)
         .extent = {desc_.extent.width, desc_.extent.height, 1},
         .mipLevels = desc_.mip_levels,
         .arrayLayers = desc_.array_layers,
-        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .samples = desc_.samples,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
         .usage = desc_.usage,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,

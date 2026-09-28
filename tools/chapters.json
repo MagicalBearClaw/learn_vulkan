@@ -184,6 +184,12 @@
       "sample": "4.advanced_vulkan/instancing",
       "previous": "4.advanced_vulkan/buffer_device_address",
       "article": "advanced-vulkan/instancing.mdx"
+    },
+    {
+      "id": "4.7.anti_aliasing",
+      "sample": "4.advanced_vulkan/anti_aliasing",
+      "previous": "4.advanced_vulkan/instancing",
+      "article": "advanced-vulkan/anti-aliasing.mdx"
     }
   ]
 }

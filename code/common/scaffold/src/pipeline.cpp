@@ -273,6 +273,13 @@ PipelineBuilder& PipelineBuilder::colour_blend(
     return *this;
 }
 
+PipelineBuilder& PipelineBuilder::multisample(VkSampleCountFlagBits samples,
+                                              float min_sample_shading) {
+    samples_ = samples;
+    min_sample_shading_ = min_sample_shading;
+    return *this;
+}
+
 PipelineBuilder& PipelineBuilder::fragment_specialisation(
     std::span<const VkSpecializationMapEntry> entries,
     std::span<const std::byte> data) {
@@ -383,9 +390,9 @@ VkPipeline PipelineBuilder::build() const {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
-        .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
-        .sampleShadingEnable = VK_FALSE,
-        .minSampleShading = 1.0F,
+        .rasterizationSamples = samples_,
+        .sampleShadingEnable = min_sample_shading_ > 0.0F ? VK_TRUE : VK_FALSE,
+        .minSampleShading = min_sample_shading_,
         .pSampleMask = nullptr,
         .alphaToCoverageEnable = VK_FALSE,
         .alphaToOneEnable = VK_FALSE,

@@ -37,6 +37,7 @@
 #   vkc_image       1.11 Textures -- images, views, mip generation, samplers
 #                   1.13 choose_depth_format and create_depth_buffer
 #   vkc_camera      1.14 Camera -- a first-person fly camera, no Vulkan in it at all
+#   vkc_timer       4.6  Instancing -- GPU timestamps, one pair per frame in flight
 
 # The headers and the third-party dependencies every piece shares.
 add_library(vkc_headers INTERFACE)
@@ -65,6 +66,7 @@ _vkc_piece(vkc_camera    SOURCES src/camera.cpp)
 
 _vkc_piece(vkc_buffer    SOURCES src/buffer.cpp    DEPENDS vkc_context)
 _vkc_piece(vkc_image     SOURCES src/image.cpp     DEPENDS vkc_buffer)
+_vkc_piece(vkc_timer     SOURCES src/timer.cpp     DEPENDS vkc_context)
 
 # The whole scaffold, for chapters past the point where all of it has been taught.
 # add_chapter() links this when a chapter names no SCAFFOLD of its own.
@@ -82,4 +84,5 @@ target_link_libraries(vkcommon
         vkc_buffer
         vkc_image
         vkc_camera
+        vkc_timer
 )
