@@ -202,6 +202,12 @@
       "sample": "4.advanced_vulkan/compute",
       "previous": "4.advanced_vulkan/slang_modules",
       "article": "advanced-vulkan/compute.mdx"
+    },
+    {
+      "id": "5.1.blinn_phong",
+      "sample": "5.advanced_lighting/blinn_phong",
+      "previous": "4.advanced_vulkan/buffer_device_address",
+      "article": "advanced-lighting/blinn-phong.mdx"
     }
   ]
 }

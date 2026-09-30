@@ -1,0 +1,847 @@
+---
+title: "Blinn-Phong"
+description: Why Phong's highlight is cut off behind every light, the halfway vector that fixes it, the factor of four the exponent needs, the streak it leaves at grazing angles, and the facing test both models need.
+sidebar:
+  order: 1
+---
+
+<figure>
+  <img src="/img/reference/5.1.blinn_phong.png" alt="A dark tiled floor with four wooden crates, lit by one small warm lamp hanging just above the floor; the lamp's highlight is a long bright streak on the floor running from under the lamp toward the viewer" />
+  <figcaption>Chapter 5.1. One lamp, low over a floor, with the specular term measured
+  against the halfway vector. Press <kbd>1</kbd> for Phong, and <kbd>2</kbd> until the
+  shininess is 1, to see what this chapter fixes.</figcaption>
+</figure>
+
+Part 2 lit its crates with the **Phong reflection model**, and the specular term in 2.2 was
+one line: reflect the light about the normal, and raise the cosine of the angle between that
+reflection and the eye to the shininess. Part 2's review listed that line among the things
+later chapters would change, because it has a flaw that the crates never showed. It shows as
+soon as a light sits close to a large surface and the eye looks along it: the highlight ends
+in a hard curve, and nothing beyond that curve gets any specular light at all, however dull
+the surface is meant to be.
+
+This chapter works out where that curve is and why it exists, and then replaces the angle
+Phong measures with a different one. The replacement is **Blinn-Phong**, which Jim Blinn
+proposed in 1977. It is the specular term this series uses from now on, until Part 6
+replaces the whole model. It is a one-line change to the shader, and the rest of the chapter
+is what that line does to the picture: the exponent has to change with it, the highlight
+changes shape, and a flaw both models share becomes much more visible.
+
+The sample is 4.5's room with the mirror, the sky and the ferns taken out, at night, with
+one lamp hanging just above the floor. The keys:
+
+- <kbd>1</kbd> switch between Phong and Blinn-Phong (Blinn-Phong is the default)
+- <kbd>2</kbd> cycle the shininess through 1, 4, 16, 64 and 256 (4 is the default)
+- <kbd>3</kbd> match the exponents: give Blinn-Phong four times the shininess, or the same
+  (matched is the default)
+
+Every setting prints what the shader is now using:
+
+```
+[info] 1 Phong / Blinn-Phong, 2 shininess, 3 match exponents.
+[info] Blinn-Phong, shininess 16 (4 x 4)
+```
+
+## Where Phong's highlight ends
+
+Phong's specular term is `pow(max(dot(to_eye, reflected), 0.0), shininess)`. The `max` is
+there because a cosine goes negative once the angle passes 90°, and a negative number raised
+to a fractional power is not a number. So wherever the eye is more than 90° away from the
+reflected light, Phong's specular is zero — not small, zero — and it is zero at every
+shininess, because the test happens before the exponent.
+
+On a small object seen from in front of the light that never matters: the reflected ray
+points back roughly toward the eye everywhere the eye can see. On a floor it matters a great
+deal, and the place it stops being true can be worked out exactly.
+
+Put the floor at height 0, the lamp at height *h* above a point **L** on the floor, and the
+eye at height *c* above a point **C**. For a point **P** on the floor, the light arrives
+travelling from the lamp down to **P**. A floor's normal is straight up, and reflecting about
+it keeps the horizontal part of a direction and flips the vertical part, so the reflected ray
+leaves **P** heading horizontally away from the lamp, along **P** − **L**, and upward by *h*:
+
+```
+reflected  ∝  (P − L,  h)       horizontal part, then height
+to_eye     ∝  (C − P,  c)
+```
+
+Neither is unit length, but only the sign of their dot product matters, and the lengths are
+positive. The dot product is zero where
+
+```
+(P − L) · (C − P) + h c  =  0
+```
+
+and a little algebra turns that into a familiar shape. Write **M** for the midpoint of **L**
+and **C**, and *d* for the distance between them. Expanding, and completing the square:
+
+```
+|P − M|²  =  d²/4 + h c
+```
+
+That is a **circle** on the floor, centred halfway between the lamp's foot and the eye's
+foot, with a radius a little more than half the distance between them. Inside it Phong has a
+highlight. Outside it the eye is more than 90° from every reflected ray, and there is none.
+
+In the sample *h* is 0.55, *c* is 1.35 and *d* is 7.0, which puts the far edge of the circle
+√(12.25 + 0.7425) − 3.5 = 0.105 units beyond the lamp's foot. Projected through the
+camera, that is row 386.7 of the 720-row frame, straight below the lamp. Rendering only the
+specular term, with the shininess at 1, and reading the pixels in that column:
+
+| Row | 330 | … | 381 | 384 | 387 | 390 | 393 |
+|---|---|---|---|---|---|---|---|
+| Phong | 0 | 0 | 0 | 0 | 49 | 105 | 133 |
+| Blinn-Phong | 53 | … | 140 | 150 | 158 | 166 | 171 |
+
+Zero at row 384 and 49 at row 387. The circle is where the arithmetic said.
+
+<figure>
+  <img src="/img/5.1/clipped-lobe.png" alt="Two dark renders side by side. Left: a broad pool of light on the floor that ends in a sharp curved edge just beyond the lamp, with black floor behind it. Right: the same pool continuing smoothly past the lamp and fading out into the distance" />
+  <figcaption>Specular light only, shininess 1. Left, Phong: the highlight stops dead at the
+  circle. Right, Blinn-Phong: it carries on past the lamp and fades.</figcaption>
+</figure>
+
+Strictly, Phong's highlight does not jump. The cosine reaches zero continuously at the
+circle, and `max` then holds it there. What the eye sees is a **crease**: brightness falling
+steadily and then stopping, with a sudden change of slope. At shininess 1 the fall is a
+straight line in the cosine, and the swapchain's sRGB encoding, which 1.4 chose, stretches
+the darkest values the most — in the table, 0 to 49 to 105 in six rows of pixels — so the
+crease reads as an edge. At higher shininess the cosine has fallen to almost nothing well
+before the circle and there is nothing left to cut, which is why 2.2's crates, at 32,
+never showed it.
+
+The general name for what Phong is doing is **lobe clipping**. The **specular lobe** is the
+shape of the specular term around its peak, over every direction the eye could be in. A
+rough surface has a wide lobe, and Phong centres its lobe on the reflected ray and throws away
+whatever half of it lies more than 90° away. Near a **grazing angle** — light or eye nearly
+along the surface — the reflected ray itself is nearly along the surface, so part of what
+gets thrown away lies above the surface, where the eye can be. Real rough floors are not
+dark behind a lamp.
+
+## The halfway vector
+
+Blinn's idea is to measure a different angle. Ask what orientation a tiny mirror at **P**
+would need in order to reflect the light straight into the eye. A mirror reflects when its
+normal bisects the incoming and outgoing directions, so that normal is the **halfway
+vector**:
+
+```
+H  =  normalize(to_light + to_eye)
+```
+
+Blinn-Phong's cosine is how closely the surface's actual normal lines up with it:
+`dot(normal, H)`. When the surface is exactly the right mirror, *N* equals *H* and the
+cosine is 1, which is exactly where Phong's cosine is 1 as well, since the reflected ray then
+points straight at the eye. Away from that peak the two measure different things, and the
+difference is the whole chapter.
+
+The first difference is that Blinn-Phong's cosine is never negative where it matters. Call
+the half of all directions on the surface's outward side its **hemisphere**. A point the eye
+can see has the eye in that hemisphere, so `dot(N, to_eye)` ≥ 0; a point the light reaches
+has the light in it, so `dot(N, to_light)` ≥ 0. Then
+
+```
+dot(N, H)  =  (dot(N, to_light) + dot(N, to_eye)) / |to_light + to_eye|  ≥  0
+```
+
+because the top is a sum of two numbers that are not negative and the bottom is a length.
+The bisector of two directions in a hemisphere is in the hemisphere. There is nothing for
+`max` to clip, and no circle.
+
+The half vector also has a history that explains why it was the default for a long time. If
+the light is treated as infinitely far away, so that `to_light` is the same at every point,
+and the eye is treated the same way — an **infinite viewer** — then *H* is the same at every
+point too, and can be worked out once per light instead of once per pixel. OpenGL's
+fixed-function lighting assumed an infinite viewer unless a program asked for a local one. This
+sample has a lamp in the room and an eye in the room, so *H* changes at every pixel and
+Blinn-Phong costs a `normalize` where Phong costs a `reflect`. Neither is the expensive part
+of this shader.
+
+## Four times the exponent
+
+Switch from Phong to Blinn-Phong at the same shininess and the highlight changes size. The
+reason is an angle that halves.
+
+Take the case where the light, the eye and the normal all lie in one plane — the **plane of
+incidence**. Measure angles in that plane from the normal: the light at −α, so its
+reflection is at +α, and the eye at +β. The angle between the eye and the reflection is
+|β − α|. *H* bisects −α and +β, so it sits at (β − α)/2, and the angle between *H* and the
+normal is |β − α|/2. Exactly half.
+
+So at the same exponent, Blinn-Phong's highlight falls off half as fast with angle, and is
+twice as wide. To get the old width back, the exponent has to grow, and the factor comes
+from how `cos` behaves near zero. The **small-angle approximation** says cos *x* ≈ 1 − *x*²/2,
+and raising that to a large power *n* gives
+
+```
+cosⁿ(x)  ≈  (1 − x²/2)ⁿ  ≈  exp(−n x² / 2)
+```
+
+a bell curve whose width goes as 1/√*n*. Phong at exponent *n* with angle *x* is
+exp(−*n x*²/2). Blinn-Phong at exponent *m* with angle *x*/2 is exp(−*m x*²/8). They are the
+same curve when *m* = 4*n*. That is **exponent matching**, and it is what key <kbd>3</kbd>
+does:
+
+```cpp title="code/src/5.advanced_lighting/blinn_phong/main.cpp"
+// The halfway vector sits at half the angle the reflected vector does, so the same
+// highlight needs four times the exponent. The article derives the four.
+constexpr float kBlinnExponentScale = 4.0F;
+```
+
+The same measurement as before, specular only, at Phong's shininess 16 and Blinn-Phong's
+64, finding the rows straight below the lamp where the highlight is at least half its peak
+(in linear light, before the sRGB encoding):
+
+| | Rows at half the peak or brighter | Columns at the peak row |
+|---|---|---|
+| Phong, 16 | 414 to 551 | 576 to 703 — 128 wide |
+| Blinn-Phong, 16 | 401 to 635 | 609 to 670 — 62 wide |
+| Blinn-Phong, 64 | 413 to 552 | 622 to 657 — 36 wide |
+
+Down the column, which is the plane of incidence, the matched pair agree to within a row.
+Across it they do not: matched Blinn-Phong is less than a third of Phong's width.
+
+### The streak
+
+Out of the plane of incidence the angle does not simply halve. Put the normal straight up,
+the light at angle θ from it on one side, and the eye at the same angle θ on the other side
+but turned sideways by a small angle φ around the normal. Working through the dot products
+with the small-angle approximation:
+
+```
+Phong:        dot(to_eye, reflected)  ≈  cos(φ sin θ)
+Blinn-Phong:  dot(N, H)               ≈  cos(φ tan θ / 2)
+```
+
+With the exponents matched, the widths across the plane differ by the ratio of those two
+angles:
+
+```
+(tan θ / 2) · 2  /  sin θ   =   1 / cos θ
+```
+
+At a normal viewing angle cos θ is close to 1 and the two agree. At a grazing angle cos θ is
+small, and Blinn-Phong's highlight is thinner across than along by that factor: a streak
+instead of a spot. In the sample the highlight's peak is where the floor reflects the lamp
+into the eye, 2.03 units beyond the lamp's foot, where tan θ = 2.03 / 0.55 and θ is 74.8°.
+The prediction is 1 / cos 74.8° = 3.8 times narrower. The table's 128 and 36 are a ratio of
+3.6, with perspective, attenuation and the half-peak threshold all leaning on it.
+
+<figure>
+  <img src="/img/5.1/highlight-shapes.png" alt="Three dark renders side by side of the lamp's highlight on the floor. Left: a broad rounded pool. Middle: a narrower, much longer pool. Right: a thin streak running from under the lamp toward the viewer" />
+  <figcaption>Specular only. Left, Phong at 16. Middle, Blinn-Phong at 16: twice as long,
+  already narrower. Right, Blinn-Phong at 64: Phong's length, a quarter of its width.</figcaption>
+</figure>
+
+This **highlight elongation** is not a flaw to be matched away. It is what glossy surfaces
+do: a low sun on wet tarmac or on water makes a long streak toward the viewer, not a round
+spot, because what reflects it is a scatter of small tilted facets, and at grazing angles a
+small sideways tilt of a facet moves the reflection a long way. Phong's lobe is round about
+the reflected ray whatever the angle, and so its highlight stays round. Part 6 builds the
+facet argument properly; Blinn-Phong is its first approximation.
+
+## Light on the wrong side
+
+One test is still missing from both models. Neither cosine knows whether the light is in
+front of the surface at all.
+
+For Phong, the reflection keeps the light's angle to the normal: `dot(N, reflected)` equals
+`dot(N, to_light)`, so if the light is behind the surface, the reflected ray points into it
+by the same amount. The eye is in front of the surface, so it can only be within 90° of that
+ray when both are close to grazing. Phong's leak is thin.
+
+Blinn-Phong's is not. The formula for `dot(N, H)` above is still a sum over a length, and now
+one term is negative. It is positive whenever the eye is further above the surface than the
+light is below it — which, for a face turned away from the lamp and towards the camera, is
+most of the time.
+
+Taking the test out and measuring the difference over the frame:
+
+| | Pixels that change | Largest change (of 255) |
+|---|---|---|
+| Phong, shininess 1 | 3,570 | 105 |
+| Phong, shininess 4 | 1,373 | 29 |
+| Blinn-Phong, 4 (4 × 1) | 67,728 | 71 |
+| Blinn-Phong, 16 (4 × 4) | 41,553 | 4 |
+
+Phong's changes are on the tops of the two nearest crates, and a sliver down the side of one.
+The lamp is below the tops, so they face away from it, and the eye skims across them — both near grazing, as the argument predicted.
+Blinn-Phong at a low exponent lights whole faces: the two crates nearest the camera have their
+lamp side at the back, and without the test their fronts glow.
+
+<figure>
+  <img src="/img/5.1/specular-leak.png" alt="Two renders of the room. Left: the two nearest crates are dark on the side facing the camera. Right: the same two crate faces are a flat, dull grey, as if lit from the front" />
+  <figcaption>Blinn-Phong at 4. Left, with the facing test. Right, without it: the faces
+  turned away from the lamp pick up a highlight they cannot have.</figcaption>
+</figure>
+
+The **specular leak** is fixed by the **facing test** the diffuse term already has: if
+`dot(N, to_light)` is not positive, the surface is facing away from the light and gets no
+highlight. At higher exponents the leak shrinks to almost nothing — 4 levels out of 255 at
+the default — which is why it is easy to ship without noticing, and why the test is in the
+shader regardless.
+
+## The scene
+
+The C++ is 4.5's with the mirror, the sky, the ferns and all six cube-face passes taken out.
+What is left is a floor, some crates and a lamp, drawn into the swapchain in one pass. The
+frame arena, the vertex pulling and the pointers are unchanged, and are not repeated here.
+
+The floor is 4.5's floor quad on its own, and there are four crates instead of two:
+
+```cpp title="code/src/5.advanced_lighting/blinn_phong/main.cpp"
+constexpr std::array<Vertex, 4> kFloorVertices{{
+    {{-kFloorHalf, kFloorY, -kFloorHalf}, {0, 1, 0}, {0, 0}},
+    {{-kFloorHalf, kFloorY, kFloorHalf}, {0, 1, 0}, {0, kFloorTiles}},
+    {{kFloorHalf, kFloorY, kFloorHalf}, {0, 1, 0}, {kFloorTiles, kFloorTiles}},
+    {{kFloorHalf, kFloorY, -kFloorHalf}, {0, 1, 0}, {kFloorTiles, 0}},
+}};
+
+constexpr std::array<uint16_t, 6> kFloorIndices{0, 1, 2, 2, 3, 0};
+```
+
+```cpp title="code/src/5.advanced_lighting/blinn_phong/main.cpp"
+constexpr std::array<Placement, 4> kCrates{{
+    {{-2.20F, kFloorY, 0.75F}, 0.36F, {1.0F, 1.0F}},
+    {{2.05F, kFloorY, -1.05F}, -0.72F, {1.0F, 1.0F}},
+    {{-1.35F, kFloorY, -3.40F}, 0.18F, {1.0F, 1.0F}},
+    {{3.10F, kFloorY, 1.60F}, 0.95F, {1.0F, 1.0F}},
+}};
+```
+
+The lamp hangs 0.55 above the floor. The whole of this chapter happens at grazing angles, and
+the nearer a light is to a surface, the more of that surface it meets at a grazing angle. The
+ambient is close to black, so the lamp is nearly all the light there is:
+
+```cpp title="code/src/5.advanced_lighting/blinn_phong/main.cpp"
+// One lamp, low over the floor. Low on purpose: the effect this chapter is about lives at
+// grazing angles, and a light close to a surface makes most of that surface grazing.
+constexpr glm::vec3 kLampPosition{0.0F, kFloorY + 0.55F, -0.60F};
+constexpr glm::vec3 kLampColour{1.0F, 0.87F, 0.68F};
+constexpr float kLampRadius = 0.06F;
+
+// Night: almost nothing but the lamp, so the lamp's highlight is what is on screen.
+constexpr glm::vec3 kAmbient{0.020F, 0.022F, 0.030F};
+
+// The shininess steps key 2 walks through, and where it starts. The low end is where
+// Phong breaks, so the sample opens near it.
+constexpr std::array<float, 5> kShininessSteps{1.0F, 4.0F, 16.0F, 64.0F, 256.0F};
+constexpr size_t kDefaultShininess = 1;
+```
+
+Globals loses `view_rotation`, which only the sky used, and trades the sun for a lamp. The
+last two fields are what the keys change:
+
+```cpp title="code/src/5.advanced_lighting/blinn_phong/main.cpp"
+// 4.5's Globals, rearranged for a point light instead of a sun. view_rotation went with
+// the sky that needed it. The last two fields are what the keys change.
+//
+// Two scalars at the end and no padding after them. A struct reached through a pointer
+// follows the scalar layout 4.5 described, so the C++ struct and the Slang one agree at
+// 200 bytes with nothing rounded up to sixteen.
+struct Globals {
+    glm::mat4 view;             // 0
+    glm::mat4 projection;       // 64
+    glm::vec4 view_position;    // 128
+    glm::vec4 light_position;   // 144
+    glm::vec4 light_colour;     // 160
+    glm::vec4 ambient;          // 176
+    float shininess;            // 192
+    uint32_t blinn;             // 196, 0 for Phong, 1 for Blinn-Phong
+};
+static_assert(offsetof(Globals, shininess) == 192);
+static_assert(sizeof(Globals) == 200);
+```
+
+`shininess` and `blinn` are four bytes each and sit at 192 and 196 with no padding after
+them. 4.5 explained why: a struct reached through a pointer uses the scalar layout, so the C++
+and Slang structs agree at 200 bytes without anything being rounded up to sixteen. The
+`static_assert`s check it.
+
+There is one more draw than there are crates, for the lamp:
+
+```cpp title="code/src/5.advanced_lighting/blinn_phong/main.cpp"
+constexpr uint32_t kFloorDraw = 0;
+constexpr uint32_t kFirstCrateDraw = kFloorDraw + 1;
+constexpr uint32_t kLampDraw = kFirstCrateDraw + static_cast<uint32_t>(kCrates.size());
+constexpr uint32_t kDrawCount = kLampDraw + 1;
+```
+
+## The shader
+
+The structs match main.cpp's. `Globals` has the two new light fields and the two scalars:
+
+```slang title="code/src/5.advanced_lighting/blinn_phong/scene.slang"
+// Matches Globals in main.cpp, 200 bytes, scalar layout.
+struct Globals {
+    float4x4 view;
+    float4x4 projection;
+    float4 view_position;
+    float4 light_position;
+    float4 light_colour;
+    float4 ambient;
+    float shininess;
+    uint blinn;
+};
+```
+
+The specular strength and 2.5's attenuation constants:
+
+```slang title="code/src/5.advanced_lighting/blinn_phong/scene.slang"
+static const float kSpecularStrength = 0.5;
+
+// 2.5's attenuation constants, unchanged. Chapter 5.7 replaces them with the
+// inverse-square law.
+static const float kConstantTerm = 1.0;
+static const float kLinearTerm = 0.09;
+static const float kQuadraticTerm = 0.032;
+```
+
+The vertex shader is 4.5's. The two cosines are one function each, so the choice between them
+is visible as a choice:
+
+```slang title="code/src/5.advanced_lighting/blinn_phong/scene.slang"
+// Phong's cosine: how closely the eye lines up with the light's mirror reflection.
+float phong_cosine(float3 normal, float3 to_light, float3 to_eye) {
+    float3 reflected = reflect(-to_light, normal);
+    return dot(to_eye, reflected);
+}
+
+// Blinn's cosine: how closely the normal lines up with the direction halfway between the
+// light and the eye -- the normal a mirror would need to send one into the other.
+float blinn_cosine(float3 normal, float3 to_light, float3 to_eye) {
+    float3 halfway = normalize(to_light + to_eye);
+    return dot(normal, halfway);
+}
+```
+
+`reflect(-to_light, normal)` is 2.2's reflection, of the direction the light travels, about
+the normal. `normalize(to_light + to_eye)` is the halfway vector. Both vectors point away from
+the surface, and both are unit length, so their sum points along the bisector.
+
+Then `shade`, which is 2.5's point light with the specular term chosen by `globals.blinn`:
+
+```slang title="code/src/5.advanced_lighting/blinn_phong/scene.slang"
+float3 shade(VSOutput input, float3 albedo) {
+    Globals globals = *push.globals;
+
+    float3 normal = normalize(input.normal);
+    float3 to_eye = normalize(globals.view_position.xyz - input.world_position);
+    float3 offset = globals.light_position.xyz - input.world_position;
+    float distance = length(offset);
+    float3 to_light = offset / distance;
+
+    float attenuation = 1.0 / (kConstantTerm + kLinearTerm * distance +
+                               kQuadraticTerm * distance * distance);
+
+    float facing = dot(normal, to_light);
+    float diffuse_amount = max(facing, 0.0);
+
+    float cosine = globals.blinn != 0 ? blinn_cosine(normal, to_light, to_eye)
+                                      : phong_cosine(normal, to_light, to_eye);
+    float specular_amount = pow(max(cosine, 0.0), globals.shininess);
+    // A surface facing away from the light gets no highlight. Without this test Phong
+    // leaks slivers at grazing angles and Blinn-Phong lights whole faces; the article
+    // measures both.
+    if (facing <= 0.0) {
+        specular_amount = 0.0;
+    }
+
+    float3 diffuse = diffuse_amount * albedo;
+    float3 specular = specular_amount * kSpecularStrength;
+    float3 lit = globals.light_colour.rgb * (diffuse + specular) * attenuation;
+    return globals.ambient.rgb * albedo + lit;
+}
+```
+
+`*push.globals` reads the whole 200-byte struct through the pointer once, into a local
+variable, instead of writing `push.globals.` in front of every field. The generated code is
+the same shape either way. It is shorter to read.
+
+`facing` is computed once and used twice: clamped for the diffuse term, and as the facing
+test for the specular one. The branch on `globals.blinn` takes the same side for every pixel
+of a frame, because every pixel reads the same globals.
+
+The ambient is added once, outside the attenuation. It stands for light that has bounced
+around the whole room, which does not fall off with distance from the lamp.
+
+The fragment entry point is 4.5's without the cutout variant, and the lamp gets one of its
+own that ignores lighting altogether:
+
+```slang title="code/src/5.advanced_lighting/blinn_phong/scene.slang"
+[shader("fragment")]
+float4 fragmentMain(VSOutput input) : SV_Target {
+    float3 tint = push.draws[push.draw_index].colour.rgb;
+    float3 albedo = base_colour_map.Sample(input.uv).rgb * tint;
+    return float4(shade(input, albedo), 1.0);
+}
+
+// The lamp itself: its colour, unlit.
+[shader("fragment")]
+float4 lampFragmentMain(VSOutput input) : SV_Target {
+    return float4(push.draws[push.draw_index].colour.rgb, 1.0);
+}
+```
+
+## The application
+
+`on_start` makes a floor mesh, a crate mesh and a small sphere for the lamp. `make_sphere` is
+4.5's; the lamp only needs 16 rings and 32 segments at this size:
+
+```cpp title="code/src/5.advanced_lighting/blinn_phong/main.cpp"
+class BlinnPhongApp : public vkc::App {
+public:
+    using vkc::App::App;
+
+protected:
+    void on_start() override {
+        cube_ = upload_mesh(context(), kCubeVertices, kCubeIndices);
+        floor_ = upload_mesh(context(), kFloorVertices, kFloorIndices);
+
+        const auto [sphere_vertices, sphere_indices] = make_sphere(16, 32, kLampRadius);
+        lamp_ = upload_mesh(context(), sphere_vertices, sphere_indices);
+
+        depth_format_ = vkc::choose_depth_format(context().physical_device());
+
+        load_textures();
+        create_arenas();
+        create_descriptors();
+        create_depth_buffer(swapchain().extent());
+        create_pipelines();
+
+        draws_.reserve(kDrawCount);
+
+        camera_.position = {0.0F, 0.35F, 6.40F};
+        camera_.pitch = -9.0F;
+
+        spdlog::info("1 Phong / Blinn-Phong, 2 shininess, 3 match exponents.");
+        log_specular();
+    }
+```
+
+The three keys each flip or step one piece of state and print the result:
+
+```cpp title="code/src/5.advanced_lighting/blinn_phong/main.cpp"
+    void on_event(const SDL_Event& event) override {
+        camera_.handle_event(event, window().handle());
+
+        if (event.type != SDL_EVENT_KEY_DOWN || event.key.repeat) {
+            return;
+        }
+        switch (event.key.scancode) {
+            case SDL_SCANCODE_1:
+                blinn_ = !blinn_;
+                log_specular();
+                break;
+            case SDL_SCANCODE_2:
+                shininess_step_ = (shininess_step_ + 1) % kShininessSteps.size();
+                log_specular();
+                break;
+            case SDL_SCANCODE_3:
+                matched_ = !matched_;
+                log_specular();
+                break;
+            default:
+                break;
+        }
+    }
+```
+
+```cpp title="code/src/5.advanced_lighting/blinn_phong/main.cpp"
+    void on_shutdown() override {
+        const VkDevice device = context().device();
+
+        vkDestroyPipeline(device, lamp_pipeline_, nullptr);
+        vkDestroyPipeline(device, opaque_pipeline_, nullptr);
+        vkDestroyPipelineLayout(device, pipeline_layout_, nullptr);
+        vkDestroyDescriptorPool(device, descriptor_pool_, nullptr);
+        vkDestroyDescriptorSetLayout(device, texture_set_layout_, nullptr);
+
+        sampler_.destroy();
+        floor_map_.destroy();
+        crate_map_.destroy();
+
+        for (FrameArena& arena : arenas_) {
+            arena.destroy();
+        }
+        depth_.destroy();
+        lamp_.destroy();
+        floor_.destroy();
+        cube_.destroy();
+    }
+```
+
+There is one pass now, so `on_render` records it inline: the floor, the crates, then the lamp
+with its own pipeline. The clear colour is black, because it is night:
+
+```cpp title="code/src/5.advanced_lighting/blinn_phong/main.cpp"
+    void on_render(const vkc::FrameInfo& frame) override {
+        camera_.update(delta_time());
+
+        // Everything the shaders will read this frame is written here, into this frame
+        // slot's arena, in the order the frame happens to want it. The arena is emptied
+        // first: the GPU finished with the last frame that used this slot before the
+        // command buffer was handed over, so there is nothing left in it to protect.
+        FrameArena& arena = arenas_[frame.frame_number % vkc::kFramesInFlight];
+        arena.reset();
+
+        write_globals(arena, frame.extent);
+        write_draws(arena);
+
+        vkc::begin_rendering(frame.cmd, frame.view, depth_.view(), frame.extent,
+                             {{0.0F, 0.0F, 0.0F, 1.0F}});
+        set_viewport(frame.cmd, frame.extent);
+
+        bind_indices(frame.cmd, floor_);
+        vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, opaque_pipeline_);
+        bind_texture(frame.cmd, floor_set_);
+        push(frame.cmd, floor_.vertex_address, kFloorDraw);
+        vkCmdDrawIndexed(frame.cmd, floor_.index_count, 1, 0, 0, 0);
+
+        bind_indices(frame.cmd, cube_);
+        bind_texture(frame.cmd, crate_set_);
+        for (uint32_t i = 0; i < kCrates.size(); ++i) {
+            push(frame.cmd, cube_.vertex_address, kFirstCrateDraw + i);
+            vkCmdDrawIndexed(frame.cmd, cube_.index_count, 1, 0, 0, 0);
+        }
+
+        // The lamp is drawn as its own colour and nothing else, so it reads as the
+        // source of the light rather than as something the light falls on.
+        bind_indices(frame.cmd, lamp_);
+        vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, lamp_pipeline_);
+        push(frame.cmd, lamp_.vertex_address, kLampDraw);
+        vkCmdDrawIndexed(frame.cmd, lamp_.index_count, 1, 0, 0, 0);
+
+        vkCmdEndRendering(frame.cmd);
+    }
+```
+
+`exponent` is where matching happens. The shader does not know the exponent was scaled; it
+raises whichever cosine it computed to whatever number it is given:
+
+```cpp title="code/src/5.advanced_lighting/blinn_phong/main.cpp"
+    // The exponent the shader is given. Matching is a CPU-side decision: the shader
+    // raises whichever cosine it computed to whatever number arrives here, and does not
+    // know or care that the number was scaled.
+    [[nodiscard]] float exponent() const {
+        const float shininess = kShininessSteps[shininess_step_];
+        return blinn_ && matched_ ? shininess * kBlinnExponentScale : shininess;
+    }
+
+    void write_globals(FrameArena& arena, VkExtent2D extent) {
+        const Globals globals{
+            .view = camera_.view(),
+            .projection = projection(extent),
+            .view_position = glm::vec4(camera_.position, 1.0F),
+            .light_position = glm::vec4(kLampPosition, 1.0F),
+            .light_colour = glm::vec4(kLampColour, 1.0F),
+            .ambient = glm::vec4(kAmbient, 1.0F),
+            .shininess = exponent(),
+            .blinn = blinn_ ? 1U : 0U,
+        };
+        globals_address_ = arena.write(&globals, sizeof(globals));
+    }
+
+    void write_draws(FrameArena& arena) {
+        draws_.clear();
+
+        draws_.push_back(draw_data_of(glm::mat4(1.0F), kWhite));
+
+        for (const Placement& crate : kCrates) {
+            draws_.push_back(draw_data_of(
+                glm::translate(model_of(crate), glm::vec3(0.0F, 0.5F, 0.0F)), kWhite));
+        }
+
+        draws_.push_back(draw_data_of(glm::translate(glm::mat4(1.0F), kLampPosition),
+                                      glm::vec4(kLampColour, 1.0F)));
+
+        draws_address_ = arena.write(draws_.data(), draws_.size() * sizeof(DrawData));
+    }
+```
+
+The lamp's `DrawData` carries its colour in the `colour` field, which is what
+`lampFragmentMain` reads. `log_specular` prints the line shown at the top of the chapter:
+
+```cpp title="code/src/5.advanced_lighting/blinn_phong/main.cpp"
+    void log_specular() const {
+        spdlog::info("{}, shininess {}{}", blinn_ ? "Blinn-Phong" : "Phong", exponent(),
+                     blinn_ && matched_ ? std::format(" (4 x {})",
+                                                      kShininessSteps[shininess_step_])
+                                        : "");
+    }
+```
+
+`push` no longer takes a globals address, because there is only one set of globals per
+frame now. `projection` is 4.5's `screen_projection`, renamed now that there is no other
+kind:
+
+```cpp title="code/src/5.advanced_lighting/blinn_phong/main.cpp"
+    void push(VkCommandBuffer cmd, VkDeviceAddress vertices, uint32_t draw_index) {
+        const PushConstants constants{
+            .globals = globals_address_,
+            .draws = draws_address_,
+            .vertices = vertices,
+            .draw_index = draw_index,
+        };
+        vkCmdPushConstants(cmd, pipeline_layout_,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                           sizeof(constants), &constants);
+    }
+```
+
+```cpp title="code/src/5.advanced_lighting/blinn_phong/main.cpp"
+    [[nodiscard]] static glm::mat4 projection(VkExtent2D extent) {
+        const float aspect =
+            static_cast<float>(extent.width) / static_cast<float>(extent.height);
+        glm::mat4 projection =
+            glm::perspective(glm::radians(45.0F), aspect, 0.1F, 100.0F);
+        projection[1][1] *= -1.0F;  // Vulkan's clip-space y points down.
+        return projection;
+    }
+```
+
+Two textures, so two descriptor sets:
+
+```cpp title="code/src/5.advanced_lighting/blinn_phong/main.cpp"
+        constexpr uint32_t kTextureSets = 2;  // crate, floor
+```
+
+And two pipelines from one shader module, differing only in their fragment entry point:
+
+```cpp title="code/src/5.advanced_lighting/blinn_phong/main.cpp"
+        const VkShaderModule scene_shader =
+            vkc::load_shader(device, LVK_CHAPTER_ID, "scene.slang");
+
+        const auto base = [&](const char* fragment_entry) -> vkc::PipelineBuilder {
+            return vkc::PipelineBuilder(device)
+                .shaders(scene_shader, "vertexMain", fragment_entry)
+                .colour_attachment(swapchain().format())
+                .cull(VK_CULL_MODE_BACK_BIT, VK_FRONT_FACE_COUNTER_CLOCKWISE)
+                .depth(depth_format_, /*test=*/true, /*write=*/true)
+                .layout(pipeline_layout_);
+        };
+        opaque_pipeline_ = base("fragmentMain").build();
+        lamp_pipeline_ = base("lampFragmentMain").build();
+
+        vkDestroyShaderModule(device, scene_shader, nullptr);
+
+        context().name(opaque_pipeline_, VK_OBJECT_TYPE_PIPELINE, "scene opaque");
+        context().name(lamp_pipeline_, VK_OBJECT_TYPE_PIPELINE, "lamp");
+    }
+```
+
+The members, and `main`:
+
+```cpp title="code/src/5.advanced_lighting/blinn_phong/main.cpp"
+    vkc::Camera camera_;
+
+    Mesh cube_;
+    Mesh floor_;
+    Mesh lamp_;
+
+    VkFormat depth_format_ = VK_FORMAT_UNDEFINED;
+    vkc::Image depth_;
+
+    // One arena per frame in flight, and the addresses this frame wrote into it.
+    std::array<FrameArena, vkc::kFramesInFlight> arenas_;
+    VkDeviceAddress globals_address_ = 0;
+    VkDeviceAddress draws_address_ = 0;
+    std::vector<DrawData> draws_;
+
+    vkc::Image crate_map_;
+    vkc::Image floor_map_;
+    vkc::Sampler sampler_;
+
+    VkDescriptorSet crate_set_ = VK_NULL_HANDLE;
+    VkDescriptorSet floor_set_ = VK_NULL_HANDLE;
+
+    VkDescriptorSetLayout texture_set_layout_ = VK_NULL_HANDLE;
+    VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
+
+    VkPipelineLayout pipeline_layout_ = VK_NULL_HANDLE;
+    VkPipeline opaque_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline lamp_pipeline_ = VK_NULL_HANDLE;
+
+    bool blinn_ = true;
+    bool matched_ = true;
+    size_t shininess_step_ = kDefaultShininess;
+};
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    try {
+        vkc::App::Options options{};
+        options.title = "LearnVulkan 5.1 - Blinn-Phong";
+        BlinnPhongApp app(vkc::App::parse_args(argc, argv, options));
+        return app.run();
+    } catch (const std::exception& error) {
+        spdlog::error("{}", error.what());
+        return EXIT_FAILURE;
+    }
+}
+```
+
+The build entry lists the one shader:
+
+```cmake title="code/src/5.advanced_lighting/blinn_phong/CMakeLists.txt"
+add_chapter(5.1.blinn_phong
+    SOURCES main.cpp
+    SHADERS scene.slang
+)
+```
+
+:::note[What moved into vkcommon]
+Nothing. This chapter uses `vkc::begin_rendering` and `vkc::PipelineBuilder` from 1.7,
+`vkc::load_texture` from 1.11 and `vkc::create_depth_buffer` from 1.13. The frame arena
+and `buffer_address` stay in the sample, as they have since 4.5.
+:::
+
+## What changed since 4.5
+
+- a new part, and a new scene: 4.5's room at night, one lamp, no sky, no mirror, no ferns
+- a point light with 2.5's attenuation, in place of the sun
+- Blinn-Phong's halfway vector beside Phong's reflection vector, chosen per frame
+- the exponent scaled by four when switching, and why four
+- the facing test on the specular term
+- one pass instead of seven, so one set of globals and a simpler `push`
+- 35 chapters in the build now
+
+## Words introduced in this chapter
+
+| | |
+|---|---|
+| **Blinn-Phong** | Phong's model with the specular cosine measured between the normal and the halfway vector |
+| **halfway vector** | `normalize(to_light + to_eye)`: the normal a mirror would need to reflect the light into the eye |
+| **specular lobe** | the shape of the specular term around its peak, over all the directions the eye could be in |
+| **grazing angle** | a direction nearly along a surface, far from its normal |
+| **hemisphere** | the half of all directions on a surface's outward side |
+| **lobe clipping** | Phong's `max` discarding the part of its lobe more than 90° from the reflected ray |
+| **crease** | a sudden change in how fast brightness changes; the eye reads it as an edge |
+| **plane of incidence** | the plane containing the normal and the incoming light |
+| **exponent matching** | giving Blinn-Phong four times Phong's exponent, so the highlights agree in the plane of incidence |
+| **small-angle approximation** | cos *x* ≈ 1 − *x*²/2 for small *x*; with it, cosⁿ*x* ≈ exp(−*n x*²/2) |
+| **highlight elongation** | Blinn-Phong's highlight stretching into a streak at grazing angles, by 1 / cos θ |
+| **specular leak** | a highlight on a surface facing away from the light |
+| **facing test** | giving no specular where `dot(N, to_light)` is not positive |
+| **infinite viewer** | treating the eye as infinitely far away, so `to_eye` and, with a distant light, *H* are constant |
+
+## Exercises
+
+1. Set the shininess to 1 with Phong, then fly the camera upward. Using the circle formula,
+   predict what happens to the edge beyond the lamp as *c* grows, and check it.
+2. Replace Phong's `max(cosine, 0.0)` with `abs(cosine)`. What does the floor do beyond the
+   circle, and why is that worse than the clipping?
+3. Turn matching off and switch between the models at shininess 256. Is the difference in
+   the size of the highlight what the plane-of-incidence argument predicts?
+4. Move the lamp up to 3 units above the floor. The ratio 1 / cos θ at the peak falls: work
+   out its new value and see whether the streak really gets rounder.
+5. Take the facing test out and find the lowest shininess at which you can no longer see the
+   leak on the crates. Compare it with the table.
+6. Make the light directional again — 4.5's sun — and compute *H* once on the CPU with the
+   camera's forward direction standing in for `to_eye`. What does the infinite viewer get
+   wrong on the floor?
+
+Next: 5.2 is about the other thing Part 2's review deferred. The lamp's light is added up in
+linear light and written to an sRGB swapchain, and the ambient, the attenuation and the
+shininess all look the way they do partly because of what that conversion does.

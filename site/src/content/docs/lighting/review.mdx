@@ -164,8 +164,8 @@ because each fragment asks only "which way is the light" and never "can I see it
 the largest single gap between Part 2 and a believable image. Chapter 5.3 closes it, and
 5.4 does it for point lights.
 
-**Specular is Phong, not Blinn-Phong.** The reflection-vector formulation breaks down at
-grazing angles and costs more than the half-vector version. Chapter 5.1.
+**Specular is Phong, not Blinn-Phong.** The reflection-vector formulation cuts its own
+highlight off at grazing angles, in a hard curve behind the light. Chapter 5.1.
 
 **Every light shades every fragment.** 2.6's loop runs for all six lights on every fragment
 of every crate, including the four bulbs too distant to contribute anything visible. Fine at
