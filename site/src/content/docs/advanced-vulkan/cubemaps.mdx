@@ -766,7 +766,6 @@ And one allocator for all five, taking the view and sampler directly rather than
         };
         VkDescriptorSet set = VK_NULL_HANDLE;
         VK_CHECK(vkAllocateDescriptorSets(device, &alloc, &set));
-
 ```
 
 The rest of it is 4.3's `allocate_material_set` with `view` and `sampler` in place of the

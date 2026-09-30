@@ -196,6 +196,12 @@
       "sample": "4.advanced_vulkan/slang_modules",
       "previous": "4.advanced_vulkan/anti_aliasing",
       "article": "advanced-vulkan/slang-modules.mdx"
+    },
+    {
+      "id": "4.9.compute",
+      "sample": "4.advanced_vulkan/compute",
+      "previous": "4.advanced_vulkan/slang_modules",
+      "article": "advanced-vulkan/compute.mdx"
     }
   ]
 }

@@ -1,6 +1,6 @@
 ---
 title: Review
-description: What 4.1 to 4.5 built, the frame they add up to, the mathematics each one derived, every barrier in the part, and the things Part 4 does badly on purpose.
+description: What 4.1 to 4.9 built, the frame they add up to, the mathematics each one derived, every barrier in the part, what reached vkcommon, and the things Part 4 does badly on purpose.
 sidebar:
   order: 99
 ---
@@ -10,8 +10,9 @@ them with the fixed-function state 1.13 had set up once and never questioned: `L
 against a buffer cleared to 1.0, back faces culled, no blending, one render target, and a
 descriptor for every buffer a shader read.
 
-Part 4 so far has taken each of those apart. This page reviews chapters 4.1 to 4.5; it will
-grow as the rest of the part — instancing and compute among it — is written.
+Part 4 took each of those apart, and then used what it had learned on a scene of its own: a
+planet and a belt of up to a hundred thousand rocks, drawn in one call, multisampled, lit by
+shaders built from modules, and moved every frame by a compute shader.
 
 This chapter has no new code.
 
@@ -24,10 +25,15 @@ This chapter has no new code.
 | 4.3 | a render target of your own; two precise barriers; a fullscreen triangle; convolution kernels; a render scale |
 | 4.4 | a sky from a cubemap; a six-face render target; six cameras; reflection, refraction and Fresnel |
 | 4.5 | buffer device addresses; a frame arena; vertex pulling; five descriptor sets where there were nineteen |
+| 4.6 | instanced drawing, three ways; timestamp queries; a reproducible hash-based random stream; a procedural rock |
+| 4.7 | multisampling at 1× to 8×, resolved at the end of rendering; sample shading; transient attachments |
+| 4.8 | shader code in Slang modules; an interface and a generic for materials; a procedural starfield |
+| 4.9 | a compute pipeline; Kepler orbits for every rock, every frame; a buffer barrier; the same work on the CPU |
 
 ## The frame, assembled
 
-4.5's frame is every chapter of the part in one command buffer:
+The part has two frames worth drawing. 4.5's is the first half of the part in one command
+buffer:
 
 ```
    on_render
@@ -52,6 +58,30 @@ This chapter has no new code.
 
 Every draw in it pushes 32 bytes — three addresses and an index — and binds exactly one
 descriptor set, for its texture.
+
+4.9's is the second half:
+
+```
+   on_render
+      │
+      ├── read last time's timestamps for this slot                ── 4.6
+      ├── arena.reset(), write 1 × Globals                         ── 4.5
+      ├── reset both timer pairs              (outside rendering)  ── 4.6
+      │
+      ├── GPU path:                                                ── 4.9
+      │      bind compute pipeline, push OrbitPush
+      │      dispatch ⌈N / 64⌉ workgroups      ──▶ N × Instance into device memory
+      │      buffer barrier: compute write ──▶ vertex read, next dispatch's write
+      │   CPU path:
+      │      N × rock_at() into the arena      ──▶ 116 × (N + 1) bytes
+      │
+      └── rendering pass, into N samples, resolved into the swapchain  ── 4.7
+             planet            1 instance, banded material          ── 4.8
+             rocks             N instances, 1 draw                  ── 4.6
+             stars             fullscreen triangle, additive, depth 1.0  ── 4.8
+```
+
+No descriptors at all: every piece of data is reached by address, and the scene has no textures.
 
 ## The mathematics Part 4 derived
 
@@ -98,6 +128,30 @@ gives `F₀ = ((n₁ − n₂)/(n₁ + n₂))²` — 0.043 for glass, the 0.04 i
 
 **Rounding up to a power of two is a mask** (4.5): `(x + a − 1) & ~(a − 1)`.
 
+**Twenty-four bits make an exact float** (4.6). A `float` has 24 significant bits, so the top
+24 bits of a hash times 2⁻²⁴ is one of 2²⁴ evenly spaced values in [0, 1), every one exact, and
+never 1.0 — which converting all 32 bits would sometimes produce.
+
+**Uniform over an area means the square root of a uniform radius²** (4.6). Setting the fraction
+of rocks inside radius *r* equal to the fraction of the annulus's area gives
+`r = √(a² + u(b² − a²))`. Measured on 5,000 rocks: 7.67 and 7.68 per unit² at the two edges,
+against 10.40 and 5.91 for a uniform radius.
+
+**N samples give N + 1 coverage levels, and the resolve averages light** (4.7). A white disc on
+black resolved to exactly the sRGB encodings of *k*/*N* — 188 at 2×, 137/188/225 at 4× — so the
+average was taken in linear space, which the specification says a driver *should*, not *must*, do.
+
+**A view ray comes from the projection's diagonal** (4.8). For a symmetric perspective,
+`x = ndc.x / P00`, `y = ndc.y / P11`, `z = −1`, rotated into the world by the transpose of the
+view's rotation.
+
+**Orbits obey Kepler** (4.9): `GM/r² = ω²r`, so `ω = √(GM/r³)` and the period squared goes as the
+radius cubed — the inner edge overtakes the outer, the opposite of 4.6's rigid disc.
+
+**A rotation about an axis is Rodrigues' formula** (4.9), `v cos θ + (k × v) sin θ + k(k·v)(1 − cos θ)`,
+and **a normal matrix needs no inverse** when the model is a rotation times a scale:
+`((RS)⁻¹)ᵀ = R S⁻¹`, the rotation's columns divided by the scale.
+
 ## The Vulkan lessons
 
 **Pipeline state changes the picture as much as shaders do.** 4.1's outline and 4.2's glass are
@@ -120,7 +174,20 @@ because nothing had made the writes visible.
 | 4.5 | one arena, by address | 5 | 1 | 32 B |
 
 The five that remain in 4.5 are all textures. An image is bytes *plus* format, tiling, swizzle
-and filtering, and no 64-bit number can carry that.
+and filtering, and no 64-bit number can carry that. 4.6 to 4.9 have no textures and no
+descriptor sets at all.
+
+**Measure where the cost is before believing where it is said to be.** 4.6 found a draw call
+costs about 12 ns of CPU to record in a release build — the OpenGL-era argument for instancing
+barely applies — and that the real costs were the GPU's per-draw overhead on small meshes and
+the validation layers' 710 ns per draw. 4.7 found 8× multisampling costs 20% more GPU time on
+this GPU and 16 times the attachment memory. 4.9 found the GPU updates 100,000 rocks 124 times
+faster than one CPU core.
+
+**Some bugs are invisible to every tool.** 4.9's compute-to-vertex barrier, removed, produced
+no validation message — synchronization validation included — and no pixel of difference in
+three runs. It is required by the specification all the same. The reasoning that derives it is
+the only check there is.
 
 ## Every barrier in Part 4
 
@@ -131,23 +198,27 @@ and filtering, and no 64-bit number can carry that.
 | 4.4, into the live cube | same as 4.3's first, all six layers | | | write after read |
 | 4.4, between faces | depth, unchanged | late fragment tests / depth write | early fragment tests / depth write | write after write |
 | 4.4, out of the live cube | same as 4.3's second, all six layers | | | read after write |
+| 4.9, the instance buffer | none — a buffer has no layout | compute shader / storage write | vertex shader + compute shader / storage read + write | read after write; write after write, across frames |
 
 The two 4.3 barriers chain across frames through the fragment-shader stage they share, which
 is how the second one also protects the first frame's writes from the next frame's layout
-transition.
+transition. 4.9's reaches across frames differently: a barrier's second scope is everything
+after it in submission order, so naming the compute stage there covers the next frame's
+dispatch. The write-after-read in the other direction needs no barrier of its own; vkcommon's
+`ALL_COMMANDS` frame-start barrier supplies the execution dependency it needs.
 
 ## What is in `vkcommon` now
 
-**Nothing new, for the third part running.** Every file in `code/common/` is still owned by a
-chapter in Part 1. What Part 4 did instead was be the first to *call* things Part 1 had written
-and set aside for it:
+Through 4.6, **nothing new**: every file in `code/common/` was still owned by a chapter in Part 1.
+What the part did instead was be the first to *call* things Part 1 had written and set aside
+for it:
 
 | Written in | Used first in |
 |---|---|
 | 1.3 — `shaderDemoteToHelperInvocation` | 4.2, the first `discard` |
 | 1.3 — `bufferDeviceAddress`, `scalarBlockLayout` | 4.5, the first pointer |
 | 1.7 — `depth_bias`, `stencil_attachment`, `stencil_test` | 4.1 |
-| 1.7 — `colour_blend`, `alpha_blending` | 4.2 |
+| 1.7 — `colour_blend`, `alpha_blending` | 4.2, and 4.8's additive stars |
 | 1.7 — `vkc::image_barrier` | 4.3 |
 | 1.11 — `ImageDesc::array_layers`, `cube`, `vkc::load_cubemap` | 4.4 |
 
@@ -156,8 +227,18 @@ versions of `image_barrier` and of cubemap creation and loading; they now use th
 and render byte-identically for it — 4.4's static-sky round trip still reads zero pixels
 different.
 
+4.7 is the part's one addition, and it follows the rule the series set in 1.1:
+
+| Added | Written out in | In `vkcommon` from |
+|---|---|---|
+| `vkc::GpuTimer`, the `vkc_timer` piece | 4.6 | 4.7 |
+| `ImageDesc::samples` | — (a field 4.7 needs) | 4.7 |
+| `PipelineBuilder::multisample` | — (a pass-through 4.7 needs) | 4.7 |
+| `sampleRateShading` in `device.cpp` | — (a feature 4.7 needs) | 4.7 |
+
 What stays in the chapters is what only they need: 4.1's depth-stencil buffer and three-attachment
-`begin_rendering`, 4.4's six per-face views, and 4.5's `buffer_address` and `FrameArena`.
+`begin_rendering`, 4.4's six per-face views, 4.5's `buffer_address` and `FrameArena` — carried
+through to 4.9 — 4.7's resolving `begin_rendering`, and 4.9's hand-written compute pipeline.
 
 ## Things Part 4 does badly on purpose
 
@@ -176,9 +257,21 @@ never happens and the glass has no back. And one `F₀` serves water, glass and 
 validation message for a stale one; GPU-assisted validation is the tool for that, and it has not
 been needed yet.
 
-**The shaders repeat themselves.** 4.5's two shaders declare the same four structs word for word,
-and the C++ declares them a third time. With descriptors gone, those declarations are the only
-contract between the two sides — which is the problem 4.8 takes on.
+**The C++ and the Slang still say everything twice.** 4.8 stopped shader files repeating each
+other, but the structs and 4.9's belt constants are still declared once in C++ and once in
+Slang, held together only by `static_assert`s and pixel comparisons.
+
+**The GPU and the CPU disagree about where the rocks are.** 4.9's two paths differ in 140 to 425
+pixels, because a GPU `cos` is only required to be within 2⁻¹¹ inside [−π, π], and the angles are
+never brought into that range.
+
+**Compute waits for nothing and nothing waits for it.** The dispatch runs on the one queue, in
+line with the drawing. A second, compute-only queue could overlap it with the previous frame's
+rendering; that needs queue ownership transfers and semaphores between queues, and it is a later
+subject.
+
+**The stars are cut at cube edges.** 4.8's starfield checks only the cube each ray lands in, so a
+star near a cube's edge is sliced off where its neighbours begin.
 
 ## Before moving on
 
@@ -189,6 +282,8 @@ diff code/src/4.advanced_vulkan/cubemaps/main.cpp \
      code/src/4.advanced_vulkan/buffer_device_address/main.cpp
 ```
 
-The pictures differ in one pixel by one level. The diff is most of the file. That is the part's
-last lesson in one command: the same frame can be delivered by very different plumbing, and a
-pixel comparison against a known-good image is how you know the new plumbing is right.
+The pictures differ in one pixel by one level. The diff is most of the file. The second half of
+the part says the same thing three more times — 4.7 at 1× against 4.6, 4.8 without stars
+against 4.7, and 4.9's CPU path against 4.8, all zero or within four pixels — and that is the
+part's last lesson: the same frame can be delivered by very different plumbing, and a pixel
+comparison against a known-good image is how you know the new plumbing is right.

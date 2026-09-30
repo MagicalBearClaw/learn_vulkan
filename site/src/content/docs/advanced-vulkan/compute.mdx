@@ -1,0 +1,1199 @@
+---
+title: "Compute"
+description: The GPU's other kind of pipeline. A compute shader moves every rock along its own Kepler orbit each frame, one thread per rock — dispatch arithmetic, a buffer barrier derived hazard by hazard, and a measured comparison with the same work done on the CPU.
+sidebar:
+  order: 9
+---
+
+<figure>
+  <img src="/img/reference/4.9.compute.png" alt="The banded planet and its belt of rocks against a starry sky, as in the previous chapter" />
+  <figcaption>Chapter 4.9 at time zero, where every rock is where 4.6 put it. Press
+  <kbd>6</kbd> and the belt starts to move — the inner edge overtaking the outer.</figcaption>
+</figure>
+
+Since 4.6 the belt has turned as one rigid disc: one rotation matrix in the globals,
+multiplied into every rock in the vertex shader. It was cheap, and it was wrong. A rigid disc
+moves fastest at its rim, and a real belt does the opposite — each rock is in its own orbit,
+and the inner ones go round faster. Getting that right means every rock needs its own matrix
+for every frame: a hundred thousand model matrices and a hundred thousand normal matrices,
+recomputed sixty times a second.
+
+That is a lot of the same small calculation, each copy independent of every other. The GPU
+was built for exactly that shape of work, and until now this series has only used it to
+draw. This chapter uses its other kind of pipeline: a **compute pipeline**, which runs a
+**compute shader** — a program with no vertices, no pixels and no rasteriser, just many copies
+of one function, each told which copy it is.
+
+The same work can also be done on the CPU, as 4.5's frame arena would have done it. The
+sample does it both ways, with the same arithmetic in both, and times them.
+
+- <kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd> <kbd>4</kbd> 1×, 2×, 4× or 8× multisampling
+- <kbd>5</kbd> sample shading
+- <kbd>6</kbd> orbits on or off
+- <kbd>7</kbd> stars on or off
+- <kbd>8</kbd> update the rocks on the GPU (default) or on the CPU
+- <kbd>-</kbd> / <kbd>=</kbd> fewer / more rocks
+
+The build file gains `orbits.slang`:
+
+```cmake title="code/src/4.advanced_vulkan/compute/CMakeLists.txt"
+add_chapter(4.9.compute
+    SOURCES main.cpp
+    SHADERS scene.slang random.slang surfaces.slang stars.slang orbits.slang
+)
+```
+
+and the includes gain `<chrono>` back, for timing the CPU path:
+
+```cpp title="code/src/4.advanced_vulkan/compute/main.cpp"
+// 4.9 Compute
+//
+// 4.8's belt, moving the way a belt of rocks actually moves.
+//
+// 4.6 to 4.8 turned the whole belt as one rigid disc: one matrix in the globals, applied
+// to every rock, so the outer edge went fastest. Real orbits are the other way round --
+// the inner rocks overtake the outer ones -- and every rock also tumbles at its own rate.
+// That means a new model matrix and a new normal matrix for every rock, every frame.
+//
+// There are two ways to do that here, on key 8: a loop on the CPU that writes the
+// matrices into the frame arena, as 4.5 would have, or a compute shader that writes them
+// into a device-local buffer, one GPU thread per rock. Both run the same arithmetic.
+//
+//   1 2 3 4   1x, 2x, 4x, 8x multisampling
+//   5         sample shading
+//   6         orbits on or off
+//   7         stars on or off
+//   8         update on the GPU (default) or on the CPU
+//   - =       fewer / more rocks
+
+#include <vkc/app.hpp>
+#include <vkc/buffer.hpp>
+#include <vkc/camera.hpp>
+#include <vkc/check.hpp>
+#include <vkc/frame.hpp>
+#include <vkc/image.hpp>
+#include <vkc/pipeline.hpp>
+#include <vkc/timer.hpp>
+
+#include <SDL3/SDL.h>
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_inverse.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <spdlog/spdlog.h>
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstddef>
+#include <cstdlib>
+#include <cstring>
+#include <exception>
+#include <format>
+#include <map>
+#include <numbers>
+#include <span>
+#include <stdexcept>
+#include <utility>
+#include <vector>
+
+namespace {
+```
+
+## How a belt moves
+
+A rock in a circular orbit of radius *r* is held on its circle by the planet's gravity. The
+gravitational acceleration at distance *r* from a planet of mass *M* is *GM*/*r*², where *G*
+is the gravitational constant. Moving in a circle at angular speed ω — radians per second —
+needs a centripetal acceleration of ω²*r* towards the centre. For a circular orbit, gravity
+supplies exactly that:
+
+```text
+GM / r²  =  ω² r
+
+      ω  =  √( GM / r³ )                      the angular speed at radius r
+
+      T  =  2π / ω  =  2π √( r³ / GM )        the period: one orbit, in seconds
+
+so  T² = (4π² / GM) · r³                      the square of the period goes as the cube
+                                              of the radius
+```
+
+The last line is **Kepler's third law**. The rock's own mass cancels out of the first line,
+which is why a pebble and a boulder at the same radius orbit together. **Angular speed** falls
+off as *r*^−3/2, so the inner edge of the belt goes round fastest; the speed along the orbit,
+ω*r* = √(*GM*/*r*), falls off too, just more slowly.
+
+The sample picks *GM* for how the result looks rather than for any real planet: 72, in scene
+units, which gives
+
+| radius | ω (rad/s) | period | speed along the orbit |
+|---|---|---|---|
+| 9 (inner edge) | 0.314 | 20.0 s | 2.83 units/s |
+| 13 | 0.181 | 34.7 s | 2.35 units/s |
+| 17 (outer edge) | 0.121 | 51.9 s | 2.06 units/s |
+
+In twenty seconds the inner edge makes a whole lap while the outer edge makes less than two
+fifths of one. 4.6's rigid rotation had the rim at 0.85 units a second and the inner edge at
+0.45 — the wrong way round.
+
+Every rock also tumbles about its own axis, at its own rate, up to half a radian a second
+either way. The constants, and the compute shader's push constants alongside the graphics
+ones:
+
+```cpp title="code/src/4.advanced_vulkan/compute/main.cpp"
+// Each rock tumbles about its own axis at up to this many radians a second.
+constexpr float kMaxTumble = 0.5F;
+
+// GM, the planet's mass times the gravitational constant, in this scene's units. Chosen
+// for the periods it gives, not for any real planet: 2 pi sqrt(r^3 / GM) is 20 seconds at
+// the inner edge, radius 9, and 52 at the outer, radius 17.
+constexpr float kGravity = 72.0F;
+
+// Threads per workgroup. Must match [numthreads] in orbits.slang.
+constexpr uint32_t kWorkgroupSize = 64;
+```
+
+```cpp title="code/src/4.advanced_vulkan/compute/main.cpp"
+// The compute shader's push constants: where to write, which slots, and when. The shader
+// puts the four fields at offsets 0, 8, 12 and 16, and so does C++. C++ then pads the
+// struct to 24 bytes, a multiple of the address's 8-byte alignment; the shader reads the
+// first 20, and the push-constant range covers all 24.
+struct OrbitPush {
+    VkDeviceAddress instances;  // 0
+    uint32_t first;             // 8
+    uint32_t count;             // 12
+    float time;                 // 16
+};
+static_assert(sizeof(OrbitPush) == 24);
+```
+
+`OrbitPush` is what the compute shader is told each frame: the address of the instance buffer,
+which slot the first rock goes in, how many rocks there are, and the time. The disassembled
+shader puts its four fields at offsets 0, 8, 12 and 16 — the address is eight bytes and eight-
+aligned, the rest four — and so does C++. C++ then pads the struct to 24 bytes, a multiple of
+the address's alignment; the shader reads the first 20, and the pipeline's push-constant range
+covers all 24.
+
+`Globals` loses the belt's rotation, since each rock's matrix now says where it is:
+
+```cpp title="code/src/4.advanced_vulkan/compute/main.cpp"
+// 4.8's Globals without the belt's rotation: each rock's own matrix now says where it is
+// in its orbit, so there is nothing to apply on top of it.
+struct Globals {
+    glm::mat4 view;           // 0
+    glm::mat4 projection;     // 64
+    glm::vec4 view_position;  // 128
+    glm::vec4 sun_direction;  // 144
+    glm::vec4 sun_colour;     // 160
+    glm::vec4 ambient;        // 176, w is the specular exponent
+};
+static_assert(sizeof(Globals) == 192);
+```
+
+## One rock at one moment, on the CPU
+
+4.6's `make_instances` built each rock once. It becomes a function of the rock's index and the
+time:
+
+```cpp title="code/src/4.advanced_vulkan/compute/main.cpp"
+// Where rock `index` is at `time`, and how it is turned.
+//
+// 4.6's make_instances(), made a function of time. The random numbers are drawn in 4.6's
+// order, with one more at the end for the tumble, so at time zero every rock is where 4.6
+// put it. orbits.slang does exactly this on the GPU.
+[[nodiscard]] Instance rock_at(uint32_t index, float time) {
+    Random random(index);
+
+    const float radius =
+        std::sqrt(random.range(kBeltInner * kBeltInner, kBeltOuter * kBeltOuter));
+    const float angle = random.range(0.0F, 2.0F * std::numbers::pi_v<float>);
+    const float height = random.range(-0.5F, 0.5F) * kBeltThickness;
+    const glm::vec3 axis = glm::normalize(glm::vec3{random.range(-1.0F, 1.0F),
+                                                    random.range(-1.0F, 1.0F),
+                                                    random.range(0.1F, 1.0F)});
+    const float spin = random.range(0.0F, 2.0F * std::numbers::pi_v<float>);
+    const float size = random.range(kRockMinSize, kRockMaxSize);
+    const glm::vec3 scale = size * glm::vec3{random.range(0.6F, 1.4F),
+                                             random.range(0.6F, 1.4F),
+                                             random.range(0.6F, 1.4F)};
+    const float grey = random.range(0.35F, 0.65F);
+    const float warmth = random.range(0.0F, 0.12F);
+    const float tumble = random.range(-kMaxTumble, kMaxTumble);
+
+    // Kepler: a circular orbit's angular speed is sqrt(GM / r^3). See the article.
+    const float speed = std::sqrt(kGravity / (radius * radius * radius));
+    const float orbit_angle = angle + speed * time;
+    const glm::vec3 position{radius * std::cos(orbit_angle), height,
+                             radius * std::sin(orbit_angle)};
+
+    const glm::mat3 rotation{
+        glm::rotate(glm::mat4(1.0F), spin + tumble * time, axis)};
+
+    // translate * rotate * scale, built by columns; and its normal matrix, which for a
+    // rotation times a scale is the rotation's columns divided by the scale.
+    return Instance{
+        .model = glm::mat4{glm::vec4(rotation[0] * scale.x, 0.0F),
+                           glm::vec4(rotation[1] * scale.y, 0.0F),
+                           glm::vec4(rotation[2] * scale.z, 0.0F),
+                           glm::vec4(position, 1.0F)},
+        .normal_matrix = glm::mat3{rotation[0] / scale.x, rotation[1] / scale.y,
+                                   rotation[2] / scale.z},
+        .colour = {grey + warmth, grey + warmth * 0.5F, grey, 1.0F},
+    };
+}
+```
+
+The random numbers are drawn in exactly 4.6's order, with the tumble rate drawn last, so that
+at time zero every rock is where 4.6 put it. Then:
+
+- The orbit angle is the rock's starting angle plus ω·*t*, with ω from Kepler.
+- The tumble angle is its starting spin plus its tumble rate times *t*.
+- `glm::rotate` builds the rotation, and the model matrix is assembled column by column rather
+  than through `glm::scale(glm::rotate(glm::translate(...)))`, for a reason that follows.
+
+### The normal matrix without an inverse
+
+Since 2.2 the normal matrix has been `glm::inverseTranspose`, and a compute shader has no
+matrix inverse to call. It does not need one here, because the model's upper 3×3 is known to be
+a rotation *R* times a diagonal scale *S*:
+
+```text
+(R S)⁻¹       =  S⁻¹ R⁻¹                      inverse of a product: reversed order
+((R S)⁻¹)ᵀ    =  (R⁻¹)ᵀ (S⁻¹)ᵀ                transpose of a product: reversed again
+              =  R S⁻¹                        R is orthonormal, so (R⁻¹)ᵀ = R;
+                                              S is diagonal, so (S⁻¹)ᵀ = S⁻¹
+```
+
+*R S* is *R* with column *j* multiplied by *s*<sub>j</sub>; *R S*⁻¹ is *R* with column *j*
+*divided* by it. So both matrices come straight from the rotation's columns, and that is how
+`rock_at` builds them: `rotation[0] * scale.x` for the model's first column,
+`rotation[0] / scale.x` for the normal matrix's. The compute shader does the same, which is the
+reason the C++ does too — two paths meant to agree should compute the same thing the same way.
+
+It is not bit-identical to 4.6's route, which inverted a general matrix. Rendered at time
+zero, the CPU path differs from 4.8's reference image in **4 pixels, each by one level** in one
+channel. That is the whole difference between inverting a matrix and writing its inverse down.
+
+## One rock at one moment, on the GPU
+
+The compute shader is its own file, importing both of 4.8's modules — which is what 4.8 built
+them for:
+
+```slang title="code/src/4.advanced_vulkan/compute/orbits.slang"
+// 4.9 Every rock's matrices for one moment, computed on the GPU, one thread per rock.
+//
+// This is what the CPU path's rock_at() in main.cpp does, line for line: the same random
+// stream, the same orbit, the same tumble, the same two matrices. The constants below
+// have to match main.cpp's, and only the pixel comparison in the article checks that
+// they do.
+import scene;
+import random;
+
+static const float kBeltInner = 9.0;
+static const float kBeltOuter = 17.0;
+static const float kBeltThickness = 0.6;
+static const float kRockMinSize = 0.04;
+static const float kRockMaxSize = 0.22;
+static const float kMaxTumble = 0.5;
+static const float kGravity = 72.0;
+static const float kTwoPi = 6.28318530718;
+
+// This dispatch's own push constants. The compute pipeline has a layout of its own, and
+// the graphics block `scene` declares is never used here, so it is not in this
+// module's SPIR-V at all.
+struct OrbitPush {
+    Instance* instances;  // rock i is written to instances[first + i]
+    uint first;
+    uint count;
+    float time;
+};
+[[vk::push_constant]] OrbitPush orbit;
+```
+
+The constants are the C++ ones again. There is no way for a C++ `constexpr` and a Slang
+`static const` to share a definition, and the comment at the top says what does keep them
+honest.
+
+`OrbitPush` is the compute shader's own push-constant block. `scene` still declares the
+graphics block, `push`, and this module imports `scene` — but nothing here uses `push`, and
+Slang leaves unused globals out of the SPIR-V. The disassembly has exactly one push-constant
+variable, `orbit`.
+
+### A rotation from an axis and an angle
+
+`glm::rotate` hides the one piece of mathematics the GPU has to be told: how to build the
+rotation by angle θ about a unit axis *k*.
+
+```slang title="code/src/4.advanced_vulkan/compute/orbits.slang"
+// glm::rotate's axis-angle rotation, as its three columns. The article derives it.
+void rotation_columns(float3 axis, float angle, out float3 column0,
+                      out float3 column1, out float3 column2) {
+    float c = cos(angle);
+    float s = sin(angle);
+    float3 t = (1.0 - c) * axis;
+    column0 = float3(c + t.x * axis.x, t.x * axis.y + s * axis.z,
+                     t.x * axis.z - s * axis.y);
+    column1 = float3(t.y * axis.x - s * axis.z, c + t.y * axis.y,
+                     t.y * axis.z + s * axis.x);
+    column2 = float3(t.z * axis.x + s * axis.y, t.z * axis.y - s * axis.x,
+                     c + t.z * axis.z);
+}
+```
+
+Split any vector *v* into its part along the axis, *k*(*k*·*v*), and its part perpendicular to
+it. The part along the axis does not move. The perpendicular part turns by θ in the plane at
+right angles to *k*, where the direction a quarter-turn on from it is *k* × *v*:
+
+```text
+v′  =  k (k·v)  +  cos θ ( v − k (k·v) )  +  sin θ ( k × v )
+    =  v cos θ  +  (k × v) sin θ  +  k (k·v)(1 − cos θ)
+```
+
+That is **Rodrigues' rotation formula**. The rotation matrix's columns are where it sends the
+three unit axes. For *v* = (1, 0, 0), *k*·*v* = *k*<sub>x</sub> and *k* × *v* =
+(0, *k*<sub>z</sub>, −*k*<sub>y</sub>):
+
+```text
+column0 = ( c + kx·kx(1−c),   kx·ky(1−c) + kz·s,   kx·kz(1−c) − ky·s )
+
+with c = cos θ, s = sin θ; t = (1 − c)·k in the code, so t.x·axis.y is kx·ky(1−c)
+```
+
+and the other two columns follow the same way from (0, 1, 0) and (0, 0, 1). It is the matrix
+`glm::rotate` builds, term for term. The function hands back columns through `out` parameters
+— one of Slang's ways of returning more than one value — because columns are what the model matrix is
+assembled from.
+
+### The rock
+
+```slang title="code/src/4.advanced_vulkan/compute/orbits.slang"
+Instance rock_at(uint index, float time) {
+    Random random = Random(index);
+
+    float radius =
+        sqrt(random.range(kBeltInner * kBeltInner, kBeltOuter * kBeltOuter));
+    float angle = random.range(0.0, kTwoPi);
+    float height = random.range(-0.5, 0.5) * kBeltThickness;
+    float3 axis = normalize(float3(random.range(-1.0, 1.0),
+                                   random.range(-1.0, 1.0),
+                                   random.range(0.1, 1.0)));
+    float spin = random.range(0.0, kTwoPi);
+    float size = random.range(kRockMinSize, kRockMaxSize);
+    float3 scale = size * float3(random.range(0.6, 1.4), random.range(0.6, 1.4),
+                                 random.range(0.6, 1.4));
+    float grey = random.range(0.35, 0.65);
+    float warmth = random.range(0.0, 0.12);
+    float tumble = random.range(-kMaxTumble, kMaxTumble);
+
+    // Kepler: a circular orbit's angular speed is sqrt(GM / r^3).
+    float speed = sqrt(kGravity / (radius * radius * radius));
+    float orbit_angle = angle + speed * time;
+    float3 position =
+        float3(radius * cos(orbit_angle), height, radius * sin(orbit_angle));
+
+    float3 c0, c1, c2;
+    rotation_columns(axis, spin + tumble * time, c0, c1, c2);
+
+    // model = translate * rotate * scale: its columns are the rotation's columns
+    // stretched by the scale, then the position. The normal matrix, the inverse
+    // transpose of the upper 3x3, is for a rotation times a scale the rotation's
+    // columns divided by the scale instead. Slang's constructors take rows, so the
+    // columns go in as rows and come out through a transpose, as in 4.6.
+    Instance instance;
+    instance.model =
+        transpose(float4x4(float4(c0 * scale.x, 0.0), float4(c1 * scale.y, 0.0),
+                           float4(c2 * scale.z, 0.0), float4(position, 1.0)));
+    instance.normal_matrix =
+        transpose(float3x3(c0 / scale.x, c1 / scale.y, c2 / scale.z));
+    instance.colour = float4(grey + warmth, grey + warmth * 0.5, grey, 1.0);
+    return instance;
+}
+```
+
+`rock_at` in Slang is `rock_at` in C++, line for line: the same draws from the same stream, the
+same Kepler speed, the same columns. The one Slang-specific detail is at the end. The
+constructors take rows, so each matrix is built from its columns as rows and transposed — 4.6's
+instance-attribute trick again.
+
+That stream is 4.6's `Random`, which `random.slang` now provides as well as the hash:
+
+```slang title="code/src/4.advanced_vulkan/compute/random.slang"
+// 4.6's Random class, in Slang: a state that each next() hashes forward. Seeded with
+// the same number, it produces the same floats in the same order as the C++ one, which
+// is what lets the compute shader rebuild exactly the belt the CPU builds.
+public struct Random {
+    uint state;
+
+    public __init(uint seed) { state = pcg_hash(seed); }
+
+    // `mutating` because it changes the struct it is called on. Slang methods are
+    // read-only unless they say otherwise.
+    [mutating]
+    public float next() {
+        state = pcg_hash(state);
+        return unit_float(state);
+    }
+
+    [mutating]
+    public float range(float low, float high) {
+        return low + (high - low) * next();
+    }
+};
+```
+
+`__init` is Slang's constructor. `[mutating]` marks a method that changes the struct it is
+called on: Slang methods treat `this` as read-only unless they say otherwise, which is the
+opposite of C++'s default, where a method must say `const` to promise *not* to.
+
+### One thread per rock
+
+```slang title="code/src/4.advanced_vulkan/compute/orbits.slang"
+// 64 threads to a workgroup; the article explains the number. The dispatch rounds the
+// rock count up to whole workgroups, so the last one can have threads with no rock to
+// work on, and they must do nothing.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void computeMain(uint3 thread : SV_DispatchThreadID) {
+    uint rock = thread.x;
+    if (rock >= orbit.count) {
+        return;
+    }
+    orbit.instances[orbit.first + rock] = rock_at(rock, orbit.time);
+}
+```
+
+A compute shader runs as a grid of **invocations** — one execution of the function each — and
+the grid is cut into **workgroups**. `[numthreads(64, 1, 1)]` makes each workgroup 64
+invocations in a row. The C++ asks for a number of workgroups — a **dispatch** — and the GPU
+runs them all, with no promised order between them. Each invocation finds out where it is
+through `SV_DispatchThreadID`, its **dispatch thread ID**:
+
+```text
+SV_DispatchThreadID  =  SV_GroupID × numthreads  +  SV_GroupThreadID
+
+    workgroup 0:  threads   0 …  63
+    workgroup 1:  threads  64 … 127
+    workgroup g:  threads  64g … 64g + 63
+```
+
+Rock *i* is handled by thread *i*. That is **data parallelism** in its plainest form: the same
+function, applied to every element independently, with no thread needing anything another
+thread computes. It is why this work suits a GPU at all.
+
+The number of workgroups has to be a whole number, so the dispatch asks for enough of them to
+cover every rock, rounding up:
+
+```text
+groups = ⌈ N / 64 ⌉ = (N + 63) / 64          in integer arithmetic
+
+N = 5,000     →    79 groups →   5,056 threads,  56 with no rock
+N = 100,000   → 1,563 groups → 100,032 threads,  32 with no rock
+```
+
+Those spare threads must do nothing — without the **bounds check**, `if (rock >= orbit.count)
+return;`, they would write matrices for rocks that do not exist, past the ones this frame draws.
+Here that would land in unused slots of the buffer. In general it is a write past the end.
+
+Why 64? The hardware runs invocations in fixed-size batches that execute in lockstep: 32 at a
+time on current NVIDIA GPUs, 32 or 64 on AMD's. A workgroup smaller than a batch wastes the
+rest of the batch; 64 is a whole number of batches on both. The upper limit is
+`maxComputeWorkGroupInvocations`, 1,024 on the RTX 4080 and at least 128 on any Vulkan device.
+For a function this independent the exact size barely matters, so long as it is a multiple of
+the batch.
+
+## The modules, adjusted
+
+`scene.slang` loses the belt from `Globals`, to match the C++:
+
+```slang title="code/src/4.advanced_vulkan/compute/scene.slang"
+public struct Globals {
+    public float4x4 view;
+    public float4x4 projection;
+    public float4 view_position;
+    public float4 sun_direction;
+    public float4 sun_colour;
+    public float4 ambient;  // rgb ambient, w shininess
+};
+```
+
+and the vertex transform stops applying it — the instance's matrices are the whole story now:
+
+```slang title="code/src/4.advanced_vulkan/compute/scene.slang"
+// Each rock's matrix now says where it is in its orbit, so there is no belt rotation to
+// apply on top of it.
+public VSOutput transform(Vertex vertex, Instance instance) {
+    VSOutput output;
+    float4 world = mul(instance.model, float4(vertex.position, 1.0));
+    output.world_position = world.xyz;
+    output.position = mul(push.globals.projection, mul(push.globals.view, world));
+    output.normal = mul(instance.normal_matrix, vertex.normal);
+    output.colour = instance.colour.rgb;
+    return output;
+}
+```
+
+`surfaces.slang` and `stars.slang` are 4.8's, unchanged but for their opening comments.
+
+## Running it
+
+### The compute pipeline
+
+```cpp title="code/src/4.advanced_vulkan/compute/main.cpp"
+    // A compute pipeline is one shader stage and a layout, and nothing else: no vertex
+    // input, no rasteriser, no attachments, no blending. PipelineBuilder builds graphics
+    // pipelines, so this one is written out.
+    void create_compute_pipeline() {
+        const VkDevice device = context().device();
+
+        const VkPushConstantRange push_range{
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+            .offset = 0,
+            .size = sizeof(OrbitPush),
+        };
+        const VkPipelineLayoutCreateInfo layout_info{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .setLayoutCount = 0,
+            .pSetLayouts = nullptr,
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &push_range,
+        };
+        VK_CHECK(vkCreatePipelineLayout(device, &layout_info, nullptr, &compute_layout_));
+
+        const VkShaderModule shader =
+            vkc::load_shader(device, LVK_CHAPTER_ID, "orbits.slang");
+        const VkComputePipelineCreateInfo pipeline_info{
+            .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .stage =
+                {
+                    .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                    .pNext = nullptr,
+                    .flags = 0,
+                    .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                    .module = shader,
+                    .pName = "computeMain",
+                    .pSpecializationInfo = nullptr,
+                },
+            .layout = compute_layout_,
+            .basePipelineHandle = VK_NULL_HANDLE,
+            .basePipelineIndex = -1,
+        };
+        VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_info,
+                                          nullptr, &orbit_pipeline_));
+        vkDestroyShaderModule(device, shader, nullptr);
+
+        context().name(orbit_pipeline_, VK_OBJECT_TYPE_PIPELINE, "orbits");
+    }
+```
+
+A compute pipeline is much smaller than a graphics one: one `VkPipelineShaderStageCreateInfo`,
+with `VK_SHADER_STAGE_COMPUTE_BIT` and the entry point `computeMain`, and a layout. There is no
+vertex input, no rasteriser state, no attachments and no blending, because none of those
+stages exist. `vkCreateComputePipelines` takes an array of `VkComputePipelineCreateInfo` — one
+here — and the same optional pipeline cache as `vkCreateGraphicsPipelines`, passed as
+`VK_NULL_HANDLE`. `basePipelineIndex` is −1 because there is no base pipeline to derive from,
+as 1.7 explained for graphics.
+
+The layout has one push-constant range, visible to the compute stage only. It is a separate
+layout from the graphics one, because the two pipelines are never bound to the same bind point:
+compute pipelines are bound to `VK_PIPELINE_BIND_POINT_COMPUTE`, graphics pipelines to
+`VK_PIPELINE_BIND_POINT_GRAPHICS`, and each bind point keeps its own bound pipeline, so binding
+the compute pipeline does not unbind a graphics one. The push constants are pushed afresh for
+each: the compute ones before the dispatch, the graphics ones before the first draw.
+
+### Dispatching it, and the barrier
+
+```cpp title="code/src/4.advanced_vulkan/compute/main.cpp"
+private:
+    [[nodiscard]] uint32_t rock_count() const { return kRockCounts[count_index_]; }
+
+    [[nodiscard]] bool multisampled() const { return samples_ != VK_SAMPLE_COUNT_1_BIT; }
+
+    // ---------------------------------------------------------------------------
+    // Updating the rocks
+    // ---------------------------------------------------------------------------
+
+    // One thread per rock, in workgroups of 64, then a barrier so that the vertex shader
+    // reads what the compute shader wrote. Returns where the instances are.
+    [[nodiscard]] VkDeviceAddress update_on_gpu(VkCommandBuffer cmd, uint32_t slot) {
+        update_timer_.begin(cmd, slot);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, orbit_pipeline_);
+        const OrbitPush push{
+            .instances = instances_address_,
+            .first = kFirstRock,
+            .count = rock_count(),
+            .time = orbit_time_,
+        };
+        vkCmdPushConstants(cmd, compute_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                           sizeof(push), &push);
+        // Enough workgroups to cover every rock: the count divided by 64, rounded up.
+        vkCmdDispatch(cmd, (rock_count() + kWorkgroupSize - 1) / kWorkgroupSize, 1, 1);
+
+        // The compute shader's writes, made available and then visible to the vertex
+        // shader's reads -- and to the next frame's dispatch, which writes the same
+        // buffer again: a barrier's second scope is everything after it in submission
+        // order, the next command buffer included. A buffer barrier, because what is
+        // being protected is a buffer.
+        const VkBufferMemoryBarrier2 barrier{
+            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
+            .pNext = nullptr,
+            .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+                             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .buffer = instances_.handle(),
+            .offset = 0,
+            .size = VK_WHOLE_SIZE,
+        };
+        const VkDependencyInfo dependency{
+            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .pNext = nullptr,
+            .dependencyFlags = 0,
+            .memoryBarrierCount = 0,
+            .pMemoryBarriers = nullptr,
+            .bufferMemoryBarrierCount = 1,
+            .pBufferMemoryBarriers = &barrier,
+            .imageMemoryBarrierCount = 0,
+            .pImageMemoryBarriers = nullptr,
+        };
+        vkCmdPipelineBarrier2(cmd, &dependency);
+
+        update_timer_.end(cmd, slot);
+        return instances_address_;
+    }
+
+    // The same arithmetic in a loop, into this frame's arena. No barrier: the CPU's
+    // writes are finished before the command buffer is even submitted, and submission
+    // makes writes to host-coherent memory visible to the device. Every host-visible
+    // memory type this GPU offers is coherent; 1.10 said what to do on one that is not.
+    [[nodiscard]] VkDeviceAddress update_on_cpu(FrameArena& arena) {
+        cpu_instances_.clear();
+        cpu_instances_.push_back(instance_of(glm::mat4(1.0F), kPlanetColour));
+        for (uint32_t i = 0; i < rock_count(); ++i) {
+            cpu_instances_.push_back(rock_at(i, orbit_time_));
+        }
+        return arena.write(cpu_instances_.data(),
+                           cpu_instances_.size() * sizeof(Instance));
+    }
+```
+
+`update_on_gpu` binds the pipeline, pushes the constants and calls `vkCmdDispatch` with the
+number of workgroups in x, y and z: ⌈*N*/64⌉, 1, 1. Then a barrier, and this is the part of the
+chapter that cannot be checked by looking at the screen.
+
+Three things touch the instance buffer, and each pair of them is a potential hazard:
+
+```text
+this frame:   compute writes  ──►  vertex shader reads             read-after-write
+next frame:                        vertex shader has read  ──►  compute writes again
+                                                                   write-after-read
+next frame:   compute writes  ──────────────────────────►  compute writes again
+                                                                   write-after-write
+```
+
+**Read-after-write.** The vertex shader must not read an instance until the compute shader's
+write of it has finished and is visible. That needs both halves of a dependency 4.3 took apart:
+an execution dependency, compute before vertex, and a memory dependency, the writes made
+available and then visible to the reads. That is exactly what the barrier's first scope and
+second scope say: `VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT` with
+`VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT` before, `VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT` with
+`VK_ACCESS_2_SHADER_STORAGE_READ_BIT` after. It is a `VkBufferMemoryBarrier2` — a **buffer
+memory barrier**, the buffer counterpart of 4.3's image barriers, naming a buffer and a byte
+range (`VK_WHOLE_SIZE` for all of it) instead of an image and a layout. There is no layout to
+change; buffers have none. `VK_QUEUE_FAMILY_IGNORED` on both sides says no queue ownership is
+being transferred. `VkDependencyInfo` carries it to `vkCmdPipelineBarrier2`, as it carried 4.3's.
+
+**Write-after-write.** Next frame's dispatch writes the same buffer again. Two writes to the same
+memory also need a memory dependency between them, or the first could land after the second.
+The barrier's second scope covers it too, because a barrier's second scope is not "the next
+command" but *everything after it in submission order* — the rest of this command buffer and
+every command buffer submitted after it. So the barrier also names the compute stage and
+`VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT` in its second half, and next frame's dispatch is inside it.
+
+**Write-after-read.** Next frame's dispatch must not overwrite an instance that this frame's
+vertex shader has not finished reading. A write after a read needs only an execution
+dependency — a read leaves nothing that has to be flushed — and one already exists: at the start
+of every frame, `vkcommon` transitions the swapchain image with a barrier from
+`VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT` to `VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT`, and that
+orders every command of every earlier frame before every command of this one. 4.3 found the
+same barrier doing the same job for its render target.
+
+That is the argument for the barrier. The evidence that it is needed is harder to come by than
+it was in 4.3. With the barrier removed:
+
+- **Synchronization validation reports nothing.** Not for lack of being switched on: the same
+  settings file, applied to 4.3 with its barrier removed, reports hazards — 20 lines of them in
+  30 frames. The
+  likely reason is that these accesses go through a raw address, which names no buffer the
+  layer can attribute them to — the same trade 4.5 described, where the validation layers stop
+  being able to see what a pointer touches.
+- **The picture does not change.** Three runs at 100,000 rocks, with the time jumped forward
+  every frame so that every frame's matrices differ from the last, all matched the run with the
+  barrier to the pixel.
+
+So on this GPU, with this driver, the missing barrier is invisible to every tool this series has.
+It is still a bug. Nothing in the specification orders the dispatch before the draw without it,
+and a GPU or driver that overlaps the compute work with the vertex work — which the specification
+allows, and which a different GPU, or a later driver for this one, is free to do — can draw rocks
+with half-written matrices. This is the one place in the
+series where the only defence is getting the reasoning right.
+
+### The same work on the CPU
+
+`update_on_cpu` fills a vector with the planet and every rock and writes the lot into this
+frame's arena: 100,001 × 116 = 11,600,116 bytes at the most, which is why the arena grows to
+12 MiB:
+
+```cpp title="code/src/4.advanced_vulkan/compute/main.cpp"
+// Room for the CPU path's whole belt, 100,001 x 116 bytes, and the globals. 4 KiB was
+// enough when the arena held only the globals; the CPU path puts every rock in it.
+constexpr VkDeviceSize kArenaBytes = 12 * 1024 * 1024;
+```
+
+No barrier on this path. The CPU finishes writing before the command buffer is submitted, and
+`vkQueueSubmit2` makes earlier host writes to host-coherent memory visible to the device.
+`vulkaninfo` lists every host-visible memory type on this GPU as `HOST_COHERENT`, so there is
+nothing to flush; on memory that was not coherent, 1.10's `vmaFlushAllocation` would be needed.
+
+### The frame
+
+```cpp title="code/src/4.advanced_vulkan/compute/main.cpp"
+    void on_render(const vkc::FrameInfo& frame) override {
+        camera_.update(delta_time());
+        if (orbiting_) {
+            orbit_time_ += delta_time();
+        }
+
+        const uint32_t slot = frame.frame_number % vkc::kFramesInFlight;
+        record_gpu_times(update_timer_.read(slot), render_timer_.read(slot));
+
+        FrameArena& arena = arenas_[slot];
+        arena.reset();
+        const VkDeviceAddress globals = write_globals(arena, frame.extent);
+
+        // Every rock's matrices for this moment, one way or the other, before any
+        // rendering: a dispatch is not allowed inside a rendering pass.
+        update_timer_.reset(frame.cmd, slot);
+        render_timer_.reset(frame.cmd, slot);
+        const auto cpu_start = std::chrono::steady_clock::now();
+        const VkDeviceAddress instances =
+            gpu_update_ ? update_on_gpu(frame.cmd, slot) : update_on_cpu(arena);
+        const auto cpu_end = std::chrono::steady_clock::now();
+        record_cpu_time(
+            std::chrono::duration<double, std::milli>(cpu_end - cpu_start).count());
+
+        render_timer_.begin(frame.cmd, slot);
+        begin_rendering(frame);
+        set_viewport(frame.cmd, frame.extent);
+
+        push(frame.cmd, globals, instances, planet_.vertex_address);
+        vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, planet_pipeline_);
+        vkCmdBindIndexBuffer(frame.cmd, planet_.indices.handle(), 0,
+                             VK_INDEX_TYPE_UINT16);
+        vkCmdDrawIndexed(frame.cmd, planet_.index_count, 1, 0, 0, kPlanetInstance);
+
+        vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, rock_pipeline_);
+        vkCmdBindIndexBuffer(frame.cmd, rock_.indices.handle(), 0, VK_INDEX_TYPE_UINT16);
+        push(frame.cmd, globals, instances, rock_.vertex_address);
+        vkCmdDrawIndexed(frame.cmd, rock_.index_count, rock_count(), 0, 0, kFirstRock);
+
+        if (stars_) {
+            vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                              stars_pipeline_);
+            vkCmdDraw(frame.cmd, 3, 1, 0, 0);
+        }
+
+        vkCmdEndRendering(frame.cmd);
+        render_timer_.end(frame.cmd, slot);
+    }
+```
+
+The update happens before `begin_rendering`, because a dispatch inside a rendering pass is not
+allowed. Whichever path ran returns the address of this frame's instances — the device-local
+buffer for the GPU path, a place in the arena for the CPU — and that address goes into the
+graphics push constants, so the vertex shader neither knows nor cares which one wrote them. Two
+`GpuTimer`s from 4.7's `vkcommon`, one around the dispatch and one around the rendering pass, and
+a `std::chrono` clock around whichever update ran.
+
+`push` takes the instance address as a parameter now, and `write_globals` loses the belt:
+
+```cpp title="code/src/4.advanced_vulkan/compute/main.cpp"
+    [[nodiscard]] VkDeviceAddress write_globals(FrameArena& arena, VkExtent2D extent) {
+        const Globals globals{
+            .view = camera_.view(),
+            .projection = projection(extent),
+            .view_position = glm::vec4(camera_.position, 1.0F),
+            .sun_direction = glm::vec4(glm::normalize(kSunDirection), 0.0F),
+            .sun_colour = glm::vec4(kSunColour, 1.0F),
+            .ambient = glm::vec4(kAmbient, kShininess),
+        };
+        return arena.write(&globals, sizeof(globals));
+    }
+
+    void push(VkCommandBuffer cmd, VkDeviceAddress globals, VkDeviceAddress instances,
+              VkDeviceAddress vertices) {
+        const PushConstants constants{
+            .globals = globals,
+            .instances = instances,
+            .vertices = vertices,
+        };
+        vkCmdPushConstants(cmd, pipeline_layout_,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                           sizeof(constants), &constants);
+    }
+```
+
+The rest of the application, which is 4.8's with the keys, the timers and the compute pipeline
+added: `on_start` makes the GPU path's buffer with the planet in slot 0 and zeroes after it,
+reserves the CPU path's vector once so it never reallocates mid-frame, creates both timers and
+the compute pipeline, and logs the new keys:
+
+```cpp title="code/src/4.advanced_vulkan/compute/main.cpp"
+// ---------------------------------------------------------------------------
+// The sample
+// ---------------------------------------------------------------------------
+
+class ComputeApp : public vkc::App {
+public:
+    using vkc::App::App;
+
+protected:
+    void on_start() override {
+        const auto [sphere_vertices, sphere_indices] = make_sphere(48, 96, kPlanetRadius);
+        planet_ = upload_mesh(context(), sphere_vertices, sphere_indices);
+
+        const auto [rock_vertices, rock_indices] = make_rock(2, 0.18F, 7);
+        rock_ = upload_mesh(context(), rock_vertices, rock_indices);
+
+        // The GPU path's instances: the planet in slot 0, written once here, and a slot
+        // for every rock, which the compute shader fills every frame before anything
+        // reads it. Zeroes until then.
+        std::vector<Instance> instances(kFirstRock + kMaxRocks);
+        instances[kPlanetInstance] = instance_of(glm::mat4(1.0F), kPlanetColour);
+        instances_ = vkc::upload_to_device_local(
+            context(), instances.data(), instances.size() * sizeof(Instance),
+            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+        instances_address_ = buffer_address(context().device(), instances_.handle());
+        cpu_instances_.reserve(kFirstRock + kMaxRocks);
+
+        depth_format_ = vkc::choose_depth_format(context().physical_device());
+
+        // Which sample counts this device can render with. A count has to be supported
+        // by both kinds of attachment the frame uses, so the two masks are intersected.
+        VkPhysicalDeviceProperties properties{};
+        vkGetPhysicalDeviceProperties(context().physical_device(), &properties);
+        supported_samples_ = properties.limits.framebufferColorSampleCounts &
+                             properties.limits.framebufferDepthSampleCounts;
+        spdlog::info("sample counts supported for colour and depth: mask 0x{:x}",
+                     supported_samples_);
+
+        for (FrameArena& arena : arenas_) {
+            arena.create(context(), kArenaBytes);
+        }
+        update_timer_.create(context());
+        render_timer_.create(context());
+        create_layout();
+        create_targets(swapchain().extent());
+        create_pipelines();
+        create_compute_pipeline();
+
+        camera_.position = {0.0F, 7.5F, 30.0F};
+        camera_.pitch = -14.0F;
+        camera_.speed = 8.0F;
+
+        spdlog::info("1-4 1x/2x/4x/8x, 5 sample shading, 6 orbits, 7 stars, "
+                     "8 CPU/GPU update, -/= rock count.");
+    }
+```
+
+```cpp title="code/src/4.advanced_vulkan/compute/main.cpp"
+    void on_resize(VkExtent2D extent) override { create_targets(extent); }
+
+    void on_event(const SDL_Event& event) override {
+        camera_.handle_event(event, window().handle());
+
+        if (event.type != SDL_EVENT_KEY_DOWN || event.key.repeat) {
+            return;
+        }
+        switch (event.key.scancode) {
+            case SDL_SCANCODE_1:
+            case SDL_SCANCODE_2:
+            case SDL_SCANCODE_3:
+            case SDL_SCANCODE_4:
+                set_samples(kSampleCounts[event.key.scancode - SDL_SCANCODE_1]);
+                break;
+            case SDL_SCANCODE_5:
+                sample_shading_ = !sample_shading_;
+                rebuild_pipelines();
+                break;
+            case SDL_SCANCODE_6:
+                orbiting_ = !orbiting_;
+                break;
+            case SDL_SCANCODE_7:
+                stars_ = !stars_;
+                break;
+            case SDL_SCANCODE_8:
+                gpu_update_ = !gpu_update_;
+                break;
+            case SDL_SCANCODE_MINUS:
+                count_index_ = count_index_ > 0 ? count_index_ - 1 : 0;
+                break;
+            case SDL_SCANCODE_EQUALS:
+                count_index_ = std::min(count_index_ + 1, kRockCounts.size() - 1);
+                break;
+            default:
+                return;
+        }
+        reset_stats();
+    }
+
+    void on_shutdown() override {
+        const VkDevice device = context().device();
+
+        vkDestroyPipeline(device, orbit_pipeline_, nullptr);
+        vkDestroyPipelineLayout(device, compute_layout_, nullptr);
+        destroy_pipelines();
+        vkDestroyPipelineLayout(device, pipeline_layout_, nullptr);
+
+        render_timer_.destroy();
+        update_timer_.destroy();
+        for (FrameArena& arena : arenas_) {
+            arena.destroy();
+        }
+        colour_.destroy();
+        depth_.destroy();
+        instances_.destroy();
+        rock_.destroy();
+        planet_.destroy();
+    }
+```
+
+The statistics now report three numbers — CPU time for the update, GPU time for the update and
+GPU time for rendering — and a slot that recorded no dispatch, on the CPU path, counts its update
+as zero:
+
+```cpp title="code/src/4.advanced_vulkan/compute/main.cpp"
+    // ---------------------------------------------------------------------------
+    // Measuring
+    // ---------------------------------------------------------------------------
+
+    void reset_stats() {
+        cpu_ms_ = 0.0;
+        update_ms_ = 0.0;
+        render_ms_ = 0.0;
+        cpu_samples_ = 0;
+        gpu_samples_ = 0;
+        stats_started_ = elapsed();
+        spdlog::info("{} rocks, updated on the {}", rock_count(),
+                     gpu_update_ ? "GPU" : "CPU");
+    }
+
+    void record_cpu_time(double ms) {
+        cpu_ms_ += ms;
+        ++cpu_samples_;
+    }
+
+    // A negative update time means the slot recorded no dispatch -- the CPU path -- and
+    // counts as zero; a negative render time means the slot has never been used.
+    void record_gpu_times(double update_ms, double render_ms) {
+        if (render_ms >= 0.0) {
+            update_ms_ += std::max(update_ms, 0.0);
+            render_ms_ += render_ms;
+            ++gpu_samples_;
+        }
+        if (elapsed() - stats_started_ < 1.0F || gpu_samples_ == 0 ||
+            cpu_samples_ == 0) {
+            return;
+        }
+        spdlog::info("{:>7} rocks, {} update: CPU {:7.3f} ms  GPU update {:6.3f} ms  "
+                     "GPU render {:6.3f} ms",
+                     rock_count(), gpu_update_ ? "GPU" : "CPU", cpu_ms_ / cpu_samples_,
+                     update_ms_ / gpu_samples_, render_ms_ / gpu_samples_);
+        reset_stats_quietly();
+    }
+
+    void reset_stats_quietly() {
+        cpu_ms_ = 0.0;
+        update_ms_ = 0.0;
+        render_ms_ = 0.0;
+        cpu_samples_ = 0;
+        gpu_samples_ = 0;
+        stats_started_ = elapsed();
+    }
+```
+
+And the members, and `main`:
+
+```cpp title="code/src/4.advanced_vulkan/compute/main.cpp"
+    vkc::Camera camera_;
+
+    Mesh planet_;
+    Mesh rock_;
+    vkc::Buffer instances_;
+    VkDeviceAddress instances_address_ = 0;
+
+    VkFormat depth_format_ = VK_FORMAT_UNDEFINED;
+    VkSampleCountFlags supported_samples_ = 0;
+    VkSampleCountFlagBits samples_ = kDefaultSamples;
+    bool sample_shading_ = false;
+    vkc::Image colour_;
+    vkc::Image depth_;
+
+    std::array<FrameArena, vkc::kFramesInFlight> arenas_;
+    std::vector<Instance> cpu_instances_;
+    vkc::GpuTimer update_timer_;
+    vkc::GpuTimer render_timer_;
+
+    VkPipelineLayout pipeline_layout_ = VK_NULL_HANDLE;
+    VkPipeline rock_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline planet_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline stars_pipeline_ = VK_NULL_HANDLE;
+    VkPipelineLayout compute_layout_ = VK_NULL_HANDLE;
+    VkPipeline orbit_pipeline_ = VK_NULL_HANDLE;
+
+    size_t count_index_ = kDefaultRockCount;
+    bool orbiting_ = false;
+    bool stars_ = true;
+    bool gpu_update_ = true;
+    float orbit_time_ = 0.0F;
+
+    double cpu_ms_ = 0.0;
+    double update_ms_ = 0.0;
+    double render_ms_ = 0.0;
+    uint32_t cpu_samples_ = 0;
+    uint32_t gpu_samples_ = 0;
+    float stats_started_ = 0.0F;
+};
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    try {
+        vkc::App::Options options{};
+        options.title = "LearnVulkan 4.9 - Compute";
+        ComputeApp app(vkc::App::parse_args(argc, argv, options));
+        return app.run();
+    } catch (const std::exception& error) {
+        spdlog::error("{}", error.what());
+        return EXIT_FAILURE;
+    }
+}
+```
+
+## What it costs
+
+Release build, `--no-validation`, averaged over a second, RTX 4080, default view:
+
+| rocks | path | CPU, update | GPU, update | GPU, rendering |
+|---|---|---|---|---|
+| 5,000 | GPU | 0.002 ms | 0.006 ms | 0.196 ms |
+| 5,000 | CPU | 0.418 ms | — | 0.195 ms |
+| 20,000 | GPU | 0.004 ms | 0.018 ms | 0.737 ms |
+| 20,000 | CPU | 1.776 ms | — | 0.733 ms |
+| 100,000 | GPU | 0.007 ms | 0.071 ms | 3.884 ms |
+| 100,000 | CPU | 8.794 ms | — | 3.700 ms |
+
+At 100,000 rocks the CPU takes 8.8 ms to do what the GPU does in 0.071 ms — about 124 times
+longer, or 88 ns per rock against 0.7. Timing the arena write on its own puts 1.70 ms of the
+CPU's 8.8 in copying 11.6 MB, about 6.8 GB/s; the other 7.1 ms is the arithmetic, on one core.
+Spreading it across cores would help the CPU several times over and still leave it far behind:
+the GPU is not faster at any one rock, it is doing thousands of them at once.
+
+The CPU path is also the one that changes the budget that matters. At 100,000 rocks its 8.8 ms
+is more than half of a 60 Hz frame, spent every frame before anything is drawn. The GPU path's
+update costs a hundredth of a millisecond of CPU time to record, and its 0.071 ms of GPU time
+is 2% of the 3.9 ms the same GPU spends drawing the result.
+
+Rendering costs about the same either way — the vertex shader reads 11.6 MB of matrices from
+wherever they are, and the two numbers are well inside the run-to-run variation 4.6 measured.
+
+## Checking it
+
+**Against 4.8.** At time zero, every rock should be where 4.6 put it. The CPU path differs from
+4.8's reference in 4 pixels by one level: the normal-matrix change above.
+
+**GPU against CPU.** The two paths run the same arithmetic, and still differ: 140 pixels at time
+zero, the largest by 54 levels in one channel; 425 pixels at 30 seconds in, the largest by 82.
+A 54-level difference is a rock edge moving by a pixel, not a colour being slightly off.
+
+The reason is that the GPU's arithmetic is not the CPU's. The Vulkan specification sets a
+**precision bound** on each built-in function, and for `sin` and `cos` in single precision it is
+an absolute error of at most 2⁻¹¹ — about 0.0005 — "inside the range [−π, π]". Outside that
+range it sets no bound at all, and the orbit angles here run from 0 to 2π at time zero and grow
+from there. An error of 0.0005 in a cosine moves a rock at radius 17 by nearly a hundredth of a
+unit, and at 30 units from the camera that is a quarter of a pixel — enough to tip an edge pixel
+from one side to the other. The C++ `std::cos` is typically accurate to within a unit in the
+last place. So the GPU path is allowed to put rocks in slightly different places, and does, and
+the difference grows as the angles grow.
+
+For a belt of rocks that does not matter. For anything that has to match the CPU exactly —
+picking which object is under the mouse, say, or a simulation whose state is saved and reloaded
+— it does, and the fix starts with keeping angles inside [−π, π] (exercise 3).
+
+:::note[What moved into vkcommon]
+Nothing. `GpuTimer` is 4.7's `vkc::GpuTimer`, used twice. The compute pipeline is written out
+here because this is the chapter that teaches it; `PipelineBuilder` stays a graphics pipeline
+builder.
+:::
+
+## What changed since 4.8
+
+- a compute shader, `orbits.slang`, importing both 4.8 modules
+- a compute pipeline and its layout: `vkCreateComputePipelines`,
+  `VK_PIPELINE_BIND_POINT_COMPUTE`, `vkCmdDispatch`
+- workgroups, `[numthreads]`, `SV_DispatchThreadID`, a rounded-up dispatch and a bounds check
+- a `VkBufferMemoryBarrier2` for compute-write to vertex-read, whose second scope also covers the
+  next frame's writes
+- Kepler orbits and a tumble for every rock, replacing the rigid belt; `Globals` loses the belt
+- Rodrigues' formula and the normal matrix as *R S*⁻¹, so both paths build the same matrices
+- 4.6's `Random` in Slang, with `__init` and `[mutating]`
+- a CPU path through the frame arena, and a measurement of both
+- 34 chapters in the build now
+
+## Words introduced in this chapter
+
+| | |
+|---|---|
+| **compute shader** | a shader with no vertices or pixels: one function, run many times, each run told which it is |
+| **compute pipeline** | a pipeline of one compute stage and a layout, bound to the compute bind point |
+| **dispatch** | `vkCmdDispatch`: run this many workgroups of the bound compute shader |
+| **workgroup** | a block of invocations of the size `[numthreads]` gives, dispatched as a unit |
+| **invocation** | one execution of a shader function; one thread |
+| **dispatch thread ID** | `SV_DispatchThreadID`: an invocation's position in the whole dispatch, workgroup × size + local index |
+| **bounds check** | the test that sends threads past the end of the data home without doing anything |
+| **data parallelism** | the same operation applied to many elements independently, with no thread needing another's result |
+| **buffer memory barrier** | a `VkBufferMemoryBarrier2`: execution and memory dependency for a range of a buffer |
+| **read-after-write hazard** | a read that could see memory before an earlier write to it is finished and visible |
+| **write-after-read hazard** | a write that could land before an earlier read of the same memory has finished |
+| **Kepler's third law** | for orbits about one body, the square of the period is proportional to the cube of the radius |
+| **angular speed** | how fast an angle changes, in radians per second; for a circular orbit √(*GM*/*r*³) |
+| **Rodrigues' rotation formula** | *v* cos θ + (*k* × *v*) sin θ + *k*(*k*·*v*)(1 − cos θ): rotation by θ about unit axis *k* |
+| **precision bound** | the largest error the specification allows a built-in function on the GPU |
+
+## Exercises
+
+1. Remove the bounds check, set the rock count to 5,000 and run under the validation layers.
+   Is anything reported? Work out which buffer slots the 56 spare threads wrote, and why the
+   picture is still right — then change `first` so that it would not be.
+2. Change `[numthreads(64, 1, 1)]` to 1, then 32, then 256, changing `kWorkgroupSize` to match, and
+   time the dispatch at 100,000 rocks. Where does the time stop improving, and why there?
+3. Wrap the orbit and tumble angles into [−π, π] in both paths before the `sin` and `cos`, and
+   measure the GPU-against-CPU difference at time zero and at 30 seconds again.
+4. Split the CPU path across threads with `std::for_each(std::execution::par, ...)` over the rock
+   indices. How close does it get to the GPU, and what is left over that more cores cannot fix?
+5. Remove `VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT` and `VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT` from
+   the barrier's second half. Write down which hazard is now unprotected, then find out whether
+   the layers or a screenshot can tell you.
+
+That is the end of Advanced Vulkan. The [review](/advanced-vulkan/review/) goes back over the whole
+part — nine chapters of pipeline state, render targets, cubemaps, addresses, instancing,
+multisampling, modules and compute — and what each one added to the frame.
