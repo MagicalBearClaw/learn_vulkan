@@ -208,6 +208,12 @@
       "sample": "5.advanced_lighting/blinn_phong",
       "previous": "4.advanced_vulkan/buffer_device_address",
       "article": "advanced-lighting/blinn-phong.mdx"
+    },
+    {
+      "id": "5.2.gamma_correction",
+      "sample": "5.advanced_lighting/gamma_correction",
+      "previous": "5.advanced_lighting/blinn_phong",
+      "article": "advanced-lighting/gamma-correction.mdx"
     }
   ]
 }

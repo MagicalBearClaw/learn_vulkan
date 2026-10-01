@@ -1,0 +1,696 @@
+---
+title: "Gamma correction"
+description: The sRGB encode derived as the inverse of 2.4's decode, each half of the conversion switched off to see what it was doing, the falloff a gamma-space renderer gets wrong, and the light above 1.0 that no encoding can store.
+sidebar:
+  order: 2
+---
+
+<figure>
+  <img src="/img/reference/5.2.gamma_correction.png" alt="A dark tiled floor with four wooden crates, lit by three small lamps — warm white in the middle, pale blue at the back left, pink at the right — each throwing a long streak of light along the floor toward the viewer" />
+  <figcaption>Chapter 5.2. Three lamps, lit in linear light and encoded on the way out — what
+  every chapter has done. Press <kbd>1</kbd> and <kbd>2</kbd> to take that apart.</figcaption>
+</figure>
+
+Two conversions have run in every frame of this series, and none of its code has done either
+of them. When a shader samples an `_SRGB` texture, the hardware decodes the stored bytes into
+**linear** light, the kind that can be added and multiplied: 1.11 chose that for the test
+grid and 2.4 derived the curve. When a fragment shader writes to the `_SRGB` swapchain 1.4
+picked, the hardware runs the curve the other way. The shader works with amounts of light in
+between and never sees an encoded number.
+
+Three earlier chapters left something about this for later. 1.4 promised to come back to
+the swapchain format. 1.4's exercises suggested a `_UNORM` swapchain and said only that the
+colours would be wrong. Part 2's review deferred two questions: what the final write actually
+does, and what happens to light that adds up to more than 1.0. This chapter answers all three
+by taking the two conversions apart.
+
+The scene is 5.1's room with three lamps instead of one. The keys:
+
+- <kbd>1</kbd> decode the colour textures, or hand the shader their bytes as if they were
+  already linear
+- <kbd>2</kbd> encode the output, or show it the way a `_UNORM` swapchain would
+- <kbd>3</kbd> paint magenta over every pixel whose light was more than 1.0
+
+```
+[info] 1 decode textures, 2 encode output, 3 show clipping.
+[info] textures decoded, output encoded
+```
+
+## The other half of the curve
+
+2.4 wrote down sRGB's decode, the **transfer function** that turns a stored value *c* into
+linear light *L*:
+
+```
+           ⎧  c / 12.92                    if c ≤ 0.04045
+   L   =   ⎨
+           ⎩  ((c + 0.055) / 1.055)^2.4    otherwise
+```
+
+**Decoding** is what a sampler does with an `_SRGB` texture. **Encoding** is what a colour
+attachment with an `_SRGB` format does to the value a fragment shader writes, and it is the
+**inverse transfer function**: the same curve solved for *c*. Each piece inverts on its own.
+The linear piece gives *c* = 12.92 *L*. The power piece gives
+(*c* + 0.055) / 1.055 = *L*^(1/2.4), so *c* = 1.055 *L*^(1/2.4) − 0.055. The point where
+they meet moves with them: *c* = 0.04045 is *L* = 0.04045 / 12.92 = 0.0031308.
+
+```
+           ⎧  12.92 L                      if L ≤ 0.0031308
+   c   =   ⎨
+           ⎩  1.055 L^(1/2.4) − 0.055      otherwise
+```
+
+Half the light, *L* = 0.5, encodes to *c* = 0.7354, which is byte 187.5. 4.7 measured exactly
+this: a pixel half covered by a white triangle resolved to 188. A quarter of the light is
+byte 137, which 4.7 also measured. The encode was running there too, without being written
+down.
+
+Then the display undoes it. A monitor treats every byte it is sent as sRGB-encoded and gives
+out the light the decode says, which is its **display response**. Encode, store, decode: the
+**round trip** brings back the linear value the shader computed, rounded to the nearest of
+256 steps. Those steps are spaced closely in the darks and widely in the brights, which is
+the reason for the curve in the first place: 2.4 covers why eyes need it that way.
+
+## Taking it apart
+
+Each half can be switched off.
+
+**Not decoding** means binding a `_UNORM` copy of each texture instead of the `_SRGB` one.
+A `_UNORM` format divides the byte by 255 and applies no curve, so the shader receives the
+encoded number and treats it as an amount of light. There is no instruction to switch off.
+The decode is a property of the image's format, so the only way to skip it is to read the
+same bytes through a different format.
+
+**Not encoding** means writing to a swapchain whose format is `_UNORM`. The value the shader
+writes is clamped to [0, 1], multiplied by 255 and stored, with no curve. The display still
+decodes it, because a display does not know what format a program rendered in. So a value
+*v* comes out of the monitor as decode(*v*).
+
+The sample does not rebuild the swapchain to show that, because the swapchain's format is
+also every pipeline's attachment format. It gets the same bytes another way. Writing
+decode(*v*) to the `_SRGB` swapchain makes the hardware store encode(decode(*v*)), which is
+*v*, and that is exactly what a `_UNORM` swapchain would have stored. Checked against a build
+with vkcommon temporarily asking for a `_UNORM` swapchain, the two agree to within one
+step: in the two raw-output modes, 104,001 and 109,019 of 921,600 pixels (11–12%) differ by
+one level, and none by more. The
+difference is rounding, in the shader's `pow` and in the hardware's encode.
+
+Four combinations, then:
+
+| Textures | Output | What it is |
+|---|---|---|
+| decoded | encoded | correct, and the default |
+| raw | raw | **gamma-space lighting**: how renderers worked before sRGB formats existed |
+| decoded | raw | the encode forgotten |
+| raw | encoded | the decode forgotten |
+
+<figure>
+  <img src="/img/5.2/correct-and-legacy.png" alt="Two renders of the room. Left: the floor softly lit across its width, with long lamp streaks fading gradually. Right: the same scene with darker, tighter pools of light and black floor between them, while the crate textures look the same as on the left" />
+  <figcaption>Left, decoded and encoded. Right, gamma-space: raw textures, raw output. The
+  crate faces near a lamp look much the same. The light between them does not.</figcaption>
+</figure>
+
+<figure>
+  <img src="/img/5.2/half-corrected.png" alt="Two renders of the room. Left: much darker than the correct render, the crates nearly black. Right: washed out and pale, the floor a light grey-pink everywhere" />
+  <figcaption>The two half-fixes. Left, decoded but not encoded: everything too dark. Right,
+  encoded but not decoded: everything too pale.</figcaption>
+</figure>
+
+The two half-fixes are wrong in the directions the curve predicts. Decode without encoding,
+and every linear value is shown as decode(*v*), which is smaller than *v* everywhere between
+0 and 1: too dark. That is what 1.4's exercise was pointing at. Encode without decoding, and
+every texture value, already encoded, is encoded a second time: too pale, and with the
+contrast squeezed out.
+
+## Why gamma-space lighting looked fine
+
+The raw-and-raw case deserves more attention, because it is not obviously wrong, and a lot
+of code was written that way. If the shader multiplies a raw texture value by 1 and writes it
+out raw, the display decodes the bytes exactly as the image's author intended, and the
+texture looks right. Lit at full strength and facing the light, a surface comes out correct.
+
+The errors are in everything in between. Any factor *k* the lighting multiplies by — a
+cosine, an attenuation, a shadow — reaches the eye as decode(*k* · *v*) instead of
+*k* · decode(*v*). The curve is close to a power of 2.2, so a factor of *k* behaves roughly
+like *k*^2.2. A cosine of 0.5 dims a surface to about a fifth, not half. Light falls off much
+faster than the formula says.
+
+That can be measured directly. With one lamp, a plain grey albedo of 0.25 and no specular,
+read the pixels in the column straight below the lamp, from its foot toward the camera. *d*
+is the distance to the lamp, and the light is in linear terms, decoded from the stored bytes:
+
+| Row | *d* | correct | gamma-space | decode(correct) |
+|---|---|---|---|---|
+| 400 | 0.72 | 0.3613 | 0.1046 | 0.1073 |
+| 420 | 1.27 | 0.1912 | 0.0307 | 0.0304 |
+| 450 | 2.02 | 0.1095 | 0.0116 | 0.0116 |
+| 500 | 2.94 | 0.0648 | 0.0056 | 0.0054 |
+| 560 | 3.70 | 0.0467 | 0.0037 | 0.0036 |
+| 640 | 4.37 | 0.0369 | 0.0027 | 0.0029 |
+| 719 | 4.83 | 0.0307 | 0.0024 | 0.0024 |
+
+The last column is the prediction: in gamma space, what reaches the eye is the decode of
+what the correct pipeline computes. It matches to within the rounding of an 8-bit pixel.
+
+Between the first row and the last, the correct light falls by a factor of 11.8, which is
+the attenuation and the cosine — the physics the shader was told to compute. The gamma-space
+light falls by 43.6. That ratio between the brightest and darkest parts of an image is its
+**contrast ratio**. Gamma-space lighting more than triples this one, and spends it on making
+lights look like they reach a third as far as they should.
+
+This is the history behind a lot of attenuation constants. Tuned by eye in a gamma-space
+renderer, falloff had to be gentler than the physics to look right, and those constants
+carried over into renderers that later fixed their gamma, where they looked wrong. This
+series has been linear since 1.4, so 2.5's constants never had that problem. They have a
+different one, which 5.7 deals with.
+
+## Light with nowhere to go
+
+There is one thing the encode cannot help with. An 8-bit format, `_SRGB` or `_UNORM`, stores
+values from 0 to 1. A fragment shader can compute anything, and the write **clamps** each
+channel into that range before encoding it. The lamps in this sample are twice as bright as
+white, so near them the light on a surface can be more than 1.0, and whatever is above 1.0 is
+thrown away. That is **clipping**.
+
+Press <kbd>3</kbd> and every pixel where any channel came out above 1.0 turns magenta:
+
+<figure>
+  <img src="/img/5.2/clipping.png" alt="Two crops of the same two crates. Left: one crate face has a bright, flat, yellowish highlight. Right: the same highlight area painted solid magenta, with a second smaller magenta patch on a crate further back" />
+  <figcaption>Left, the frame as presented. Right, with clipping shown: every magenta pixel
+  had at least one channel above 1.0.</figcaption>
+</figure>
+
+3,549 pixels clip, 0.39% of the frame. Rendering the frame again with every output divided
+by four, so that nothing clips, gives the values those pixels should have had. The brightest
+is 1.39. And in every one of the 3,549, at least one channel stayed under 1.0. That matters
+more than the count. A clipped pixel does not just lose brightness, it changes colour.
+
+The brightest pixel shows how. It should be (1.387, 0.792, 0.499), an orange: green is 0.571
+of red. Red is clamped to 1.0 and the other two are not, so it is stored as bytes
+(255, 230, 188), and green is now 0.791 of red. Every clipped pixel moves toward yellow,
+then white, as more of its channels reach the ceiling. This is **hue shift**. It is why a
+bright highlight on a coloured surface in a game often looks pale and flat instead of
+brilliant.
+
+The gamma-space renderer clips four times as much — 13,504 pixels — because its raw texture
+values are larger than the decoded ones before any light touches them.
+
+What is missing is **dynamic range**: the span from the darkest value an image can hold to
+the brightest. An 8-bit swapchain holds 0 to 1, and a room with a lamp in it holds far more
+than that. The encode only decides how the 256 steps are spread across 0 to 1. It cannot add
+steps above 1. 5.7 renders into a floating-point target that can hold 1.39, or 1,000, and
+then decides deliberately how to bring that down into 0 to 1. Until then, clipping is the
+ceiling, and the sample has a key to show where it is.
+
+## The scene
+
+5.1's room, with three lamps. Each has a position and a colour, and all three share one
+intensity:
+
+```cpp title="code/src/5.advanced_lighting/gamma_correction/main.cpp"
+// Three lamps: 5.1's, low over the middle of the floor, and two more at the sides, so that
+// light from more than one lamp adds up on the crates between them.
+struct LampPlacement {
+    glm::vec3 position;
+    glm::vec3 colour;
+};
+
+constexpr uint32_t kLampCount = 3;
+constexpr std::array<LampPlacement, kLampCount> kLamps{{
+    {{0.0F, kFloorY + 0.55F, -0.60F}, {1.0F, 0.87F, 0.68F}},
+    {{-3.30F, kFloorY + 0.90F, -2.50F}, {0.50F, 0.68F, 1.0F}},
+    {{2.90F, kFloorY + 0.80F, 0.10F}, {1.0F, 0.52F, 0.46F}},
+}};
+constexpr float kLampRadius = 0.06F;
+
+// Each lamp's colour is scaled by this before it reaches the shader. Above 1, on purpose:
+// a lamp is brighter than a white surface, and the article measures what happens to the
+// pixels where that shows.
+constexpr float kLampIntensity = 2.0F;
+
+// Night: almost nothing but the lamps.
+constexpr glm::vec3 kAmbient{0.020F, 0.022F, 0.030F};
+
+```
+
+`kLampIntensity` is 2. A lamp is brighter than any surface it lights, and a value above 1
+is what makes the clipping in the last section possible.
+
+The shader receives the lamps as an array of `Lamp`, two `vec4`s each, so that the stride is
+32 bytes in both languages without any argument about how a `vec3` is padded. Two flags
+replace 5.1's specular switches. The texture choice is not one of them, because it is made by
+binding a different descriptor set, and the shader never knows:
+
+```cpp title="code/src/5.advanced_lighting/gamma_correction/main.cpp"
+// these has the same 32-byte stride in C++ and Slang without anyone having to think
+// about it.
+struct Lamp {
+    glm::vec4 position;  // w unused
+    glm::vec4 colour;    // rgb already scaled by kLampIntensity, w unused
+};
+static_assert(sizeof(Lamp) == 32);
+
+// The bits of Globals::flags. Texture decoding is not among them: that is decided by
+// which descriptor set is bound, and the shader never knows.
+constexpr uint32_t kEncodeOutput = 1U << 0;
+constexpr uint32_t kShowClipping = 1U << 1;
+
+// 5.1's Globals with the one light replaced by an array of them, and the specular
+// switches replaced by flags.
+struct Globals {
+    glm::mat4 view;                       // 0
+    glm::mat4 projection;                 // 64
+    glm::vec4 view_position;              // 128
+    glm::vec4 ambient;                    // 144
+    std::array<Lamp, kLampCount> lamps;   // 160
+    uint32_t flags;                       // 256
+};
+static_assert(offsetof(Globals, lamps) == 160);
+static_assert(sizeof(Globals) == 260);
+
+```
+
+`Globals` grows to 260 bytes, with the array at 160. As in 5.1, a struct behind a pointer
+uses the scalar layout and the `static_assert`s check that both sides agree.
+
+One draw per lamp now:
+
+```cpp title="code/src/5.advanced_lighting/gamma_correction/main.cpp"
+// write_draws() below and nothing else may reorder it.
+constexpr uint32_t kFloorDraw = 0;
+constexpr uint32_t kFirstCrateDraw = kFloorDraw + 1;
+constexpr uint32_t kFirstLampDraw =
+    kFirstCrateDraw + static_cast<uint32_t>(kCrates.size());
+constexpr uint32_t kDrawCount = kFirstLampDraw + kLampCount;
+
+```
+
+## The shader
+
+The structs, matching:
+
+```slang title="code/src/5.advanced_lighting/gamma_correction/scene.slang"
+static const uint kLampCount = 3;
+
+struct Lamp {
+    float4 position;
+    float4 colour;
+};
+
+// Matches Globals in main.cpp, 260 bytes, scalar layout.
+struct Globals {
+    float4x4 view;
+    float4x4 projection;
+    float4 view_position;
+    float4 ambient;
+    Lamp lamps[kLampCount];
+    uint flags;
+};
+
+static const uint kEncodeOutput = 1u << 0;
+static const uint kShowClipping = 1u << 1;
+```
+
+The exponent is fixed now, at the matched value 5.1 derived for a shininess of 16:
+
+```slang title="code/src/5.advanced_lighting/gamma_correction/scene.slang"
+// Blinn-Phong's exponent for a Phong shininess of 16, matched the way 5.1 showed.
+static const float kShininess = 64.0;
+static const float kSpecularStrength = 0.5;
+
+static const float kConstantTerm = 1.0;
+static const float kLinearTerm = 0.09;
+static const float kQuadraticTerm = 0.032;
+```
+
+5.1's `shade` becomes `lamp_light`, the contribution of one lamp, and a new `shade` adds them
+up. The facing test now returns early, since a lamp behind the surface adds nothing at all:
+
+```slang title="code/src/5.advanced_lighting/gamma_correction/scene.slang"
+// 5.1's shade(), for one lamp, without the ambient.
+float3 lamp_light(Lamp lamp, float3 world_position, float3 normal, float3 to_eye,
+                  float3 albedo) {
+    float3 offset = lamp.position.xyz - world_position;
+    float distance = length(offset);
+    float3 to_light = offset / distance;
+
+    float attenuation = 1.0 / (kConstantTerm + kLinearTerm * distance +
+                               kQuadraticTerm * distance * distance);
+
+    float facing = dot(normal, to_light);
+    if (facing <= 0.0) {
+        return float3(0.0);
+    }
+
+    float3 halfway = normalize(to_light + to_eye);
+    float specular_amount = pow(max(dot(normal, halfway), 0.0), kShininess);
+
+    float3 diffuse = facing * albedo;
+    float3 specular = specular_amount * kSpecularStrength;
+    return lamp.colour.rgb * (diffuse + specular) * attenuation;
+}
+
+float3 shade(VSOutput input, float3 albedo) {
+    Globals globals = *push.globals;
+
+    float3 normal = normalize(input.normal);
+    float3 to_eye = normalize(globals.view_position.xyz - input.world_position);
+
+    // Light adds. This sum is the reason the shader has to work in linear light: it is
+    // only true of amounts of light, not of the encoded numbers that stand for them.
+    float3 total = globals.ambient.rgb * albedo;
+    for (uint i = 0; i < kLampCount; ++i) {
+        total += lamp_light(globals.lamps[i], input.world_position, normal, to_eye, albedo);
+    }
+    return total;
+}
+```
+
+`total +=` is the line this chapter defends. It is true of light: two lamps on the same spot
+give the sum of what each gives alone, which 2.6 called superposition. It is not true of
+encoded values, which are light raised to roughly 1/2.2, and the sum of two of those is not
+the encoding of anything.
+
+The decode, written out from 2.4's formula. `select` picks per component, so a colour whose
+red is in the linear segment and whose green is not gets each channel through the right
+piece:
+
+```slang title="code/src/5.advanced_lighting/gamma_correction/scene.slang"
+// sRGB's decoding curve, from 2.4: an encoded value in, linear light out.
+float3 srgb_to_linear(float3 encoded) {
+    float3 low = encoded / 12.92;
+    float3 high = pow((encoded + 0.055) / 1.055, 2.4);
+    return select(encoded <= 0.04045, low, high);
+}
+```
+
+Both sides of the `select` are computed for every channel. `pow` on the low side's inputs is
+harmless: the base is never negative after the `saturate` below.
+
+And `present`, which every fragment shader now ends with:
+
+```slang title="code/src/5.advanced_lighting/gamma_correction/scene.slang"
+// The last thing every fragment does. With kEncodeOutput set this does nothing, and the
+// sRGB swapchain encodes the value as it is written -- what every chapter has done.
+//
+// Without it, the sample shows what a UNORM swapchain would: the value clamped, stored as
+// it is, and then decoded by the display, which assumes everything it is sent is sRGB.
+// Writing srgb_to_linear(value) through the sRGB swapchain stores the same bytes, to
+// within one step of rounding, because the swapchain's encode undoes the decode.
+float4 present(float3 colour) {
+    uint flags = push.globals.flags;
+    if ((flags & kShowClipping) != 0 && any(colour > 1.0)) {
+        return float4(1.0, 0.0, 1.0, 1.0);
+    }
+    if ((flags & kEncodeOutput) == 0) {
+        colour = srgb_to_linear(saturate(colour));
+    }
+    return float4(colour, 1.0);
+}
+```
+
+The clipping test comes first, so it sees the value before any clamp. Without
+`kEncodeOutput`, the value is clamped as a `_UNORM` write would clamp it, then decoded, so
+that the hardware's encode turns it back into the bytes a `_UNORM` swapchain would have
+held.
+
+The two fragment entry points both end in `present`. The lamp markers have to go through it
+too. Otherwise they would stay correctly encoded while everything around them changed:
+
+```slang title="code/src/5.advanced_lighting/gamma_correction/scene.slang"
+[shader("fragment")]
+float4 fragmentMain(VSOutput input) : SV_Target {
+    float3 tint = push.draws[push.draw_index].colour.rgb;
+    float3 albedo = base_colour_map.Sample(input.uv).rgb * tint;
+    return present(shade(input, albedo));
+}
+
+// The lamp itself: its colour, unlit, presented the same way as everything else.
+[shader("fragment")]
+float4 lampFragmentMain(VSOutput input) : SV_Target {
+    return present(push.draws[push.draw_index].colour.rgb);
+}
+```
+
+## The application
+
+`on_start` is 5.1's with new messages, and the keys flip the three flags:
+
+```cpp title="code/src/5.advanced_lighting/gamma_correction/main.cpp"
+class GammaCorrectionApp : public vkc::App {
+```
+
+```cpp title="code/src/5.advanced_lighting/gamma_correction/main.cpp"
+        spdlog::info("1 decode textures, 2 encode output, 3 show clipping.");
+        log_mode();
+```
+
+```cpp title="code/src/5.advanced_lighting/gamma_correction/main.cpp"
+            case SDL_SCANCODE_1:
+                decode_textures_ = !decode_textures_;
+                log_mode();
+                break;
+            case SDL_SCANCODE_2:
+                encode_output_ = !encode_output_;
+                log_mode();
+                break;
+            case SDL_SCANCODE_3:
+                show_clipping_ = !show_clipping_;
+                log_mode();
+                break;
+```
+
+Every colour texture is loaded twice. `vkc::load_texture` takes the format as an argument,
+and the two images hold the same bytes:
+
+```cpp title="code/src/5.advanced_lighting/gamma_correction/main.cpp"
+    // Each colour texture twice: once as _SRGB, which 2.4 explained, and once as _UNORM,
+    // which hands the shader the file's bytes divided by 255 with no curve applied. Two
+    // images of the same bytes is the simple way to get both. The same pixels can also be
+    // given two views of one image, by creating it with VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+    // vkc::load_texture does not, and twice the memory for two textures is no hardship.
+    void load_textures() {
+        crate_map_ = vkc::load_texture(
+            context(), vkc::asset_path("textures/lvk_crate_diffuse.png"),
+            VK_FORMAT_R8G8B8A8_SRGB);
+        floor_map_ = vkc::load_texture(context(),
+                                       vkc::asset_path("textures/lvk_ground.png"),
+                                       VK_FORMAT_R8G8B8A8_SRGB);
+        crate_raw_map_ = vkc::load_texture(
+            context(), vkc::asset_path("textures/lvk_crate_diffuse.png"),
+            VK_FORMAT_R8G8B8A8_UNORM);
+        floor_raw_map_ = vkc::load_texture(context(),
+                                           vkc::asset_path("textures/lvk_ground.png"),
+                                           VK_FORMAT_R8G8B8A8_UNORM);
+
+        sampler_ = vkc::Sampler(context(), vkc::SamplerDesc{});
+    }
+```
+
+There is a way to avoid the second copy. An image view normally has to have the same format
+as its image, but an image created with `VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT` may be viewed
+through any format of the same size per texel, so one `_SRGB` image could have a `_UNORM`
+view as well. `vkc::load_texture` does not set that flag, and two small textures twice over
+is not worth a change to vkcommon.
+
+Each image also gets its own mipmaps, and these differ, which is a smaller version of this
+chapter's point. 1.11's mip generation blits with linear filtering, and filtering averages.
+For the `_SRGB` image it averages decoded light. For the `_UNORM` one it averages encoded
+numbers, which produces darker mips, just as a gamma-space renderer's would.
+
+Four sets now, and four images to destroy:
+
+```cpp title="code/src/5.advanced_lighting/gamma_correction/main.cpp"
+        constexpr uint32_t kTextureSets = 4;  // crate and floor, decoded and raw
+```
+
+```cpp title="code/src/5.advanced_lighting/gamma_correction/main.cpp"
+        crate_set_ = allocate_texture_set(crate_map_.view(), sampler_.handle());
+        floor_set_ = allocate_texture_set(floor_map_.view(), sampler_.handle());
+        crate_raw_set_ = allocate_texture_set(crate_raw_map_.view(), sampler_.handle());
+        floor_raw_set_ = allocate_texture_set(floor_raw_map_.view(), sampler_.handle());
+```
+
+```cpp title="code/src/5.advanced_lighting/gamma_correction/main.cpp"
+        sampler_.destroy();
+        floor_raw_map_.destroy();
+        crate_raw_map_.destroy();
+        floor_map_.destroy();
+        crate_map_.destroy();
+```
+
+In `on_render` the descriptor set is chosen per draw by `decode_textures_`, and the lamps are
+drawn in a loop:
+
+```cpp title="code/src/5.advanced_lighting/gamma_correction/main.cpp"
+        bind_indices(frame.cmd, floor_);
+        vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, opaque_pipeline_);
+        bind_texture(frame.cmd, decode_textures_ ? floor_set_ : floor_raw_set_);
+        push(frame.cmd, floor_.vertex_address, kFloorDraw);
+        vkCmdDrawIndexed(frame.cmd, floor_.index_count, 1, 0, 0, 0);
+
+        bind_indices(frame.cmd, cube_);
+        bind_texture(frame.cmd, decode_textures_ ? crate_set_ : crate_raw_set_);
+        for (uint32_t i = 0; i < kCrates.size(); ++i) {
+            push(frame.cmd, cube_.vertex_address, kFirstCrateDraw + i);
+            vkCmdDrawIndexed(frame.cmd, cube_.index_count, 1, 0, 0, 0);
+        }
+
+        bind_indices(frame.cmd, lamp_);
+        vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, lamp_pipeline_);
+        for (uint32_t i = 0; i < kLampCount; ++i) {
+            push(frame.cmd, lamp_.vertex_address, kFirstLampDraw + i);
+            vkCmdDrawIndexed(frame.cmd, lamp_.index_count, 1, 0, 0, 0);
+        }
+```
+
+`write_globals` fills the lamp array after the designated initialiser, because each element
+is computed from the placement and the intensity:
+
+```cpp title="code/src/5.advanced_lighting/gamma_correction/main.cpp"
+    void write_globals(FrameArena& arena, VkExtent2D extent) {
+        Globals globals{
+            .view = camera_.view(),
+            .projection = projection(extent),
+            .view_position = glm::vec4(camera_.position, 1.0F),
+            .ambient = glm::vec4(kAmbient, 1.0F),
+            .lamps = {},
+            .flags = (encode_output_ ? kEncodeOutput : 0U) |
+                     (show_clipping_ ? kShowClipping : 0U),
+        };
+        for (uint32_t i = 0; i < kLampCount; ++i) {
+            globals.lamps[i] = Lamp{
+                .position = glm::vec4(kLamps[i].position, 1.0F),
+                .colour = glm::vec4(kLamps[i].colour * kLampIntensity, 1.0F),
+            };
+        }
+        globals_address_ = arena.write(&globals, sizeof(globals));
+    }
+
+    void write_draws(FrameArena& arena) {
+        draws_.clear();
+
+        draws_.push_back(draw_data_of(glm::mat4(1.0F), kWhite));
+
+        for (const Placement& crate : kCrates) {
+            draws_.push_back(draw_data_of(
+                glm::translate(model_of(crate), glm::vec3(0.0F, 0.5F, 0.0F)), kWhite));
+        }
+
+        for (const LampPlacement& lamp : kLamps) {
+            draws_.push_back(draw_data_of(glm::translate(glm::mat4(1.0F), lamp.position),
+                                          glm::vec4(lamp.colour, 1.0F)));
+        }
+
+        draws_address_ = arena.write(draws_.data(), draws_.size() * sizeof(DrawData));
+    }
+
+    void log_mode() const {
+        spdlog::info("textures {}, output {}{}", decode_textures_ ? "decoded" : "raw",
+                     encode_output_ ? "encoded" : "raw",
+                     show_clipping_ ? ", clipping shown" : "");
+    }
+```
+
+The members that changed, and `main`:
+
+```cpp title="code/src/5.advanced_lighting/gamma_correction/main.cpp"
+    vkc::Image crate_map_;
+    vkc::Image floor_map_;
+    vkc::Image crate_raw_map_;
+    vkc::Image floor_raw_map_;
+    vkc::Sampler sampler_;
+
+    VkDescriptorSet crate_set_ = VK_NULL_HANDLE;
+    VkDescriptorSet floor_set_ = VK_NULL_HANDLE;
+    VkDescriptorSet crate_raw_set_ = VK_NULL_HANDLE;
+    VkDescriptorSet floor_raw_set_ = VK_NULL_HANDLE;
+
+    VkDescriptorSetLayout texture_set_layout_ = VK_NULL_HANDLE;
+    VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
+
+    VkPipelineLayout pipeline_layout_ = VK_NULL_HANDLE;
+    VkPipeline opaque_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline lamp_pipeline_ = VK_NULL_HANDLE;
+
+    bool decode_textures_ = true;
+    bool encode_output_ = true;
+    bool show_clipping_ = false;
+};
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    try {
+        vkc::App::Options options{};
+        options.title = "LearnVulkan 5.2 - Gamma correction";
+        GammaCorrectionApp app(vkc::App::parse_args(argc, argv, options));
+        return app.run();
+    } catch (const std::exception& error) {
+        spdlog::error("{}", error.what());
+        return EXIT_FAILURE;
+    }
+}
+```
+
+```cmake title="code/src/5.advanced_lighting/gamma_correction/CMakeLists.txt"
+add_chapter(5.2.gamma_correction
+    SOURCES main.cpp
+    SHADERS scene.slang
+)
+```
+
+:::note[What moved into vkcommon]
+Nothing. 5.1's code is all still in the sample, and nothing here is used twice yet.
+`srgb_to_linear` is the obvious candidate. It does not move, because no later chapter needs
+it: 5.7 moves the lighting into a floating-point target, and the one pass that then writes
+the swapchain can leave the encode to the hardware like every chapter before this one.
+:::
+
+## What changed since 5.1
+
+- three lamps in an array in `Globals`, summed in the shader
+- the sRGB encode, derived as the inverse of 2.4's decode
+- each colour texture loaded as both `_SRGB` and `_UNORM`, chosen per draw
+- a `_UNORM` swapchain reproduced in the shader, and checked against a real one
+- a clipping view, and the hue shift it exposes
+- the Phong option removed: Blinn-Phong is now the only specular term
+- 36 chapters in the build now
+
+## Words introduced in this chapter
+
+| | |
+|---|---|
+| **encoding** | turning linear light into the stored, perceptually spaced value; an `_SRGB` attachment does it on write |
+| **decoding** | turning a stored value back into linear light; an `_SRGB` texture does it on read, and a display does it on screen |
+| **inverse transfer function** | the encode: c = 12.92 L below L = 0.0031308, and 1.055 L^(1/2.4) − 0.055 above |
+| **gamma-space lighting** | doing lighting arithmetic on encoded values, as renderers did before sRGB formats |
+| **UNORM** | a format that stores a value in [0, 1] as an integer scaled by 255, with no curve |
+| **round trip** | encode, store, decode: the linear value back, rounded to one of 256 steps |
+| **display response** | the light a monitor emits for a stored value; for an sRGB display, the decode |
+| **falloff** | how light dims with distance from its source |
+| **contrast ratio** | the ratio between the brightest and the darkest light in an image or region |
+| **clamping** | forcing a value into a range; an 8-bit attachment clamps every channel to [0, 1] on write |
+| **clipping** | the information lost when light above 1.0 is clamped |
+| **hue shift** | the change of colour when some channels of a pixel clip and others do not |
+| **dynamic range** | the span between the darkest and brightest values an image can hold |
+
+## Exercises
+
+1. Turn both conversions off and look at the crates nearest a lamp, then at the floor between
+   the lamps. Which looks right, and why does the argument in "Why gamma-space lighting looked
+   fine" predict exactly that split?
+2. Set `kLampIntensity` to 1 and count the magenta pixels. Then set it to 4. Does the count
+   grow with the area of the brightest part of each pool?
+3. Replace `srgb_to_linear` with `pow(saturate(colour), 2.2)` and compare the raw-output frame
+   with the original. Where do the two curves differ most, and how many levels is that?
+4. Show clipping with the textures raw, once with the output encoded and once raw. The two
+   counts are the same. Why, when the two frames look so different?
+5. In gamma-space mode, find the multiplier for the lamp intensity that makes the floor 2 units
+   from the warm lamp as bright as it is in the correct mode. Is one number enough for every
+   distance?
+6. Write `linear_to_srgb` from the inverse transfer function above and check
+   `linear_to_srgb(srgb_to_linear(c))` against `c` for every byte value on the CPU. What is
+   the largest error, and is it ever more than half a step?
+
+Next: 5.3 makes the crates do something they have never done in this series: cast shadows.
