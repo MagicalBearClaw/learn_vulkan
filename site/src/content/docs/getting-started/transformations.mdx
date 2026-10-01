@@ -6,7 +6,7 @@ sidebar:
 ---
 
 <figure>
-  <img src="/img/reference/1.12.transformations.png" alt="Two textured quads at different sizes and positions, both rotated by the same angle" />
+  <img src="/learn_vulkan/img/reference/1.12.transformations.png" alt="Two textured quads at different sizes and positions, both rotated by the same angle" />
   <figcaption>Chapter 1.12: two quads, the same two matrices, multiplied in opposite orders.</figcaption>
 </figure>
 
@@ -256,7 +256,7 @@ basis vectors, turned, and turning preserves lengths and angles. A matrix like t
 undone it, with no division and no determinant.
 
 That fact is what makes a camera cheap in chapter 1.14, and the
-[mathematics appendix](/appendices/mathematics/) works through it.
+[mathematics appendix](/learn_vulkan/appendices/mathematics/) works through it.
 :::
 
 Each glm helper takes a matrix to build on, which is why `glm::mat4(1.0F)` appears so often. That
@@ -477,5 +477,5 @@ The screenshot for this chapter is pixel-for-pixel what it was before the textur
 6. Make a third quad that orbits *and* spins: an orbit chain with a second rotation after the
    translation. That is a moon, and it is the whole idea behind a scene graph.
 
-Next: [coordinate systems](/getting-started/coordinate-systems/) — the third dimension, and the two
+Next: [coordinate systems](/learn_vulkan/getting-started/coordinate-systems/) — the third dimension, and the two
 Vulkan conventions that catch everyone.

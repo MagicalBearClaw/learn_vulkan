@@ -8,7 +8,7 @@ sidebar:
 Something finally appears on screen in this chapter.
 
 <figure>
-  <img src="/img/reference/1.5.command_buffers.png" alt="A window filled with a single flat colour" />
+  <img src="/learn_vulkan/img/reference/1.5.command_buffers.png" alt="A window filled with a single flat colour" />
   <figcaption>Chapter 1.5: a cleared window. Not much to look at, but every piece of machinery behind it is now in place.</figcaption>
 </figure>
 
@@ -761,7 +761,7 @@ optimisation, it would be a bug: the command buffer would be re-recorded while t
 still reading it.
 
 The actual fix is to stop asking *"has the GPU finished?"* and start saying *"do this after
-that"*, which is what [chapter 1.6](/getting-started/synchronisation/) is about.
+that"*, which is what [chapter 1.6](/learn_vulkan/getting-started/synchronisation/) is about.
 
 ```cpp title="code/src/1.getting_started/command_buffers/main.cpp"
     vkc::Args args_;
@@ -1306,5 +1306,5 @@ switched off.
    The choosing functions, the create info and the ownership comments are the same code — which
    is the claim this series makes about everything in the scaffold.
 
-Next: [synchronisation](/getting-started/synchronisation/) — making both halves of the machine
+Next: [synchronisation](/learn_vulkan/getting-started/synchronisation/) — making both halves of the machine
 work at once.

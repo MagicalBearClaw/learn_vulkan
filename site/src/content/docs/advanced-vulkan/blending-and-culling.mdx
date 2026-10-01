@@ -6,7 +6,7 @@ sidebar:
 ---
 
 <figure>
-  <img src="/img/reference/4.2.blending_and_culling.png" alt="Three overlapping panes of coloured glass standing on a flagstone floor, with ferns and two wooden crates behind them" />
+  <img src="/learn_vulkan/img/reference/4.2.blending_and_culling.png" alt="Three overlapping panes of coloured glass standing on a flagstone floor, with ferns and two wooden crates behind them" />
   <figcaption>Chapter 4.2: three panes of glass, a stand of ferns cut out of flat quads, and two crates. Only one of those three is drawn the way it looks.</figcaption>
 </figure>
 
@@ -299,7 +299,7 @@ Culling the front faces is the useful one to look at, because it does not simply
 scene — it turns it inside out:
 
 <figure>
-  <img src="/img/4.2/cull-front.png" alt="The same scene with front-face culling: the floor has vanished and the crates show their interior faces" />
+  <img src="/learn_vulkan/img/4.2/cull-front.png" alt="The same scene with front-face culling: the floor has vanished and the crates show their interior faces" />
   <figcaption><code>VK_CULL_MODE_FRONT_BIT</code>: 64.65% of the frame changes. The floor is gone
   because its only face pointed at the camera, and the crates now show the inside of their far
   walls. The ferns are unaffected — their pipeline never culls anything.</figcaption>
@@ -469,7 +469,7 @@ Across the whole frame only 1.90% of pixels change, and they are almost all on t
 edges:
 
 <figure>
-  <img src="/img/4.2/fern-edge-detail.png" alt="Side-by-side magnification of fern leaflets: the left panel has hard stair-stepped edges, the right has smooth graded ones" />
+  <img src="/learn_vulkan/img/4.2/fern-edge-detail.png" alt="Side-by-side magnification of fern leaflets: the left panel has hard stair-stepped edges, the right has smooth graded ones" />
   <figcaption>The same leaflets at 4×, cut out on the left and blended on the right. In the
   150×112 region where the two differ most, 42.14% of pixels are not the same colour. The
   cutout's edges step; the blended ones keep the gradient the sampler produced.</figcaption>
@@ -693,7 +693,7 @@ Press <kbd>2</kbd> to turn the sort off and the panes are drawn in array order i
 puts the farthest one last:
 
 <figure>
-  <img src="/img/4.2/panes-unsorted.png" alt="The three glass panes drawn unsorted: the blue pane appears in front of the red and green ones despite being furthest away" />
+  <img src="/learn_vulkan/img/4.2/panes-unsorted.png" alt="The three glass panes drawn unsorted: the blue pane appears in front of the red and green ones despite being furthest away" />
   <figcaption>Unsorted: 1.96% of the frame changes, all of it in the regions where two panes
   overlap. The blue pane is the farthest away and is painted on top of both of the others.</figcaption>
 </figure>
@@ -720,7 +720,7 @@ rejected wherever they cover it, so it loses the overlap regions entirely instea
 being painted in the wrong order:
 
 <figure>
-  <img src="/img/4.2/panes-unsorted-depth-writes.png" alt="Unsorted panes with depth writes enabled: the blue pane is clipped away wherever the nearer panes already covered it" />
+  <img src="/learn_vulkan/img/4.2/panes-unsorted-depth-writes.png" alt="Unsorted panes with depth writes enabled: the blue pane is clipped away wherever the nearer panes already covered it" />
   <figcaption>Unsorted <em>and</em> writing depth. This differs from the unsorted-only image
   in a further 1.96% of pixels — the same overlap regions again, failing a second way.</figcaption>
 </figure>

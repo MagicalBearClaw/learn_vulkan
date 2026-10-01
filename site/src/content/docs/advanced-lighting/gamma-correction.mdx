@@ -6,7 +6,7 @@ sidebar:
 ---
 
 <figure>
-  <img src="/img/reference/5.2.gamma_correction.png" alt="A dark tiled floor with four wooden crates, lit by three small lamps — warm white in the middle, pale blue at the back left, pink at the right — each throwing a long streak of light along the floor toward the viewer" />
+  <img src="/learn_vulkan/img/reference/5.2.gamma_correction.png" alt="A dark tiled floor with four wooden crates, lit by three small lamps — warm white in the middle, pale blue at the back left, pink at the right — each throwing a long streak of light along the floor toward the viewer" />
   <figcaption>Chapter 5.2. Three lamps, lit in linear light and encoded on the way out — what
   every chapter has done. Press <kbd>1</kbd> and <kbd>2</kbd> to take that apart.</figcaption>
 </figure>
@@ -105,13 +105,13 @@ Four combinations, then:
 | raw | encoded | the decode forgotten |
 
 <figure>
-  <img src="/img/5.2/correct-and-legacy.png" alt="Two renders of the room. Left: the floor softly lit across its width, with long lamp streaks fading gradually. Right: the same scene with darker, tighter pools of light and black floor between them, while the crate textures look the same as on the left" />
+  <img src="/learn_vulkan/img/5.2/correct-and-legacy.png" alt="Two renders of the room. Left: the floor softly lit across its width, with long lamp streaks fading gradually. Right: the same scene with darker, tighter pools of light and black floor between them, while the crate textures look the same as on the left" />
   <figcaption>Left, decoded and encoded. Right, gamma-space: raw textures, raw output. The
   crate faces near a lamp look much the same. The light between them does not.</figcaption>
 </figure>
 
 <figure>
-  <img src="/img/5.2/half-corrected.png" alt="Two renders of the room. Left: much darker than the correct render, the crates nearly black. Right: washed out and pale, the floor a light grey-pink everywhere" />
+  <img src="/learn_vulkan/img/5.2/half-corrected.png" alt="Two renders of the room. Left: much darker than the correct render, the crates nearly black. Right: washed out and pale, the floor a light grey-pink everywhere" />
   <figcaption>The two half-fixes. Left, decoded but not encoded: everything too dark. Right,
   encoded but not decoded: everything too pale.</figcaption>
 </figure>
@@ -175,7 +175,7 @@ thrown away. That is **clipping**.
 Press <kbd>3</kbd> and every pixel where any channel came out above 1.0 turns magenta:
 
 <figure>
-  <img src="/img/5.2/clipping.png" alt="Two crops of the same two crates. Left: one crate face has a bright, flat, yellowish highlight. Right: the same highlight area painted solid magenta, with a second smaller magenta patch on a crate further back" />
+  <img src="/learn_vulkan/img/5.2/clipping.png" alt="Two crops of the same two crates. Left: one crate face has a bright, flat, yellowish highlight. Right: the same highlight area painted solid magenta, with a second smaller magenta patch on a crate further back" />
   <figcaption>Left, the frame as presented. Right, with clipping shown: every magenta pixel
   had at least one channel above 1.0.</figcaption>
 </figure>

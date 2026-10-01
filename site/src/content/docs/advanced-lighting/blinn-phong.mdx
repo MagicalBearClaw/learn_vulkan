@@ -6,7 +6,7 @@ sidebar:
 ---
 
 <figure>
-  <img src="/img/reference/5.1.blinn_phong.png" alt="A dark tiled floor with four wooden crates, lit by one small warm lamp hanging just above the floor; the lamp's highlight is a long bright streak on the floor running from under the lamp toward the viewer" />
+  <img src="/learn_vulkan/img/reference/5.1.blinn_phong.png" alt="A dark tiled floor with four wooden crates, lit by one small warm lamp hanging just above the floor; the lamp's highlight is a long bright streak on the floor running from under the lamp toward the viewer" />
   <figcaption>Chapter 5.1. One lamp, low over a floor, with the specular term measured
   against the halfway vector. Press <kbd>1</kbd> for Phong, and <kbd>2</kbd> until the
   shininess is 1, to see what this chapter fixes.</figcaption>
@@ -96,7 +96,7 @@ specular term, with the shininess at 1, and reading the pixels in that column:
 Zero at row 384 and 49 at row 387. The circle is where the arithmetic said.
 
 <figure>
-  <img src="/img/5.1/clipped-lobe.png" alt="Two dark renders side by side. Left: a broad pool of light on the floor that ends in a sharp curved edge just beyond the lamp, with black floor behind it. Right: the same pool continuing smoothly past the lamp and fading out into the distance" />
+  <img src="/learn_vulkan/img/5.1/clipped-lobe.png" alt="Two dark renders side by side. Left: a broad pool of light on the floor that ends in a sharp curved edge just beyond the lamp, with black floor behind it. Right: the same pool continuing smoothly past the lamp and fading out into the distance" />
   <figcaption>Specular light only, shininess 1. Left, Phong: the highlight stops dead at the
   circle. Right, Blinn-Phong: it carries on past the lamp and fades.</figcaption>
 </figure>
@@ -228,7 +228,7 @@ The prediction is 1 / cos 74.8° = 3.8 times narrower. The table's 128 and 36 ar
 3.6, with perspective, attenuation and the half-peak threshold all leaning on it.
 
 <figure>
-  <img src="/img/5.1/highlight-shapes.png" alt="Three dark renders side by side of the lamp's highlight on the floor. Left: a broad rounded pool. Middle: a narrower, much longer pool. Right: a thin streak running from under the lamp toward the viewer" />
+  <img src="/learn_vulkan/img/5.1/highlight-shapes.png" alt="Three dark renders side by side of the lamp's highlight on the floor. Left: a broad rounded pool. Middle: a narrower, much longer pool. Right: a thin streak running from under the lamp toward the viewer" />
   <figcaption>Specular only. Left, Phong at 16. Middle, Blinn-Phong at 16: twice as long,
   already narrower. Right, Blinn-Phong at 64: Phong's length, a quarter of its width.</figcaption>
 </figure>
@@ -270,7 +270,7 @@ Blinn-Phong at a low exponent lights whole faces: the two crates nearest the cam
 lamp side at the back, and without the test their fronts glow.
 
 <figure>
-  <img src="/img/5.1/specular-leak.png" alt="Two renders of the room. Left: the two nearest crates are dark on the side facing the camera. Right: the same two crate faces are a flat, dull grey, as if lit from the front" />
+  <img src="/learn_vulkan/img/5.1/specular-leak.png" alt="Two renders of the room. Left: the two nearest crates are dark on the side facing the camera. Right: the same two crate faces are a flat, dull grey, as if lit from the front" />
   <figcaption>Blinn-Phong at 4. Left, with the facing test. Right, without it: the faces
   turned away from the lamp pick up a highlight they cannot have.</figcaption>
 </figure>

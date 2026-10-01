@@ -6,7 +6,10 @@ import starlight from "@astrojs/starlight";
 // an `autogenerate` directory, so adding a chapter page is all it takes to add it to
 // the navigation -- `sidebar.order` in the page frontmatter places it within its part.
 export default defineConfig({
-  site: "https://example.com",
+  // Served by GitHub Pages from /learn_vulkan/. Root-relative links in the articles
+  // therefore carry the base themselves ("/learn_vulkan/img/...").
+  site: "https://magicalbearclaw.github.io",
+  base: "/learn_vulkan",
   integrations: [
     starlight({
       title: "LearnVulkan",

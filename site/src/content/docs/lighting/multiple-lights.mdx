@@ -6,7 +6,7 @@ sidebar:
 ---
 
 <figure>
-  <img src="/img/reference/2.6.multiple_lights.png" alt="Ten crates lit by six lights at once: a dim cool sun, four coloured bulbs shown as small bright cubes, and a white torch at the camera. Cyan spills across the left face of the central crate, pink along its top edge, orange on the crate at the upper right and green on the one at the right" />
+  <img src="/learn_vulkan/img/reference/2.6.multiple_lights.png" alt="Ten crates lit by six lights at once: a dim cool sun, four coloured bulbs shown as small bright cubes, and a white torch at the camera. Cyan spills across the left face of the central crate, pink along its top edge, orange on the crate at the upper right and green on the one at the right" />
   <figcaption>Chapter 2.6: one sun, four bulbs and a torch, all shading the same crates.</figcaption>
 </figure>
 
@@ -201,12 +201,12 @@ The three figures below differ by nothing but this constant. Same binary, same s
 shader source, one number:
 
 <figure>
-  <img src="/img/2.6/sun-only.png" alt="The ten crates lit only by the dim directional sun: uniformly dark brown, every face flat, the four lamp cubes still visible as bright coloured squares" />
+  <img src="/learn_vulkan/img/2.6/sun-only.png" alt="The ten crates lit only by the dim directional sun: uniformly dark brown, every face flat, the four lamp cubes still visible as bright coloured squares" />
   <figcaption><code>kLightCount = 1</code>: the sun alone. Dim, even, and flat.</figcaption>
 </figure>
 
 <figure>
-  <img src="/img/2.6/sun-and-bulbs.png" alt="The same crates with the sun and the four coloured bulbs: cyan, pink, orange and green spill across the crates, but the front face of the central crate stays dark brown" />
+  <img src="/learn_vulkan/img/2.6/sun-and-bulbs.png" alt="The same crates with the sun and the four coloured bulbs: cyan, pink, orange and green spill across the crates, but the front face of the central crate stays dark brown" />
   <figcaption><code>kLightCount = 5</code>: the four bulbs added. Note the central crate's front face — no light reaches it.</figcaption>
 </figure>
 

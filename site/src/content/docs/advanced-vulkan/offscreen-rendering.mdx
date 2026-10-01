@@ -6,7 +6,7 @@ sidebar:
 ---
 
 <figure>
-  <img src="/img/reference/4.3.offscreen_rendering.png" alt="The glass panes, ferns and crates of the previous chapter, apparently unchanged" />
+  <img src="/learn_vulkan/img/reference/4.3.offscreen_rendering.png" alt="The glass panes, ferns and crates of the previous chapter, apparently unchanged" />
   <figcaption>Chapter 4.3, running with no effect selected. This is 4.2's frame, and it is
   pixel for pixel the same frame — but it reached the screen by a different road.</figcaption>
 </figure>
@@ -788,7 +788,7 @@ negative values to 0 — so each edge appears once, on its darker side. And the 
 almost entirely, because a cut-out silhouette is nothing but edges.
 
 <figure>
-  <img src="/img/4.3/edges.png" alt="The same scene reduced to coloured outlines on black: the floor's grout lines, the crates' edges, the ferns' silhouettes and the panes' borders" />
+  <img src="/learn_vulkan/img/4.3/edges.png" alt="The same scene reduced to coloured outlines on black: the floor's grout lines, the crates' edges, the ferns' silhouettes and the panes' borders" />
   <figcaption>Edge detection, <kbd>1</kbd> five times. The panes' interiors vanish because
   they are flat; their borders survive. The ferns survive almost entirely, because a cutout
   silhouette is nothing but edges.</figcaption>
@@ -1205,7 +1205,7 @@ int main(int argc, char** argv) {
 Nothing else changes: the same scene, the same draw calls, the same second pass.
 
 <figure>
-  <img src="/img/4.3/scale-25.png" alt="The same scene, visibly blocky, with stair-stepped edges on the crates and panes" />
+  <img src="/learn_vulkan/img/4.3/scale-25.png" alt="The same scene, visibly blocky, with stair-stepped edges on the crates and panes" />
   <figcaption>The scene rendered into a 320×180 image and stretched across 1280×720.
   63.47% of pixels differ from the reference.</figcaption>
 </figure>

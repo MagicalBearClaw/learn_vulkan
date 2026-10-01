@@ -6,7 +6,7 @@ sidebar:
 ---
 
 <figure>
-  <img src="/img/reference/4.4.cubemaps.png" alt="A mirrored sphere standing on a tiled floor between two wooden crates, reflecting the sky above, the crates and ferns around it, and the floor below" />
+  <img src="/learn_vulkan/img/reference/4.4.cubemaps.png" alt="A mirrored sphere standing on a tiled floor between two wooden crates, reflecting the sky above, the crates and ferns around it, and the floor below" />
   <figcaption>Chapter 4.4. The sky is a cubemap loaded from six files. The sphere is
   reflecting a second cubemap, which did not exist when the frame began — the scene was
   drawn into it six times, one face per axis, a few microseconds earlier.</figcaption>
@@ -247,7 +247,7 @@ The symptom of forgetting is very specific, and it is worth recognising because 
 look like a winding problem:
 
 <figure>
-  <img src="/img/4.4/wrong-winding.png" alt="The sphere showing only a thin band of tiny crates and ferns against flat dark blue, with no sky and no floor in the reflection" />
+  <img src="/learn_vulkan/img/4.4/wrong-winding.png" alt="The sphere showing only a thin band of tiny crates and ferns against flat dark blue, with no sky and no floor in the reflection" />
   <figcaption>The same frame with the face pipelines left counter-clockwise. The ferns
   survive in the reflection because they are drawn with culling off; the floor and the
   inside of the skybox — both single-sided — are gone, leaving the clear colour.</figcaption>
@@ -1032,7 +1032,7 @@ simplification worth stating: water's own `F₀` is 0.020 and diamond's is 0.172
 of why diamond sparkles.
 
 <figure>
-  <img src="/img/4.4/refract-vs-fresnel.png" alt="Two crops of the sphere side by side: the left is uniformly glassy with the floor visible through it, the right is the same but with a bright reflective rim" />
+  <img src="/learn_vulkan/img/4.4/refract-vs-fresnel.png" alt="Two crops of the sphere side by side: the left is uniformly glassy with the floor visible through it, the right is the same but with a bright reflective rim" />
   <figcaption>Left: pure refraction. Right: the Fresnel mix. The difference is almost
   entirely at the rim.</figcaption>
 </figure>
@@ -1736,7 +1736,7 @@ Key <kbd>2</kbd> also switches between the six loaded PNGs and the live cubemap.
 difference is the whole argument for rendering one:
 
 <figure>
-  <img src="/img/4.4/static-sky.png" alt="The sphere reflecting only sky and a plain grey ground, with no crates or ferns visible in the reflection" />
+  <img src="/learn_vulkan/img/4.4/static-sky.png" alt="The sphere reflecting only sky and a plain grey ground, with no crates or ferns visible in the reflection" />
   <figcaption>The sphere reflecting the static sky. The crates and the ferns standing a
   metre away are simply not in the image being sampled, so the reflection cannot show
   them.</figcaption>

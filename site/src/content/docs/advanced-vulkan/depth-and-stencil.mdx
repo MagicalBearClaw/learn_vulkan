@@ -6,7 +6,7 @@ sidebar:
 ---
 
 <figure>
-  <img src="/img/reference/4.1.depth_and_stencil.png" alt="Two wooden crates standing on a painted slab set into a tiled grid floor, each crate ringed by a thin orange outline" />
+  <img src="/learn_vulkan/img/reference/4.1.depth_and_stencil.png" alt="Two wooden crates standing on a painted slab set into a tiled grid floor, each crate ringed by a thin orange outline" />
   <figcaption>Chapter 4.1: two crates, a painted slab lying in the floor's plane, and an outline that is not geometry.</figcaption>
 </figure>
 
@@ -554,7 +554,7 @@ values are computed by the same arithmetic from the same inputs and come out bit
 identical.
 
 <figure>
-  <img src="/img/4.1/coplanar-unbiased.png" alt="The grid floor with no slab visible at all" />
+  <img src="/learn_vulkan/img/4.1/coplanar-unbiased.png" alt="The grid floor with no slab visible at all" />
   <figcaption>Identical coplanar geometry, no depth bias. The slab is drawn, and every one of its fragments is rejected.</figcaption>
 </figure>
 
@@ -563,7 +563,7 @@ completely — not a speckle, not a fight, an absence. Switch the bias on and it
 floor that vanishes instead:
 
 <figure>
-  <img src="/img/4.1/coplanar-biased.png" alt="The same view with the painted slab covering the entire floor" />
+  <img src="/learn_vulkan/img/4.1/coplanar-biased.png" alt="The same view with the painted slab covering the entire floor" />
   <figcaption>The same geometry with `depthBiasConstantFactor = -2.0`. 74.38% of the frame changes.</figcaption>
 </figure>
 
