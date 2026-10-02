@@ -55,6 +55,8 @@ FENCE = re.compile(r"^\s*(```|~~~)")
 #   * image.cpp splits -- create/upload/mips/samplers in 1.11, depth in 1.13.
 #   * 4.7 adds multisampling: a sample count on ImageDesc and PipelineBuilder, and the
 #     sampleRateShading feature in device.cpp. Its article shows those lines.
+#   * 5.3 lets PipelineBuilder build a depth-only pipeline, with no fragment stage
+#     and no colour attachment, for its shadow pass.
 OWNERS: dict[str, list[str]] = {
     "base/include/vkc/capture.hpp": ["1.1", "1.5"],
     # parse_args belongs with the Args struct in 1.1; the Capture class is 1.5's.
@@ -77,8 +79,8 @@ OWNERS: dict[str, list[str]] = {
     "scaffold/src/context.cpp": ["1.5"],
     "scaffold/include/vkc/frame.hpp": ["1.5", "1.6", "1.7"],
     "scaffold/src/frame.cpp": ["1.5", "1.6", "1.7"],
-    "scaffold/include/vkc/pipeline.hpp": ["1.7", "4.7"],
-    "scaffold/src/pipeline.cpp": ["1.7", "4.7"],
+    "scaffold/include/vkc/pipeline.hpp": ["1.7", "4.7", "5.3"],
+    "scaffold/src/pipeline.cpp": ["1.7", "4.7", "5.3"],
     "scaffold/include/vkc/app.hpp": ["1.8"],
     "scaffold/src/app.cpp": ["1.8"],
     "scaffold/include/vkc/buffer.hpp": ["1.8"],

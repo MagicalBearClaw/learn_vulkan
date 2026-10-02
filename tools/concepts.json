@@ -60,6 +60,7 @@
     "4.9.compute": ["compute shader", "compute pipeline", "dispatch", "workgroup", "invocation", "dispatch thread ID", "bounds check", "data parallelism", "buffer memory barrier", "read-after-write hazard", "write-after-read hazard", "Kepler's third law", "angular speed", "Rodrigues' rotation formula", "precision bound"],
 
     "5.1.blinn_phong": ["Blinn-Phong", "halfway vector", "specular lobe", "grazing angle", "hemisphere", "lobe clipping", "crease", "plane of incidence", "exponent matching", "small-angle approximation", "highlight elongation", "specular leak", "facing test", "infinite viewer"],
-    "5.2.gamma_correction": ["encoding", "decoding", "inverse transfer function", "gamma-space lighting", "UNORM", "round trip", "display response", "falloff", "contrast ratio", "clamping", "clipping", "hue shift", "dynamic range"]
+    "5.2.gamma_correction": ["encoding", "decoding", "inverse transfer function", "gamma-space lighting", "UNORM", "round trip", "display response", "falloff", "contrast ratio", "clamping", "clipping", "hue shift", "dynamic range"],
+    "5.3.shadow_mapping": ["shadow mapping", "shadow map", "occluder", "receiver", "light space", "orthographic projection", "depth-only pass", "comparison sampler", "shadow acne", "slope-scaled depth bias", "peter-panning", "percentage-closer filtering", "border colour", "box fitting"]
   }
 }

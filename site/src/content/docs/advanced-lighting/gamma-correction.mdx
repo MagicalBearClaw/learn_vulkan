@@ -642,9 +642,10 @@ add_chapter(5.2.gamma_correction
 
 :::note[What moved into vkcommon]
 Nothing. 5.1's code is all still in the sample, and nothing here is used twice yet.
-`srgb_to_linear` is the obvious candidate. It does not move, because no later chapter needs
-it: 5.7 moves the lighting into a floating-point target, and the one pass that then writes
-the swapchain can leave the encode to the hardware like every chapter before this one.
+`srgb_to_linear` is the obvious candidate. It does not move. The lighting never needs it
+again: 5.7 moves the lighting into a floating-point target, and the one pass that then writes
+the swapchain can leave the encode to the hardware like every chapter before this one. Its one
+later use is 5.3's picture of a depth image, which copies its three lines.
 :::
 
 ## What changed since 5.1

@@ -1,0 +1,1533 @@
+---
+title: "Shadow mapping"
+description: A second pass that renders the scene from the sun and keeps only depth, a comparison sampler that asks it whether each fragment can see the sun, the acne that comparison produces and the slope-scaled bias derived to remove it, and three ways of reading the map.
+sidebar:
+  order: 3
+---
+
+<figure>
+  <img src="/learn_vulkan/img/reference/5.3.shadow_mapping.png" alt="A tiled floor under a pale blue sky with five wooden crates and a tall thin post, lit by a low sun from the left. Each crate throws a long, soft-edged shadow to the right and towards the viewer; the stacked pair on the left throws one shadow shaped like both" />
+  <figcaption>Chapter 5.3. Every crate casts a shadow, onto the floor and onto other crates. Press
+  <kbd>4</kbd> to see the image those shadows were read from.</figcaption>
+</figure>
+
+Every fragment shader in this series has asked one question about each light: *which way is
+it?* The answer goes into a cosine, and the cosine is the lighting. Part 2's review named the
+question that is never asked: *can this point see the light at all?* A crate's shadow is the
+set of points for which the answer is no, and until now nothing has been able to say no. The
+floor behind a crate is lit exactly as if the crate were not there.
+
+The question is about a straight line. A point is in shadow when something lies on the
+segment between it and the light. A fragment shader cannot look along that segment: it sees
+one fragment of one triangle, and knows nothing about the rest of the scene. What it can do is
+read an image. **Shadow mapping** is the technique of drawing an image beforehand that holds
+the answer.
+
+The scene is 5.2's room by daylight: the four crates, a small one stacked on the first, and a
+tall thin post, lit by a sun low in the sky. The keys:
+
+- <kbd>1</kbd> shadows on or off
+- <kbd>2</kbd> the shadow pass's slope-scaled depth bias: 0, 1, 2, 4 or 8
+- <kbd>3</kbd> how the map is read: one texel, bilinear, or nine bilinear reads
+- <kbd>4</kbd> show the map itself in the corner of the window
+
+```
+[info] 1 shadows, 2 slope bias, 3 filter, 4 show the shadow map.
+[info] shadows on, slope bias 4, 3x3 bilinear taps
+```
+
+## A depth buffer is a visibility answer
+
+Put a camera where the light is and render the scene. The depth buffer that comes out holds,
+for every direction the camera can see, the distance to the nearest surface in that
+direction. That nearest surface is what the light reaches. Anything further along the same
+direction is behind it, and the light does not get there.
+
+The surface nearer the light is the **occluder**, and the one behind it that it darkens is the
+**receiver**. One surface can be both: a crate shades the floor and is shaded by the post. The
+test the depth buffer makes possible is a single comparison. Find where a fragment lands in
+that image, and compare its own distance from the light with the distance stored there:
+
+```
+   lit   ⇔   fragment's depth from the light  ≤  stored depth at that texel
+```
+
+If the fragment is as near as the nearest thing the light saw in its direction, it *is* that
+thing, and it is lit. If it is further, something else came first.
+
+So every frame now has two passes. The first renders the scene from the light into a depth
+image, the **shadow map**, keeping nothing else. The second renders the scene from the camera
+as before, and every fragment shader runs the comparison. Coordinates measured from the
+light's camera, rather than from the viewer's, are **light space**, and moving a point into
+light space takes nothing but another view and projection matrix.
+
+## A camera for the sun
+
+2.5 described the sun as a **directional light**: so far away that its rays are parallel
+everywhere in the scene. A perspective projection is the wrong camera for that. It fans its
+rays out from one point, and the sun's rays do not fan. The camera that matches parallel rays
+is an **orthographic projection**: a box rather than a pyramid, which maps view-space x and y
+to the image without dividing by distance.
+
+1.12's `aspect_fix` was a two-by-two orthographic projection, and 1.13 replaced it without
+deriving the real one. It is short. The box is `[l, r]` across, `[b, t]` up, and from `n` to
+`f` along the view direction. In view space the camera looks down −z, so a point at distance
+*d* in front of it has z = −*d*. Each axis is a linear map that sends the box's two faces to
+the two ends of the clip-space range:
+
+```
+   x′ =  2x / (r − l)  −  (r + l) / (r − l)          l → −1,  r → +1
+   y′ =  2y / (t − b)  −  (t + b) / (t − b)          b → −1,  t → +1
+   z′ = −z / (f − n)   −  n / (f − n)                d = n → 0,  d = f → 1
+   w′ =  1
+```
+
+The z row is Vulkan's: depth runs 0 to 1, not OpenGL's −1 to 1, which is what the project's
+`GLM_FORCE_DEPTH_ZERO_TO_ONE` asks `glm::ortho` for. The w row is the difference from a
+perspective matrix. w′ stays 1, so the divide that follows the vertex shader divides by one,
+and depth is a linear function of distance from the light, not the reciprocal one 4.1
+measured.
+
+```cpp title="code/src/5.advanced_lighting/shadow_mapping/main.cpp"
+// The sun. A direction rather than a position: it is far enough away that every ray from
+// it into this room is parallel to every other. This vector points *towards* the sun,
+// which is what the lighting wants; it sits 30 degrees above the horizon, behind the
+// room and to its left, so shadows fall long, to the right and towards the camera.
+const glm::vec3 kSunDirection = glm::normalize(glm::vec3(-0.80F, 0.50F, -0.33F));
+constexpr glm::vec3 kSunColour{1.0F, 0.92F, 0.80F};
+
+// Daylight from the rest of the sky: the only light a shadowed surface gets.
+constexpr glm::vec3 kAmbient{0.10F, 0.12F, 0.16F};
+
+```
+
+The sun sits 30° above the horizon: the vector's y is 0.50 and its length is 1, and
+arcsin 0.50 is 30°. `kSunDirection` points *towards* the sun, which is what a lighting
+calculation wants. The sun's camera looks the other way.
+
+### How big the box is
+
+A shadow map has a fixed number of texels, so the box that maps onto it decides how much of
+the room each texel covers. Too small, and something that casts a shadow is outside it. Too
+large, and the texels are spread over floor that casts nothing.
+
+The question that settles the size is: which points can be in shadow? A point is shadowed by an
+occluder on the line from it towards the sun. That line is parallel to the sun's view
+direction, so in light space it keeps the same x and y all the way along. If every occluder
+lies inside the box's x and y range, then a receiver outside that range has nothing on its
+line, and is lit. The box has to hold the **occluders**, not every receiver. That is what
+**box fitting** means here: the smallest square, across the sun's view, that holds every crate.
+
+```cpp title="code/src/5.advanced_lighting/shadow_mapping/main.cpp"
+// ---------------------------------------------------------------------------
+// The shadow map
+// ---------------------------------------------------------------------------
+
+// Texels along each side. With the box fitted around the crates, as below, one texel
+// covers about 6 mm of the room.
+constexpr uint32_t kShadowMapSize = 1024;
+
+// The box the sun's camera sees: looked at from kSunDistance away along kSunDirection,
+// towards kShadowCentre, keeping depth between kShadowNear and kShadowFar. Its width is
+// not a constant -- sun_view_projection() fits it around the crates -- and the article
+// works out why holding every crate is enough.
+constexpr glm::vec3 kShadowCentre{0.30F, kFloorY, -0.80F};
+constexpr float kSunDistance = 15.0F;
+constexpr float kShadowNear = 1.0F;
+constexpr float kShadowFar = 30.0F;
+
+// A little more than the crates need, so that the 3x3 reads around a crate's outermost
+// edge stay inside the map.
+constexpr float kShadowMargin = 1.02F;
+
+// The slope-scaled depth bias the shadow pass can use, in units the article derives:
+// 1 moves each surface back by the depth it changes across one shadow-map texel.
+constexpr std::array<float, 5> kSlopeBiasSteps{0.0F, 1.0F, 2.0F, 4.0F, 8.0F};
+constexpr size_t kDefaultSlopeBias = 3;  // 4
+
+// How the fragment shader reads the shadow map. The values are Globals::filter.
+enum class ShadowFilter : uint32_t { OneTexel = 0, Bilinear = 1, Pcf3x3 = 2 };
+
+constexpr std::array<const char*, 3> kFilterNames{"one texel", "bilinear",
+                                                  "3x3 bilinear taps"};
+
+```
+
+```cpp title="code/src/5.advanced_lighting/shadow_mapping/main.cpp"
+// Each crate's model matrix: the placement, lifted by half a unit so that the cube's
+// base, not its centre, sits at the placement's height.
+[[nodiscard]] glm::mat4 crate_model(const Placement& crate) {
+    return glm::translate(model_of(crate), glm::vec3(0.0F, 0.5F, 0.0F));
+}
+
+// The sun's camera: a view matrix that looks along the sun's rays at the middle of the
+// room, and an orthographic projection, because parallel rays need no perspective.
+[[nodiscard]] glm::mat4 sun_view_projection() {
+    const glm::vec3 eye = kShadowCentre + kSunDirection * kSunDistance;
+    const glm::mat4 view = glm::lookAt(eye, kShadowCentre, glm::vec3(0.0F, 1.0F, 0.0F));
+
+    // The smallest square around the sun's line of sight that holds every corner of
+    // every crate. In view space the sun looks down -z, so x and y are the two
+    // directions across the map; depth plays no part in the fit.
+    float half_width = 0.0F;
+    for (const Placement& crate : kCrates) {
+        const glm::mat4 model_view = view * crate_model(crate);
+        for (const Vertex& vertex : kCubeVertices) {
+            const glm::vec4 corner = model_view * glm::vec4(vertex.position, 1.0F);
+            half_width = std::max({half_width, std::abs(corner.x), std::abs(corner.y)});
+        }
+    }
+    half_width *= kShadowMargin;
+
+    glm::mat4 projection = glm::ortho(-half_width, half_width, -half_width, half_width,
+                                      kShadowNear, kShadowFar);
+    // The y flip is the same one every camera in this series has made, and here it is
+    // not needed for the lookup to agree with the pass: both use this one matrix,
+    // whichever way up the image is stored. It is there so that triangles keep the
+    // winding the cull mode expects, and so that key 4 shows the map the right way up.
+    projection[1][1] *= -1.0F;
+    return projection * view;
+}
+```
+
+The fit transforms every corner of every crate into the sun's view space and keeps the
+largest |x| or |y|. Here that is 3.09, so with the 2% margin the box is 6.31 units across and
+each of the 1,024 texels covers 6.2 mm of it. A square 11 units across, which was this chapter's
+first guess, holds the crates too. It leaves each texel 10.7 mm and spends about two thirds of
+the map on floor that casts nothing.
+
+Depth is the other dimension, and there receivers do matter. `kShadowNear` and `kShadowFar`
+have to hold every point the fragment shader will look up, occluder or not: a floor fragment
+beyond the far plane would have a depth above 1 and fail every comparison. Inside the fitted
+box the floor runs from depth 0.30 to 0.67, comfortably inside 0 to 1. The shader still guards
+against the case, and that is measured below.
+
+:::note[What the y flip is for here]
+Every camera in this series flips y, because Vulkan's clip-space y points down. For the
+sun's camera the flip is not needed to make the lookup agree with the pass: both use the same
+matrix, whichever way up the image is stored. Removing it changes something else. Without
+it, every triangle's winding reverses on screen, the back-face culling in the shadow pass
+discards the faces that point at the sun, and draws the far faces instead. The floor, which
+has no far face, vanishes from the map. The shadows barely move: 3,142 pixels of the main
+view change. Drawing only the far faces into a shadow map is a known technique in its own
+right. The sample keeps the flip so that the culling means what it says, and so that key 4
+shows the map the right way up.
+:::
+
+## The shadow pass
+
+The pass from the sun keeps depth and nothing else, so it needs no colour attachment. With no
+colour attachment, there is nothing for a fragment shader to write, and it can be left out
+too. The rasteriser still works out each fragment's depth, and the depth test and depth write
+are fixed-function. A pass like this is a **depth-only pass**. The GPU runs a vertex shader
+per vertex and the depth test per fragment, and no shader per fragment at all.
+
+`PipelineBuilder` could not build such a pipeline: its `build()` threw without a colour
+attachment, and it always had two stages. 5.3 changes `vkcommon` to allow both, and these are
+all the lines that changed. In the header:
+
+```cpp title="code/common/scaffold/include/vkc/pipeline.hpp"
+    // The module holds both stages. The entry point names are the Slang function
+    // names -- this project marks them [shader("vertex")] vertexMain and
+    // [shader("fragment")] fragmentMain, and the build passes
+    // -fvk-use-entrypoint-name so those names survive into the SPIR-V.
+    //
+    // An empty fragment_entry builds a pipeline with no fragment stage. That is legal
+    // in any pipeline, but colour outputs are then undefined, so it is only useful
+    // when depth is all the pipeline writes. Chapter 5.3's shadow map is the first.
+    PipelineBuilder& shaders(VkShaderModule module,
+                             std::string vertex_entry = "vertexMain",
+                             std::string fragment_entry = "fragmentMain");
+```
+
+```cpp title="code/common/scaffold/include/vkc/pipeline.hpp"
+    // Dynamic rendering has no render pass to describe the attachments, so the
+    // pipeline is told their formats directly. These must match the images the
+    // chapter actually renders into. Leaving it unset declares no colour attachment
+    // at all, for a depth-only pass like chapter 5.3's shadow map.
+    PipelineBuilder& colour_attachment(VkFormat format);
+```
+
+In `build()`, the check now asks only that the pipeline writes *something*, and the two
+counts it used to hard-code follow what the chapter set:
+
+```cpp title="code/common/scaffold/src/pipeline.cpp"
+    // A pipeline with no colour attachment has to have a depth attachment, or it would
+    // produce nothing at all. Chapter 5.3's shadow pass is the first to leave out the
+    // colour attachment, and its fragment shader with it.
+    if (colour_format_ == VK_FORMAT_UNDEFINED && depth_format_ == VK_FORMAT_UNDEFINED) {
+        throw std::runtime_error(
+            "PipelineBuilder::build: neither colour_attachment() nor depth() was called");
+    }
+    const uint32_t colour_count = colour_format_ == VK_FORMAT_UNDEFINED ? 0 : 1;
+    const uint32_t stage_count = fragment_entry_.empty() ? 1 : 2;
+```
+
+```cpp title="code/common/scaffold/src/pipeline.cpp"
+        .attachmentCount = colour_count,
+```
+
+```cpp title="code/common/scaffold/src/pipeline.cpp"
+        .colorAttachmentCount = colour_count,
+```
+
+```cpp title="code/common/scaffold/src/pipeline.cpp"
+        // The vertex stage is first in stages[], so a count of 1 drops the fragment one.
+        .stageCount = stage_count,
+```
+
+`stages[]` lists the vertex stage first, so a `stageCount` of 1 hands Vulkan the vertex
+stage alone. A pipeline with no fragment shader is legal Vulkan. Its colour outputs would be
+undefined, which does not matter when there are none.
+
+The pipelines themselves are the next thing. There are five, one for each bias step, because
+depth bias is part of the pipeline unless it is declared dynamic:
+
+```cpp title="code/src/5.advanced_lighting/shadow_mapping/main.cpp"
+        // The shadow pass: a vertex shader and nothing else, into a depth attachment
+        // and nothing else. One pipeline per bias step, because depth bias is baked
+        // into the pipeline unless it is declared dynamic.
+        for (size_t i = 0; i < kSlopeBiasSteps.size(); ++i) {
+            vkc::PipelineBuilder builder(device);
+            builder.shaders(scene_shader, "shadowVertexMain", "")
+                .cull(VK_CULL_MODE_BACK_BIT, VK_FRONT_FACE_COUNTER_CLOCKWISE)
+                .depth(shadow_map_.format(), /*test=*/true, /*write=*/true)
+                .layout(pipeline_layout_);
+            if (kSlopeBiasSteps[i] > 0.0F) {
+                builder.depth_bias(/*constant_factor=*/0.0F, kSlopeBiasSteps[i]);
+            }
+            shadow_pipelines_[i] = builder.build();
+            const std::string label =
+                std::format("shadow, slope bias {}", kSlopeBiasSteps[i]);
+            context().name(shadow_pipelines_[i], VK_OBJECT_TYPE_PIPELINE, label.c_str());
+        }
+```
+
+The entry point is a vertex shader that places each vertex where the sun sees it, and nothing
+more:
+
+```slang title="code/src/5.advanced_lighting/shadow_mapping/scene.slang"
+// The shadow pass. The same vertex, the same model matrix, and the sun's matrix in place
+// of the camera's. The rasteriser's depth is all this pass keeps, so there is nothing
+// else to output.
+[shader("vertex")]
+float4 shadowVertexMain(uint vertex_id : SV_VulkanVertexID) : SV_Position {
+    Vertex vertex = push.vertices[vertex_id];
+    DrawData draw = push.draws[push.draw_index];
+    float4 world = mul(draw.model, float4(vertex.position, 1.0));
+    return mul(push.globals.light_view_projection, world);
+}
+```
+
+It reads the same vertex, the same `DrawData` and the same model matrix as `vertexMain`. Only
+the matrix after the model matrix differs.
+
+### Recording it
+
+```cpp title="code/src/5.advanced_lighting/shadow_mapping/main.cpp"
+private:
+    // ---------------------------------------------------------------------------
+    // Pass one: depth from the sun
+    // ---------------------------------------------------------------------------
+
+    void render_shadow_map(VkCommandBuffer cmd) {
+        // Into DEPTH_ATTACHMENT_OPTIMAL, from nothing: the pass clears the whole map, so
+        // last frame's depths are not worth keeping. The source scope is last frame's
+        // reader, as in 4.3 -- there is one shadow map and two frames in flight, and the
+        // previous frame's fragment shaders may still be sampling it.
+        vkc::image_barrier(cmd, shadow_map_.handle(), VK_IMAGE_LAYOUT_UNDEFINED,
+                           VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                           VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                           VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                           VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                               VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                           VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                               VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                           VK_IMAGE_ASPECT_DEPTH_BIT);
+
+```
+
+The first barrier moves the map into `VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL`, the layout
+for being written as depth. From `UNDEFINED`, as 4.3's scene image did, because the pass
+clears the whole map. The source scope is last frame's reader, for 4.3's reason: one map, two
+frames in flight. The destination names both fragment-test stages,
+`VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT` and `VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT`.
+A depth test can happen before the fragment shader or after it, and with no fragment shader
+the implementation picks, so both are named. The accesses are
+`VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT` and `VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT`,
+because a depth test reads the stored value before it writes a new one. The last argument,
+`VK_IMAGE_ASPECT_DEPTH_BIT`, says which part of the image the barrier covers. 4.3's barriers
+left it at its default of colour, and a depth image has no colour.
+
+```cpp title="code/src/5.advanced_lighting/shadow_mapping/main.cpp"
+        // A rendering instance with a depth attachment and no colour attachment at all.
+        // The depth is STOREd this time: unlike the camera's depth buffer, which nothing
+        // reads once the frame is drawn, this one is the whole point of the pass.
+        const VkRenderingAttachmentInfo depth_attachment{
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .pNext = nullptr,
+            .imageView = shadow_map_.view(),
+            .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+            .resolveMode = VK_RESOLVE_MODE_NONE,
+            .resolveImageView = VK_NULL_HANDLE,
+            .resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .clearValue = {.depthStencil = {.depth = 1.0F, .stencil = 0}},
+        };
+        const VkExtent2D extent{kShadowMapSize, kShadowMapSize};
+        const VkRenderingInfo rendering{
+            .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .renderArea = {.offset = {0, 0}, .extent = extent},
+            .layerCount = 1,
+            .viewMask = 0,
+            .colorAttachmentCount = 0,
+            .pColorAttachments = nullptr,
+            .pDepthAttachment = &depth_attachment,
+            .pStencilAttachment = nullptr,
+        };
+        vkCmdBeginRendering(cmd, &rendering);
+        set_viewport(cmd, extent);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                          shadow_pipelines_[slope_bias_]);
+        draw_geometry(cmd);
+
+        vkCmdEndRendering(cmd);
+```
+
+This is the first rendering instance in the series with no colour attachment at all. The
+depth attachment's `storeOp` is `VK_ATTACHMENT_STORE_OP_STORE`. The camera's depth buffer has
+always been `DONT_CARE`, because nothing reads it after the frame. This one is the reason for
+the pass. The viewport follows the map, 1024 square, as 4.3's followed its target.
+
+```cpp title="code/src/5.advanced_lighting/shadow_mapping/main.cpp"
+
+        // From attachment to texture. Depth is written by the fragment tests, early or
+        // late, and the last of those writes has landed once LATE_FRAGMENT_TESTS is
+        // done; the reader is the camera pass's fragment shader.
+        vkc::image_barrier(cmd, shadow_map_.handle(),
+                           VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                           VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                           VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                           VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                           VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                           VK_IMAGE_ASPECT_DEPTH_BIT);
+    }
+```
+
+The second barrier turns the map from an attachment into a texture, as 4.3's turned its scene
+image. The source side is not 4.3's. Colour is written in the colour-attachment-output stage.
+Depth is written by the fragment tests, and the store at the end of the pass happens in
+`VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT`.
+
+Copying 4.3's barrier is an easy mistake to make here, so it was tried. Changing the source to
+`COLOR_ATTACHMENT_OUTPUT` / `COLOR_ATTACHMENT_WRITE` produces no core validation message, and
+no difference in the frame: 0 pixels. With synchronization validation switched on, as 4.3
+showed, every frame reports this, until the tenth report says the layer has reached its
+`duplicate_message_limit` and stops:
+
+```text
+vkCmdPipelineBarrier2(): WRITE_AFTER_WRITE hazard detected. vkCmdPipelineBarrier2 performs
+image layout transition on the VkImage 0x300000000030[shadow map], which was previously
+written at the end of the render pass instance (vkCmdEndRendering) by the attachment storeOp.
+No sufficient synchronization is present to ensure that a layout transition does not
+conflict with a prior write (VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT) at
+VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT.
+```
+
+The message names the stage and the access the barrier should have used. With them, the
+sample runs clean under synchronization validation, with every key exercised.
+
+## Asking the map
+
+The second pass reads the map. A depth image is read through a **comparison sampler**: a
+sampler that does not return the depth it reads, but compares it against a value the shader
+passes in, and returns 1 where the comparison holds and 0 where it fails.
+
+```cpp title="code/src/5.advanced_lighting/shadow_mapping/main.cpp"
+    // A comparison sampler, written out because SamplerDesc has no field for any of the
+    // three things that make it one.
+    [[nodiscard]] VkSampler create_shadow_sampler(VkFilter filter) {
+        const VkSamplerCreateInfo info{
+            .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .magFilter = filter,
+            .minFilter = filter,
+            .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+            // Outside the map, the border: depth 1.0, the far plane, which nothing is
+            // behind. A fragment the sun's camera never saw is lit.
+            .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER,
+            .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER,
+            .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER,
+            .mipLodBias = 0.0F,
+            .anisotropyEnable = VK_FALSE,
+            .maxAnisotropy = 1.0F,
+            // The sampler compares the depth the shader passes in against each texel it
+            // reads, and returns 1 where the comparison holds and 0 where it fails,
+            // filtered: the fraction of texels that passed. LESS_OR_EQUAL holds when the
+            // fragment is no further from the sun than what the sun saw.
+            .compareEnable = VK_TRUE,
+            .compareOp = VK_COMPARE_OP_LESS_OR_EQUAL,
+            .minLod = 0.0F,
+            .maxLod = 0.0F,
+            .borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE,
+            .unnormalizedCoordinates = VK_FALSE,
+        };
+        VkSampler sampler = VK_NULL_HANDLE;
+        VK_CHECK(vkCreateSampler(context().device(), &info, nullptr, &sampler));
+        return sampler;
+    }
+```
+
+Three fields make a sampler a comparison sampler. `compareEnable` turns it on. `compareOp` is
+the comparison, with the shader's value on the left and the texel on the right:
+`VK_COMPARE_OP_LESS_OR_EQUAL` holds when the fragment's depth is at most the stored one, the
+"lit" condition above. And the sampler is given an answer for coordinates outside the map.
+`VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER` returns a fixed **border colour** there instead of
+repeating the image, and `VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE` makes that 1.0 in every channel.
+For a depth map, 1.0 is the far plane: nothing is further, every comparison holds, and a
+fragment outside the map is lit. That is the box-fitting argument made into sampler state.
+
+There is no mip chain, so `maxLod` is 0, and the `mipmapMode` is never used.
+
+<figure>
+  <img src="/learn_vulkan/img/5.3/box-and-border.png" alt="Two renders of the room with the sun's box made too small. Left: the crates at the edges cast no shadow, and the rest of the scene is normal. Right: the same, but two huge dark wedges sweep across the floor from the left and the top right" />
+  <figcaption>The box shrunk to 55% of the fit, so some crates fall outside it. Left: clamped to the border, a crate outside the box casts nothing (25,724 pixels change). Right: clamped to the edge instead, the map's outermost texels are stretched across everything outside it (101,233 pixels).</figcaption>
+</figure>
+
+The alternative, `CLAMP_TO_EDGE`, repeats the outermost texel outwards. Where that texel
+holds a crate, the crate's depth is smeared across the whole region beyond it, and the floor
+there is compared against it. The figure shows both modes with a deliberately undersized box.
+
+The map is created next. It is a depth image that is also a texture, which is two questions
+about the format, and there is a third:
+
+```cpp title="code/src/5.advanced_lighting/shadow_mapping/main.cpp"
+
+    // A depth image that is also a texture, and the three samplers that read it.
+    void create_shadow_map() {
+        // D32_SFLOAT, asked for by name rather than through choose_depth_format(): the
+        // map has to be sampled as well as rendered into, which is a second question
+        // about the format, and filtered, which is a third. Not every GPU promises the
+        // third, so ask.
+        constexpr VkFormat kShadowFormat = VK_FORMAT_D32_SFLOAT;
+        VkFormatProperties properties{};
+        vkGetPhysicalDeviceFormatProperties(context().physical_device(), kShadowFormat,
+                                            &properties);
+        const VkFormatFeatureFlags features = properties.optimalTilingFeatures;
+        constexpr VkFormatFeatureFlags kRequired =
+            VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT |
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+        if ((features & kRequired) != kRequired) {
+            throw std::runtime_error(
+                "D32_SFLOAT cannot be both rendered into and sampled on this GPU");
+        }
+        const bool filterable =
+            (features & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0;
+        if (!filterable) {
+            spdlog::warn("D32_SFLOAT cannot be filtered here; bilinear reads fall back "
+                         "to one texel");
+        }
+
+        shadow_map_ = vkc::Image(
+            context(),
+            vkc::ImageDesc{
+                .format = kShadowFormat,
+                .extent = {kShadowMapSize, kShadowMapSize},
+                .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                         VK_IMAGE_USAGE_SAMPLED_BIT,
+                .mip_levels = 1,
+                .aspect = VK_IMAGE_ASPECT_DEPTH_BIT,
+            });
+        context().name(shadow_map_.handle(), VK_OBJECT_TYPE_IMAGE, "shadow map");
+
+        shadow_nearest_sampler_ = create_shadow_sampler(VK_FILTER_NEAREST);
+        shadow_linear_sampler_ =
+            create_shadow_sampler(filterable ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+
+        // A plain sampler as well, for key 4's picture of the map: this one returns the
+        // stored depth itself rather than the result of comparing against it.
+        depth_sampler_ = vkc::Sampler(
+            context(), vkc::SamplerDesc{
+                           .mag_filter = VK_FILTER_NEAREST,
+                           .min_filter = VK_FILTER_NEAREST,
+                           .mipmap_mode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+                           .address_mode = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                           .anisotropy = false,
+                       });
+    }
+
+```
+
+`vkGetPhysicalDeviceFormatProperties` fills a `VkFormatProperties` with what the GPU can do
+with a format, in three groups. `optimalTilingFeatures` is the group for images created with
+the tiling every image in this series has used, and like the other two it is a
+`VkFormatFeatureFlags`, one bit per capability. `VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT`
+means the format can be rendered into as depth, `VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT` means it
+can be read through a sampler, and `VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT` means
+the sampler may use `LINEAR` filtering. The first two are required, so the sample throws
+without them. The third is only needed by two of the three filter modes, so without it those
+modes fall back to one texel and say so. On the RTX 4080 this was written on, `D32_SFLOAT` has
+all three.
+
+Each comparison sampler is made twice, with `VK_FILTER_NEAREST`, which reads the one texel
+nearest the coordinate, and with `LINEAR`, which reads four. The `vkc::Sampler` at the end is
+a plain sampler for key 4's picture of the map, which wants the stored depth itself. It reads
+the nearest texel too, and with `VK_SAMPLER_MIPMAP_MODE_NEAREST`, since there is only one mip
+level to choose from.
+
+### Descriptors
+
+```cpp title="code/src/5.advanced_lighting/shadow_mapping/main.cpp"
+        // Set 1 is the shadow map, twice: through a comparison sampler at binding 0 for
+        // the lighting, and through a plain one at binding 1 for the inset.
+        const std::array<VkDescriptorSetLayoutBinding, 2> shadow_bindings{{
+            {
+                .binding = 0,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .descriptorCount = 1,
+                .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+                .pImmutableSamplers = nullptr,
+            },
+            {
+                .binding = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .descriptorCount = 1,
+                .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+                .pImmutableSamplers = nullptr,
+            },
+        }};
+        const VkDescriptorSetLayoutCreateInfo shadow_layout_info{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .bindingCount = static_cast<uint32_t>(shadow_bindings.size()),
+            .pBindings = shadow_bindings.data(),
+        };
+        VK_CHECK(vkCreateDescriptorSetLayout(device, &shadow_layout_info, nullptr,
+                                             &shadow_set_layout_));
+
+        // Two texture sets, and two shadow sets of two descriptors each: one with the
+        // nearest comparison sampler, one with the linear.
+        constexpr uint32_t kSets = 4;
+        constexpr uint32_t kDescriptors = 2 + 2 * 2;
+        const VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                             kDescriptors};
+        const VkDescriptorPoolCreateInfo pool_info{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .maxSets = kSets,
+            .poolSizeCount = 1,
+            .pPoolSizes = &pool_size,
+        };
+        VK_CHECK(vkCreateDescriptorPool(device, &pool_info, nullptr, &descriptor_pool_));
+
+        crate_set_ = allocate_set(texture_set_layout_);
+        write_image(crate_set_, 0, crate_map_.view(), sampler_.handle());
+        floor_set_ = allocate_set(texture_set_layout_);
+        write_image(floor_set_, 0, floor_map_.view(), sampler_.handle());
+
+        shadow_nearest_set_ = allocate_set(shadow_set_layout_);
+        write_image(shadow_nearest_set_, 0, shadow_map_.view(), shadow_nearest_sampler_);
+        write_image(shadow_nearest_set_, 1, shadow_map_.view(), depth_sampler_.handle());
+        shadow_linear_set_ = allocate_set(shadow_set_layout_);
+        write_image(shadow_linear_set_, 0, shadow_map_.view(), shadow_linear_sampler_);
+        write_image(shadow_linear_set_, 1, shadow_map_.view(), depth_sampler_.handle());
+    }
+```
+
+Set 1 is new: the shadow map at binding 0 through a comparison sampler, and again at binding 1
+through the plain one. There are two such sets, which differ only in the comparison sampler's
+filter, and the frame binds the one key 3 asks for. 5.2's `allocate_texture_set` is split
+into allocating and writing, because the shadow sets have two bindings each:
+
+```cpp title="code/src/5.advanced_lighting/shadow_mapping/main.cpp"
+    [[nodiscard]] VkDescriptorSet allocate_set(VkDescriptorSetLayout layout) {
+        const VkDescriptorSetAllocateInfo alloc{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .pNext = nullptr,
+            .descriptorPool = descriptor_pool_,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &layout,
+        };
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        VK_CHECK(vkAllocateDescriptorSets(context().device(), &alloc, &set));
+        return set;
+    }
+
+    // The layout is the one the image will be in whenever a shader reads it. For the
+    // shadow map that is true only after the barrier at the end of pass one, which is
+    // the only time the camera pass reads it.
+    void write_image(VkDescriptorSet set, uint32_t binding, VkImageView view,
+                     VkSampler sampler) {
+        const VkDescriptorImageInfo image_info{
+            .sampler = sampler,
+            .imageView = view,
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
+        const VkWriteDescriptorSet write{
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .pNext = nullptr,
+            .dstSet = set,
+            .dstBinding = binding,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .pImageInfo = &image_info,
+            .pBufferInfo = nullptr,
+            .pTexelBufferView = nullptr,
+        };
+        vkUpdateDescriptorSets(context().device(), 1, &write, 0, nullptr);
+    }
+```
+
+### The lookup
+
+```slang title="code/src/5.advanced_lighting/shadow_mapping/scene.slang"
+// Matches Globals in main.cpp, 268 bytes, scalar layout.
+struct Globals {
+    float4x4 view;
+    float4x4 projection;
+    float4x4 light_view_projection;
+    float4 view_position;
+    float4 ambient;
+    float4 sun_direction;
+    float4 sun_colour;
+    float shadow_texel;
+    uint flags;
+    uint filter;
+};
+
+static const uint kShadowsOn = 1u << 0;
+
+static const uint kFilterOneTexel = 0;
+static const uint kFilterBilinear = 1;
+static const uint kFilterPcf3x3 = 2;
+```
+
+```slang title="code/src/5.advanced_lighting/shadow_mapping/scene.slang"
+[[vk::binding(0, 0)]] Sampler2D base_colour_map;
+
+// The shadow map through a comparison sampler: reading it returns not a depth but the
+// fraction of the texels read whose depth passed the sampler's comparison.
+[[vk::binding(0, 1)]] Sampler2DShadow shadow_map;
+// The same image through a plain sampler, which returns the stored depth. Key 4 only.
+[[vk::binding(1, 1)]] Sampler2D shadow_depth;
+```
+
+`Sampler2DShadow` is Slang's type for a texture read through a comparison sampler, combined in
+one descriptor as `Sampler2D` was. Its read returns a single `float`, the comparison result,
+rather than a colour.
+
+```slang title="code/src/5.advanced_lighting/shadow_mapping/scene.slang"
+// How much of the sun reaches this point: 1 in full sun, 0 in full shadow, and fractions
+// along the edges when the filter reads more than one texel.
+float sunlight(float3 world_position) {
+    Globals globals = *push.globals;
+    if ((globals.flags & kShadowsOn) == 0) {
+        return 1.0;
+    }
+
+    // The point as the shadow pass saw it: clip space, then -- after the divide, which is
+    // by 1 for an orthographic projection but costs nothing to keep -- normalised device
+    // coordinates. x and y are -1..1 across the map; z is already 0..1, the value the
+    // depth attachment stored.
+    float4 clip = mul(globals.light_view_projection, float4(world_position, 1.0));
+    float3 ndc = clip.xyz / clip.w;
+    float2 uv = ndc.xy * 0.5 + 0.5;
+    float depth = ndc.z;
+
+    // Beyond the far plane the comparison would always fail. Nothing in this scene is
+    // there, and the article explains why that is a property of the box, not luck.
+    if (depth > 1.0) {
+        return 1.0;
+    }
+
+    if (globals.filter != kFilterPcf3x3) {
+        // One read. Through the nearest sampler that is one texel, 0 or 1; through the
+        // linear sampler it is four, compared one by one and then blended.
+        return shadow_map.SampleCmpLevelZero(uv, depth);
+    }
+
+    // Nine bilinear reads, one texel apart: a 4x4 block of texels, each compared.
+    float sum = 0.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            float2 offset = float2(x, y) * globals.shadow_texel;
+            sum += shadow_map.SampleCmpLevelZero(uv + offset, depth);
+        }
+    }
+    return sum / 9.0;
+}
+```
+
+The point goes through the same matrix the shadow pass used, which lands it in clip space, and
+the divide takes it to normalised device coordinates: x and y from −1 to 1 across the map, and
+z the depth the pass would have stored for a surface at this point. Turning x and y into a
+texture coordinate is `* 0.5 + 0.5`, the map from −1..1 to 0..1. There is no flip of the
+second coordinate. Vulkan puts NDC y = −1 at the first row of the framebuffer, and a texture
+coordinate of 0 reads the first row of the image, so the two already agree. Depth needs no
+conversion at all, because Vulkan's NDC z is already 0..1. Both of those are places where
+OpenGL code does more arithmetic.
+
+`SampleCmpLevelZero` reads level 0 with no level-of-detail calculation, so it needs no
+screen-space derivatives. That matters, because `sunlight` is called only for fragments that
+face the sun, which is a decision made per fragment, and derivatives are only defined where all
+four fragments of a 2×2 quad run the same code.
+
+Removing the `depth > 1.0` guard changes 0 pixels of the frame. Nothing the camera sees lies
+beyond the sun's far plane, which is what the depth range above was chosen for.
+
+```slang title="code/src/5.advanced_lighting/shadow_mapping/scene.slang"
+float3 shade(VSOutput input, float3 albedo) {
+    Globals globals = *push.globals;
+
+    float3 normal = normalize(input.normal);
+    float3 to_eye = normalize(globals.view_position.xyz - input.world_position);
+    float3 to_sun = globals.sun_direction.xyz;
+
+    float3 ambient = globals.ambient.rgb * albedo;
+
+    float facing = dot(normal, to_sun);
+    if (facing <= 0.0) {
+        return ambient;
+    }
+
+    float3 halfway = normalize(to_sun + to_eye);
+    float specular_amount = pow(max(dot(normal, halfway), 0.0), kShininess);
+
+    float3 diffuse = facing * albedo;
+    float3 specular = specular_amount * kSpecularStrength;
+
+    // The shadow takes away the sun and nothing else. The ambient term is the light from
+    // the rest of the sky, and a crate does not block that.
+    return ambient + globals.sun_colour.rgb * (diffuse + specular) *
+                         sunlight(input.world_position);
+}
+```
+
+The shadow multiplies the sun's contribution and leaves the ambient alone. Ambient light stands
+for the light from the rest of the sky, and a crate only blocks the sun.
+
+## Shadow acne
+
+With the bias at 0, key 2's first step, this is what the comparison produces:
+
+<figure>
+  <img src="/learn_vulkan/img/5.3/acne.png" alt="Two crops of the same scene. Left: the floor and every sun-facing crate face are covered in fine dark rings and stripes, a moire pattern. Right: the same view with clean, solid surfaces and only the real shadows" />
+  <figcaption>Left: slope bias 0, one texel per read. Lit surfaces shadow themselves in bands. Right: the default, slope bias 4 and nine bilinear reads.</figcaption>
+</figure>
+
+Every lit surface is shadowing itself. The pattern is called **shadow acne**, and it follows
+from the comparison being made between two different points.
+
+The map stores depth at texel centres: the rasteriser samples each triangle there. A fragment
+lands somewhere inside a texel, not at its centre. On a surface that faces the sun squarely,
+depth is the same everywhere across the texel and the two values agree. On a surface tilted
+away from the sun they do not. Measured along the light, the surface is nearer at one side of
+the texel than the other, and every fragment on the far side of the centre has a depth greater
+than the stored one. It fails the comparison, and is in shadow of itself. Which fragments do
+depends on where the texel grid happens to fall, so the result is bands and rings.
+
+The fix is to push the stored depth back, so that a surface clears its own entry. 4.1
+introduced the rasteriser's offset, `depthBiasConstantFactor · r + depthBiasSlopeFactor · m`,
+where *m* is how fast depth changes across the triangle in the image being drawn, per pixel.
+Here the image being drawn is the shadow map, so a pixel is a texel, and *m* is the depth a
+surface changes across one texel. That is exactly the size of the error.
+
+Write the depth across a planar surface near a texel centre as
+z(x, y) = z₀ + zₓ·Δx + z_y·Δy, with Δx and Δy in texels. Reading **one texel**, the nearest one,
+the fragment is at most half a texel from the centre on each axis, so
+
+```
+   |z − z₀|  ≤  ½ |zₓ| + ½ |z_y|  ≤  max(|zₓ|, |z_y|)  ≤  m
+```
+
+A **slope-scaled depth bias** of factor 1 adds *m*, which covers the worst case. That is the
+unit `kSlopeBiasSteps` is in: 1 is one texel's worth of the surface's own slope. Reading
+bilinearly, the four texels around a point are up to one texel away on each axis, which bounds
+the error at |zₓ| + |z_y|, up to 2*m*. The nine reads 3×3 mode makes are one texel apart, so its
+furthest texels are two away on each axis, and the bound is 4*m*.
+
+Measured, as the number of pixels darker than the shadows-off frame by more than two levels:
+
+| slope bias | 0 | 1 | 2 | 4 | 8 |
+|---|---|---|---|---|---|
+| one texel | 128,391 | 28,168 | 28,109 | 28,028 | 27,893 |
+| bilinear | 215,449 | 29,218 | 28,652 | 28,465 | 28,314 |
+| 3×3 bilinear | 229,389 | 187,984 | 30,957 | 29,930 | 29,215 |
+
+The real shadows are about 28,000 pixels. Each row drops to that level at the step the
+derivation predicts, or one step earlier. One texel is clean at 1. Bilinear is almost clean at
+1, because its far texels carry little weight. The 3×3 reads keep 187,984 pixels of acne at 1
+and 1,027 at 2, on the post's sunlit face and along the crates' edges, and are clean at 4.
+That is the default.
+
+The constant factor is 0 throughout. For a `D32_SFLOAT` map, 4.1 showed that *r* is
+2^(*e* − 23), where *e* is the exponent of the triangle's largest depth. This floor's depths
+lie between 0.30 and 0.67, which spans two exponents, so *r* is 3.0 × 10⁻⁸ in one part of it
+and 6.0 × 10⁻⁸ in the other. The floor's depth changes by 6.2 mm × tan 60° / 29 = 3.7 × 10⁻⁴
+per texel, tan 60° because the floor is tilted 60° from facing the sun. A constant bias would
+need a factor of about 12,000 in one part of the floor and 6,000 in the other, and the factor
+that is right for the floor is wrong for every surface at a different angle. The slope term
+measures each surface's own slope.
+
+### Peter-panning
+
+Pushing depths back has a cost. A biased occluder is recorded as further from the sun than it
+is, and a receiver just behind it may now pass the comparison. The shadow starts late, as if
+the object were hovering. This is called **peter-panning**.
+
+How late? The bias moves a surface back by *b* · *m*, and *m* is the depth change across a
+texel, so in world units the surface moves *b* × 6.2 mm × tan θ along the light, where θ is
+how far the surface is tilted from facing the sun. At *b* = 4 and θ = 30° that is 14 mm. A
+receiver is wrongly lit only if it lies less than that distance behind the occluder, along the
+light. Every occluder here is a closed box, and the light reaching the floor behind one has
+passed through the whole box, a crate's width or the post's 0.30 m, first. Nothing in this
+room is thin enough for the shadows to detach. A sheet of paper on the floor would be.
+
+The measurement agrees. Going from slope bias 4 to 8 with the 3×3 reads changes 715 pixels,
+and every one is on a vertical crate edge where a sun-facing side meets a face turned away.
+None is where a shadow meets its crate.
+
+## Soft edges
+
+<figure>
+  <img src="/learn_vulkan/img/5.3/filters.png" alt="Three enlarged crops of the same shadow edge on the floor. Left: a hard edge in visible steps. Middle: the same edge with the steps smoothed. Right: the edge blurred into a soft gradient a few pixels wide" />
+  <figcaption>One shadow edge, three times enlarged. Left: one texel per read. Middle: bilinear. Right: nine bilinear reads.</figcaption>
+</figure>
+
+Reading one texel, each fragment's result is 0 or 1, and the edge of a shadow is the edge of a
+texel: a staircase, each step 6.2 mm of floor, stretched by the angle the camera sees it at.
+
+The linear comparison sampler does something that is easy to get backwards. It does not
+filter four depths and then compare the average. Averaging depths would give a depth that
+belongs to no surface. It compares each of the four texels and filters the four results, 0s
+and 1s, so it returns the fraction of the four that passed. The result can be 0.25, 0.5 or
+0.75, and the staircase gets intermediate steps. The bilinear frame confirms it: if the
+sampler filtered first and compared after, every result would still be 0 or 1. Rendered as a
+grey image, it has 2,023 pixels that are neither, and the one-texel frame has none.
+
+Doing the same thing over a wider area is **percentage-closer filtering**. Nine bilinear reads
+one texel apart cover a 4×4 block, sixteen texels, and their average is the fraction of that
+block the fragment is in front of. The edge widens to a few pixels: 7,242 pixels of the frame
+fall strictly between 0 and 1. It is not a physical penumbra, since its width is set by the
+texel size and not by how far the receiver is from the occluder. It hides the texels.
+
+## Key 4: the map itself
+
+<figure>
+  <img src="/learn_vulkan/img/5.3/shadow-map.png" alt="A square greyscale image, darker at the bottom and lighter at the top, with the outlines of several boxes and a tall thin post standing out slightly darker than the floor around them" />
+  <figcaption>The shadow map as key 4 shows it: depth as grey, from the sun. The crates are nearer the sun than the floor behind them, so they are darker.</figcaption>
+</figure>
+
+```slang title="code/src/5.advanced_lighting/shadow_mapping/scene.slang"
+// ---------------------------------------------------------------------------
+// Key 4: the shadow map itself
+// ---------------------------------------------------------------------------
+
+struct InsetOutput {
+    float4 position : SV_Position;
+    [[vk::location(0)]] float2 uv;
+};
+
+// 4.3's single triangle that covers the viewport, here a small viewport in the corner.
+[shader("vertex")]
+InsetOutput insetVertexMain(uint vertex_id : SV_VulkanVertexID) {
+    float2 uv = float2((vertex_id << 1) & 2, vertex_id & 2);
+    InsetOutput output;
+    output.position = float4(uv * 2.0 - 1.0, 0.0, 1.0);
+    output.uv = uv;
+    return output;
+}
+
+// 5.2's decoding curve. Here it is used backwards from the way 5.2 used it: to make
+// the swapchain's encode store the depth's own value as the pixel's byte.
+float3 srgb_to_linear(float3 encoded) {
+    float3 low = encoded / 12.92;
+    float3 high = pow((encoded + 0.055) / 1.055, 2.4);
+    return select(encoded <= 0.04045, low, high);
+}
+
+// The stored depth, as grey: black at the sun's near plane, white at its far plane. The
+// floor runs from about 0.3 to 0.67 across the map, because it tilts away from the sun.
+// A depth is not an amount of light, so it is decoded first, as 5.2's UNORM emulation
+// did; written straight out it would be encoded, and every grey would come out pale.
+[shader("fragment")]
+float4 insetFragmentMain(InsetOutput input) : SV_Target {
+    float depth = shadow_depth.Sample(input.uv).r;
+    return float4(srgb_to_linear(depth.xxx), 1.0);
+}
+```
+
+The inset is drawn with 4.3's covering triangle into a small viewport. Its fragment shader
+reads the depth through the plain sampler and writes it as grey. The floor's depth runs from
+0.298 at the bottom of the map to 0.671 at the top. Those are the bytes measured off the
+screenshot, divided by 255, and they match the range worked out above.
+
+That match depends on the call to `srgb_to_linear`. A depth is a number, not an amount of
+light. Written straight to the `_SRGB` swapchain it would be encoded, and 0.3 would be stored
+as 149 rather than about 76: the whole map would come out pale. Decoding it first means the
+swapchain's encode undoes the decode, and the byte stored is the depth itself. That is 5.2's
+`_UNORM` emulation, used for its own sake.
+
+## The application
+
+```cpp title="code/src/5.advanced_lighting/shadow_mapping/main.cpp"
+// 5.3 Shadow mapping
+//
+// 5.2's room by daylight, lit by a low sun, and the crates casting shadows for the first
+// time in the series. Each frame now renders the scene twice: once from the sun, keeping
+// nothing but depth, and once from the camera, where every fragment asks that depth
+// image whether anything stood between it and the sun.
+//
+//   1  shadows on or off
+//   2  the shadow pass's slope-scaled depth bias: 0, 1, 2, 4 or 8
+//   3  how the shadow map is read: one texel, bilinear, or 3x3 bilinear taps
+//   4  show the shadow map itself in the corner of the window
+```
+
+Two headers join the list: `<algorithm>` for the `std::max` in the box fit, and `<string>`
+for the pipelines' debug names.
+
+```cpp title="code/src/5.advanced_lighting/shadow_mapping/main.cpp"
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstddef>
+#include <cstdlib>
+#include <cstring>
+#include <exception>
+#include <format>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <vector>
+```
+
+```cpp title="code/src/5.advanced_lighting/shadow_mapping/main.cpp"
+struct Placement {
+    glm::vec3 position;
+    float angle;
+    glm::vec2 size;  // width in x and z, height in y
+};
+
+// 5.2's four crates, a small one stacked on the first, and a tall thin post, which
+// casts the longest shadow in the room.
+constexpr std::array<Placement, 6> kCrates{{
+    {{-2.20F, kFloorY, 0.75F}, 0.36F, {1.0F, 1.0F}},
+    {{2.05F, kFloorY, -1.05F}, -0.72F, {1.0F, 1.0F}},
+    {{-1.35F, kFloorY, -3.40F}, 0.18F, {1.0F, 1.0F}},
+    {{3.10F, kFloorY, 1.60F}, 0.95F, {1.0F, 1.0F}},
+    {{-2.15F, kFloorY + 1.0F, 0.70F}, 1.10F, {0.55F, 0.55F}},
+    {{0.35F, kFloorY, -1.90F}, 0.30F, {0.30F, 2.60F}},
+}};
+
+constexpr glm::vec4 kWhite{1.0F};
+```
+
+`Placement::size.x` now scales z as well as x, so the stacked crate is a smaller cube and not a
+flattened one. Every crate in 5.2 had a size of 1, so nothing else changes:
+
+```cpp title="code/src/5.advanced_lighting/shadow_mapping/main.cpp"
+[[nodiscard]] glm::mat4 model_of(const Placement& placement) {
+    return glm::scale(
+        glm::rotate(glm::translate(glm::mat4(1.0F), placement.position), placement.angle,
+                    glm::vec3(0.0F, 1.0F, 0.0F)),
+        glm::vec3(placement.size.x, placement.size.y, placement.size.x));
+}
+```
+
+`Globals` swaps the lamps for the sun and adds what the lookup needs:
+
+```cpp title="code/src/5.advanced_lighting/shadow_mapping/main.cpp"
+// ---------------------------------------------------------------------------
+// What the shaders read through a pointer
+// ---------------------------------------------------------------------------
+
+// The bits of Globals::flags.
+constexpr uint32_t kShadowsOn = 1U << 0;
+
+// 5.2's Globals with the lamps replaced by the sun, and what the fragment shader needs to
+// find itself in the shadow map: the matrix the shadow pass drew with, the size of one
+// texel, and which way to read it.
+struct Globals {
+    glm::mat4 view;                    // 0
+    glm::mat4 projection;              // 64
+    glm::mat4 light_view_projection;   // 128
+    glm::vec4 view_position;           // 192
+    glm::vec4 ambient;                 // 208
+    glm::vec4 sun_direction;           // 224, towards the sun
+    glm::vec4 sun_colour;              // 240
+    float shadow_texel;                // 256, one texel in uv units
+    uint32_t flags;                    // 260
+    uint32_t filter;                   // 264
+};
+static_assert(offsetof(Globals, light_view_projection) == 128);
+static_assert(offsetof(Globals, shadow_texel) == 256);
+static_assert(sizeof(Globals) == 268);
+```
+
+```cpp title="code/src/5.advanced_lighting/shadow_mapping/main.cpp"
+// Where each object's DrawData sits in the array the frame writes. The order is fixed by
+// write_draws() below and nothing else may reorder it.
+constexpr uint32_t kFloorDraw = 0;
+constexpr uint32_t kFirstCrateDraw = kFloorDraw + 1;
+constexpr uint32_t kDrawCount = kFirstCrateDraw + static_cast<uint32_t>(kCrates.size());
+```
+
+```cpp title="code/src/5.advanced_lighting/shadow_mapping/main.cpp"
+class ShadowMappingApp : public vkc::App {
+public:
+    using vkc::App::App;
+
+protected:
+    void on_start() override {
+        cube_ = upload_mesh(context(), kCubeVertices, kCubeIndices);
+        floor_ = upload_mesh(context(), kFloorVertices, kFloorIndices);
+
+        depth_format_ = vkc::choose_depth_format(context().physical_device());
+
+        load_textures();
+        create_shadow_map();
+        create_arenas();
+        create_descriptors();
+        create_depth_buffer(swapchain().extent());
+        create_pipelines();
+
+        draws_.reserve(kDrawCount);
+
+        camera_.position = {0.0F, 0.35F, 6.40F};
+        camera_.pitch = -9.0F;
+
+        spdlog::info("1 shadows, 2 slope bias, 3 filter, 4 show the shadow map.");
+        log_mode();
+    }
+
+    void on_resize(VkExtent2D extent) override { create_depth_buffer(extent); }
+
+    void on_event(const SDL_Event& event) override {
+        camera_.handle_event(event, window().handle());
+
+        if (event.type != SDL_EVENT_KEY_DOWN || event.key.repeat) {
+            return;
+        }
+        switch (event.key.scancode) {
+            case SDL_SCANCODE_1:
+                shadows_ = !shadows_;
+                log_mode();
+                break;
+            case SDL_SCANCODE_2:
+                slope_bias_ = (slope_bias_ + 1) % kSlopeBiasSteps.size();
+                log_mode();
+                break;
+            case SDL_SCANCODE_3:
+                filter_ = static_cast<ShadowFilter>(
+                    (static_cast<uint32_t>(filter_) + 1) % kFilterNames.size());
+                log_mode();
+                break;
+            case SDL_SCANCODE_4:
+                show_map_ = !show_map_;
+                log_mode();
+                break;
+            default:
+                break;
+        }
+    }
+
+    void on_shutdown() override {
+        const VkDevice device = context().device();
+
+        vkDestroyPipeline(device, inset_pipeline_, nullptr);
+        for (VkPipeline pipeline : shadow_pipelines_) {
+            vkDestroyPipeline(device, pipeline, nullptr);
+        }
+        vkDestroyPipeline(device, opaque_pipeline_, nullptr);
+        vkDestroyPipelineLayout(device, pipeline_layout_, nullptr);
+        vkDestroyDescriptorPool(device, descriptor_pool_, nullptr);
+        vkDestroyDescriptorSetLayout(device, shadow_set_layout_, nullptr);
+        vkDestroyDescriptorSetLayout(device, texture_set_layout_, nullptr);
+
+        vkDestroySampler(device, shadow_linear_sampler_, nullptr);
+        vkDestroySampler(device, shadow_nearest_sampler_, nullptr);
+        depth_sampler_.destroy();
+        shadow_map_.destroy();
+
+        sampler_.destroy();
+        floor_map_.destroy();
+        crate_map_.destroy();
+
+        for (FrameArena& arena : arenas_) {
+            arena.destroy();
+        }
+        depth_.destroy();
+        floor_.destroy();
+        cube_.destroy();
+    }
+
+    void on_render(const vkc::FrameInfo& frame) override {
+        camera_.update(delta_time());
+
+        // Everything the shaders will read this frame is written here, into this frame
+        // slot's arena, in the order the frame happens to want it. The arena is emptied
+        // first: the GPU finished with the last frame that used this slot before the
+        // command buffer was handed over, so there is nothing left in it to protect.
+        FrameArena& arena = arenas_[frame.frame_number % vkc::kFramesInFlight];
+        arena.reset();
+
+        write_globals(arena, frame.extent);
+        write_draws(arena);
+
+        render_shadow_map(frame.cmd);
+        render_scene(frame);
+    }
+```
+
+The frame is the two passes in order. The camera pass binds the shadow set once, and then
+draws exactly what the shadow pass drew:
+
+```cpp title="code/src/5.advanced_lighting/shadow_mapping/main.cpp"
+
+    // ---------------------------------------------------------------------------
+    // Pass two: the scene from the camera
+    // ---------------------------------------------------------------------------
+
+    void render_scene(const vkc::FrameInfo& frame) {
+        vkc::begin_rendering(frame.cmd, frame.view, depth_.view(), frame.extent,
+                             {{0.30F, 0.42F, 0.62F, 1.0F}});
+        set_viewport(frame.cmd, frame.extent);
+
+        const VkDescriptorSet shadow_set =
+            filter_ == ShadowFilter::OneTexel ? shadow_nearest_set_ : shadow_linear_set_;
+        vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                pipeline_layout_, 1, 1, &shadow_set, 0, nullptr);
+
+        vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, opaque_pipeline_);
+        draw_geometry(frame.cmd);
+
+        if (show_map_) {
+            draw_inset(frame.cmd, frame.extent);
+        }
+
+        vkCmdEndRendering(frame.cmd);
+    }
+
+    // The floor and every crate, with whatever pipeline is bound. Both passes draw
+    // exactly this; only the matrix and the fragment work differ.
+    void draw_geometry(VkCommandBuffer cmd) {
+        bind_indices(cmd, floor_);
+        bind_texture(cmd, floor_set_);
+        push(cmd, floor_.vertex_address, kFloorDraw);
+        vkCmdDrawIndexed(cmd, floor_.index_count, 1, 0, 0, 0);
+
+        bind_indices(cmd, cube_);
+        bind_texture(cmd, crate_set_);
+        for (uint32_t i = 0; i < kCrates.size(); ++i) {
+            push(cmd, cube_.vertex_address, kFirstCrateDraw + i);
+            vkCmdDrawIndexed(cmd, cube_.index_count, 1, 0, 0, 0);
+        }
+    }
+
+    // The shadow map drawn into a square in the bottom-left corner: one triangle that
+    // covers the viewport, with the viewport made small.
+    void draw_inset(VkCommandBuffer cmd, VkExtent2D extent) {
+        const float side = static_cast<float>(extent.height) * 0.4F;
+        const VkViewport viewport{
+            .x = 0.0F,
+            .y = static_cast<float>(extent.height) - side,
+            .width = side,
+            .height = side,
+            .minDepth = 0.0F,
+            .maxDepth = 1.0F,
+        };
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, inset_pipeline_);
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Filling the arena
+    // ---------------------------------------------------------------------------
+
+    void write_globals(FrameArena& arena, VkExtent2D extent) {
+        const Globals globals{
+            .view = camera_.view(),
+            .projection = projection(extent),
+            .light_view_projection = sun_view_projection(),
+            .view_position = glm::vec4(camera_.position, 1.0F),
+            .ambient = glm::vec4(kAmbient, 1.0F),
+            .sun_direction = glm::vec4(kSunDirection, 0.0F),
+            .sun_colour = glm::vec4(kSunColour, 1.0F),
+            .shadow_texel = 1.0F / static_cast<float>(kShadowMapSize),
+            .flags = shadows_ ? kShadowsOn : 0U,
+            .filter = static_cast<uint32_t>(filter_),
+        };
+        globals_address_ = arena.write(&globals, sizeof(globals));
+    }
+
+    void write_draws(FrameArena& arena) {
+        draws_.clear();
+
+        draws_.push_back(draw_data_of(glm::mat4(1.0F), kWhite));
+
+        for (const Placement& crate : kCrates) {
+            draws_.push_back(draw_data_of(crate_model(crate), kWhite));
+        }
+
+        draws_address_ = arena.write(draws_.data(), draws_.size() * sizeof(DrawData));
+    }
+
+    void log_mode() const {
+        spdlog::info("shadows {}, slope bias {}, {}{}", shadows_ ? "on" : "off",
+                     kSlopeBiasSteps[slope_bias_],
+                     kFilterNames[static_cast<uint32_t>(filter_)],
+                     show_map_ ? ", map shown" : "");
+    }
+```
+
+`draw_geometry` binds a texture set in both passes. The shadow pipeline's shader reads no
+texture, so in that pass the binding does nothing. A pipeline layout shared between the
+passes is what makes that harmless. `shadow_texel` is one texel in texture coordinates,
+1/1024, which is the step between the nine reads.
+
+```cpp title="code/src/5.advanced_lighting/shadow_mapping/main.cpp"
+
+    void load_textures() {
+        crate_map_ = vkc::load_texture(
+            context(), vkc::asset_path("textures/lvk_crate_diffuse.png"),
+            VK_FORMAT_R8G8B8A8_SRGB);
+        floor_map_ = vkc::load_texture(context(),
+                                       vkc::asset_path("textures/lvk_ground.png"),
+                                       VK_FORMAT_R8G8B8A8_SRGB);
+
+        sampler_ = vkc::Sampler(context(), vkc::SamplerDesc{});
+```
+
+```cpp title="code/src/5.advanced_lighting/shadow_mapping/main.cpp"
+    void create_descriptors() {
+        const VkDevice device = context().device();
+
+        const VkDescriptorSetLayoutBinding texture_binding{
+            .binding = 0,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+            .pImmutableSamplers = nullptr,
+        };
+        const VkDescriptorSetLayoutCreateInfo texture_layout_info{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .bindingCount = 1,
+            .pBindings = &texture_binding,
+        };
+        VK_CHECK(vkCreateDescriptorSetLayout(device, &texture_layout_info, nullptr,
+                                             &texture_set_layout_));
+
+```
+
+```cpp title="code/src/5.advanced_lighting/shadow_mapping/main.cpp"
+    void create_pipelines() {
+        const VkDevice device = context().device();
+
+        // No vertex_input() call on any builder below, so every pipeline is created with
+        // zero bindings and zero attributes. That state used to configure the hardware
+        // that fetched vertices; there is nothing left for it to configure.
+        const VkPushConstantRange push_range{
+            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+            .offset = 0,
+            .size = sizeof(PushConstants),
+        };
+        const std::array<VkDescriptorSetLayout, 2> set_layouts{texture_set_layout_,
+                                                               shadow_set_layout_};
+        const VkPipelineLayoutCreateInfo layout_info{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .setLayoutCount = static_cast<uint32_t>(set_layouts.size()),
+            .pSetLayouts = set_layouts.data(),
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &push_range,
+        };
+        VK_CHECK(
+            vkCreatePipelineLayout(device, &layout_info, nullptr, &pipeline_layout_));
+
+        const VkShaderModule scene_shader =
+            vkc::load_shader(device, LVK_CHAPTER_ID, "scene.slang");
+
+        opaque_pipeline_ =
+            vkc::PipelineBuilder(device)
+                .shaders(scene_shader, "vertexMain", "fragmentMain")
+                .colour_attachment(swapchain().format())
+                .cull(VK_CULL_MODE_BACK_BIT, VK_FRONT_FACE_COUNTER_CLOCKWISE)
+                .depth(depth_format_, /*test=*/true, /*write=*/true)
+                .layout(pipeline_layout_)
+                .build();
+
+```
+
+```cpp title="code/src/5.advanced_lighting/shadow_mapping/main.cpp"
+
+        // Drawn last, over the scene, so it neither tests nor writes depth -- but the
+        // rendering instance has a depth attachment, so the pipeline still has to say
+        // which format it is.
+        inset_pipeline_ =
+            vkc::PipelineBuilder(device)
+                .shaders(scene_shader, "insetVertexMain", "insetFragmentMain")
+                .colour_attachment(swapchain().format())
+                .depth(depth_format_, /*test=*/false, /*write=*/false)
+                .layout(pipeline_layout_)
+                .build();
+
+        vkDestroyShaderModule(device, scene_shader, nullptr);
+
+        context().name(opaque_pipeline_, VK_OBJECT_TYPE_PIPELINE, "scene opaque");
+        context().name(inset_pipeline_, VK_OBJECT_TYPE_PIPELINE, "shadow map inset");
+    }
+
+    vkc::Camera camera_;
+
+    Mesh cube_;
+    Mesh floor_;
+
+    VkFormat depth_format_ = VK_FORMAT_UNDEFINED;
+    vkc::Image depth_;
+
+    // One arena per frame in flight, and the addresses this frame wrote into it.
+    std::array<FrameArena, vkc::kFramesInFlight> arenas_;
+    VkDeviceAddress globals_address_ = 0;
+    VkDeviceAddress draws_address_ = 0;
+    std::vector<DrawData> draws_;
+
+    vkc::Image crate_map_;
+    vkc::Image floor_map_;
+    vkc::Sampler sampler_;
+
+    vkc::Image shadow_map_;
+    VkSampler shadow_nearest_sampler_ = VK_NULL_HANDLE;
+    VkSampler shadow_linear_sampler_ = VK_NULL_HANDLE;
+    vkc::Sampler depth_sampler_;
+
+    VkDescriptorSet crate_set_ = VK_NULL_HANDLE;
+    VkDescriptorSet floor_set_ = VK_NULL_HANDLE;
+    VkDescriptorSet shadow_nearest_set_ = VK_NULL_HANDLE;
+    VkDescriptorSet shadow_linear_set_ = VK_NULL_HANDLE;
+
+    VkDescriptorSetLayout texture_set_layout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout shadow_set_layout_ = VK_NULL_HANDLE;
+    VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
+
+    VkPipelineLayout pipeline_layout_ = VK_NULL_HANDLE;
+    VkPipeline opaque_pipeline_ = VK_NULL_HANDLE;
+    std::array<VkPipeline, kSlopeBiasSteps.size()> shadow_pipelines_{};
+    VkPipeline inset_pipeline_ = VK_NULL_HANDLE;
+
+    bool shadows_ = true;
+    size_t slope_bias_ = kDefaultSlopeBias;
+    ShadowFilter filter_ = ShadowFilter::Pcf3x3;
+    bool show_map_ = false;
+};
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    try {
+        vkc::App::Options options{};
+        options.title = "LearnVulkan 5.3 - Shadow mapping";
+        ShadowMappingApp app(vkc::App::parse_args(argc, argv, options));
+        return app.run();
+    } catch (const std::exception& error) {
+        spdlog::error("{}", error.what());
+        return EXIT_FAILURE;
+    }
+}
+```
+
+```slang title="code/src/5.advanced_lighting/shadow_mapping/scene.slang"
+// 5.3 The scene shader, lit by the sun, with the sun's view of the scene to say where it
+// cannot reach.
+//
+// Three vertex shaders share this file now. vertexMain is 5.2's. shadowVertexMain is the
+// whole of the shadow pass: it places each vertex where the sun sees it and stops, with
+// no fragment shader behind it. insetVertexMain draws key 4's picture of the shadow map.
+```
+
+```slang title="code/src/5.advanced_lighting/shadow_mapping/scene.slang"
+[shader("fragment")]
+float4 fragmentMain(VSOutput input) : SV_Target {
+    float3 tint = push.draws[push.draw_index].colour.rgb;
+    float3 albedo = base_colour_map.Sample(input.uv).rgb * tint;
+    return float4(shade(input, albedo), 1.0);
+}
+```
+
+```cmake title="code/src/5.advanced_lighting/shadow_mapping/CMakeLists.txt"
+add_chapter(5.3.shadow_mapping
+    SOURCES main.cpp
+    SHADERS scene.slang
+)
+```
+
+:::note[What moved into vkcommon]
+Nothing moved. One `vkcommon` class changed: `PipelineBuilder` can now build a pipeline with
+no colour attachment and no fragment stage, and every changed line is shown in "The shadow
+pass" above. The comparison sampler stays in the sample. 5.4 will want one too, and it can be
+promoted then.
+:::
+
+## What changed since 5.2
+
+- a second pass, from the sun, into a depth image with no colour attachment
+- `PipelineBuilder` taught to build a depth-only pipeline
+- an orthographic projection, derived, fitted around the crates every frame
+- two barriers for a depth image, and what synchronization validation says when the second
+  one is copied from 4.3
+- a comparison sampler with a border, read through `Sampler2DShadow`
+- shadow acne measured, and the slope bias it needs derived for three ways of reading the map
+- the three lamps and 5.2's switches removed: one sun, and its shadows
+- 37 chapters in the build now
+
+## Words introduced in this chapter
+
+| | |
+|---|---|
+| **shadow mapping** | deciding whether a point can see a light by comparing its depth from the light with a depth image rendered from the light |
+| **shadow map** | that depth image: for each direction from the light, the distance to the nearest surface |
+| **occluder** | a surface between a light and something else, which it shadows |
+| **receiver** | a surface a shadow falls on |
+| **light space** | coordinates measured from the light's camera, after its view and projection matrices |
+| **orthographic projection** | a projection that maps a box to clip space without dividing by distance, so parallel lines stay parallel |
+| **depth-only pass** | a rendering pass with a depth attachment, no colour attachment and no fragment shader |
+| **comparison sampler** | a sampler that compares each texel it reads with a value the shader supplies, and returns the filtered results |
+| **shadow acne** | lit surfaces shadowing themselves, because each fragment is compared with the depth at a texel centre that is not where it is |
+| **slope-scaled depth bias** | a depth offset proportional to how fast a surface's depth changes per texel; factor 1 covers a one-texel read |
+| **peter-panning** | a shadow starting late, away from its occluder, because the bias pushed the occluder back |
+| **percentage-closer filtering** | averaging the comparison results over several texels, rather than averaging depths, to soften shadow edges |
+| **border colour** | the fixed value a sampler returns outside the image when the address mode is clamp-to-border |
+| **box fitting** | sizing the light's orthographic box to the smallest that holds every occluder |
+
+## Exercises
+
+1. Set `kShadowMapSize` to 256 and to 4096. With the one-texel read, how does the staircase
+   change? At which size does the 3×3 read stop making a visible difference?
+2. Delete `kShadowMargin` and look closely at the outermost crate's shadow with the 3×3 read.
+   What do the reads at a crate's outer edge find, and why does the border make it harmless?
+3. Change the shadow pass to cull front faces instead of back faces, keep the y flip, and set
+   the slope bias to 0. Is there acne? Where would this trick fail in a scene with a sheet of
+   paper on the floor?
+4. Raise the sun to 60° above the horizon. Predict from the derivation whether the floor needs
+   more or less bias, then measure with key 2.
+5. Put a thin plank (a crate with a height of 0.02) flat on the floor in the sun, and step key
+   2 through 8. At what bias does its shadow detach, and does that agree with the 14 mm
+   worked out above?
+6. Make the comparison `VK_COMPARE_OP_LESS` instead of `LESS_OR_EQUAL`. Does anything change?
+   Think about which surfaces would be exactly equal to their stored depth, given the bias.
+
+Next: 5.4 gives the lamps back their shadows. A lamp shines in every direction, and one square
+map cannot hold that.

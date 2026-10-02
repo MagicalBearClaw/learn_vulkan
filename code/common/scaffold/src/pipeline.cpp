@@ -300,10 +300,15 @@ VkPipeline PipelineBuilder::build() const {
     if (layout_ == VK_NULL_HANDLE) {
         throw std::runtime_error("PipelineBuilder::build: layout() was never called");
     }
-    if (colour_format_ == VK_FORMAT_UNDEFINED) {
+    // A pipeline with no colour attachment has to have a depth attachment, or it would
+    // produce nothing at all. Chapter 5.3's shadow pass is the first to leave out the
+    // colour attachment, and its fragment shader with it.
+    if (colour_format_ == VK_FORMAT_UNDEFINED && depth_format_ == VK_FORMAT_UNDEFINED) {
         throw std::runtime_error(
-            "PipelineBuilder::build: colour_attachment() was never called");
+            "PipelineBuilder::build: neither colour_attachment() nor depth() was called");
     }
+    const uint32_t colour_count = colour_format_ == VK_FORMAT_UNDEFINED ? 0 : 1;
+    const uint32_t stage_count = fragment_entry_.empty() ? 1 : 2;
 
     const VkSpecializationInfo specialisation{
         .mapEntryCount = static_cast<uint32_t>(specialisation_entries_.size()),
@@ -441,7 +446,7 @@ VkPipeline PipelineBuilder::build() const {
         .flags = 0,
         .logicOpEnable = VK_FALSE,
         .logicOp = VK_LOGIC_OP_COPY,
-        .attachmentCount = 1,
+        .attachmentCount = colour_count,
         .pAttachments = &blend_attachment,
         .blendConstants = {0.0F, 0.0F, 0.0F, 0.0F},
     };
@@ -460,7 +465,7 @@ VkPipeline PipelineBuilder::build() const {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
         .pNext = nullptr,
         .viewMask = 0,
-        .colorAttachmentCount = 1,
+        .colorAttachmentCount = colour_count,
         .pColorAttachmentFormats = &colour_format_,
         .depthAttachmentFormat = depth_format_,
         .stencilAttachmentFormat = stencil_format_,
@@ -470,7 +475,8 @@ VkPipeline PipelineBuilder::build() const {
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
         .pNext = &rendering_info,
         .flags = 0,
-        .stageCount = 2,
+        // The vertex stage is first in stages[], so a count of 1 drops the fragment one.
+        .stageCount = stage_count,
         .pStages = stages,
         .pVertexInputState = &vertex_input,
         .pInputAssemblyState = &input_assembly,

@@ -42,6 +42,10 @@ public:
     // names -- this project marks them [shader("vertex")] vertexMain and
     // [shader("fragment")] fragmentMain, and the build passes
     // -fvk-use-entrypoint-name so those names survive into the SPIR-V.
+    //
+    // An empty fragment_entry builds a pipeline with no fragment stage. That is legal
+    // in any pipeline, but colour outputs are then undefined, so it is only useful
+    // when depth is all the pipeline writes. Chapter 5.3's shadow map is the first.
     PipelineBuilder& shaders(VkShaderModule module,
                              std::string vertex_entry = "vertexMain",
                              std::string fragment_entry = "fragmentMain");
@@ -80,7 +84,8 @@ public:
 
     // Dynamic rendering has no render pass to describe the attachments, so the
     // pipeline is told their formats directly. These must match the images the
-    // chapter actually renders into.
+    // chapter actually renders into. Leaving it unset declares no colour attachment
+    // at all, for a depth-only pass like chapter 5.3's shadow map.
     PipelineBuilder& colour_attachment(VkFormat format);
 
     // Standard source-over alpha blending. Off by default: an opaque fragment shader
