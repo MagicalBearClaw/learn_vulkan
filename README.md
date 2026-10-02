@@ -5,6 +5,8 @@ A complete, beginner-oriented course in modern Vulkan, built the way
 from the one before it, and the series runs all the way from opening a window to
 physically based rendering with image-based lighting.
 
+**Read the course: <https://magicalbearclaw.github.io/learn_vulkan/>**
+
 Targets **Vulkan 1.3** with dynamic rendering, `synchronization2`, descriptor indexing
 and buffer device address - no render pass objects, no framebuffer objects, and
 roughly a third less setup code than a 1.0-era tutorial.
