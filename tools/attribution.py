@@ -53,6 +53,8 @@ FENCE = re.compile(r"^\s*(```|~~~)")
 #   * pipeline.cpp has to be 1.7: chapter 1.8 already calls both `vkc::load_shader`
 #     and `PipelineBuilder`.
 #   * image.cpp splits -- create/upload/mips/samplers in 1.11, depth in 1.13.
+#   * 3.4 enables shaderSampledImageArrayDynamicIndexing in device.cpp, for its texture
+#     array indexed by material.
 #   * 4.7 adds multisampling: a sample count on ImageDesc and PipelineBuilder, and the
 #     sampleRateShading feature in device.cpp. Its article shows those lines.
 #   * 5.3 lets PipelineBuilder build a depth-only pipeline, with no fragment stage
@@ -76,7 +78,7 @@ OWNERS: dict[str, list[str]] = {
     "scaffold/include/vkc/instance.hpp": ["1.2"],
     "scaffold/src/instance.cpp": ["1.2"],
     "scaffold/include/vkc/device.hpp": ["1.3"],
-    "scaffold/src/device.cpp": ["1.3", "4.7", "5.4"],
+    "scaffold/src/device.cpp": ["1.3", "3.4", "4.7", "5.4"],
     "scaffold/include/vkc/swapchain.hpp": ["1.4"],
     "scaffold/src/swapchain.cpp": ["1.4"],
     "scaffold/include/vkc/context.hpp": ["1.5"],

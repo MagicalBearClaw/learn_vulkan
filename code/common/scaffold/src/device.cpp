@@ -209,6 +209,11 @@ void Device::create_device() {
     features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     features2.pNext = &features12;
     features2.features.samplerAnisotropy = VK_TRUE;
+    // Indexing an array of textures with a value computed at run time, the same for a
+    // whole draw. Without it, the index must be a constant the compiler knows. Chapter
+    // 3.4 needs it for `base_colour_maps[material.texture]`, and nothing reports its
+    // absence, which is why the article spends a paragraph on it.
+    features2.features.shaderSampledImageArrayDynamicIndexing = VK_TRUE;
     // Running the fragment shader once per sample rather than once per pixel. Chapter
     // 4.7 turns it on for one of its pipelines and measures what it costs.
     features2.features.sampleRateShading = VK_TRUE;

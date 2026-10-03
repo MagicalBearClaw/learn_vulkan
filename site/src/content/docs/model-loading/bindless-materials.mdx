@@ -121,10 +121,26 @@ there:
 features12.runtimeDescriptorArray = VK_TRUE;
 ```
 
-:::note[Nothing new in `vkcommon`]
-This chapter adds no shared code. `runtimeDescriptorArray` is already on because 1.3 turned it
-on — it is the one feature in `Context::create_device()` that exists purely for a chapter in
-Part 3, and 1.3's article says so at the point it is written.
+:::note[One line in `vkcommon`]
+`runtimeDescriptorArray` is already on because 1.3 turned it on. It is not the only feature
+this array needs. Indexing an array of textures at all, with anything but a constant, is a
+separate feature:
+
+```cpp title="code/common/scaffold/src/device.cpp"
+    // Indexing an array of textures with a value computed at run time, the same for a
+    // whole draw. Without it, the index must be a constant the compiler knows. Chapter
+    // 3.4 needs it for `base_colour_maps[material.texture]`, and nothing reports its
+    // absence, which is why the article spends a paragraph on it.
+    features2.features.shaderSampledImageArrayDynamicIndexing = VK_TRUE;
+```
+
+Without `shaderSampledImageArrayDynamicIndexing`, the specification says an array of sampled
+images "must be indexed only by constant integral expressions". `material.texture` is read from
+a buffer, so it is not one. Unlike the missing `runtimeDescriptorArray` above, nothing catches
+this. The SPIR-V Slang emits declares no capability for it, so `vkCreateShaderModule` accepts the
+module, the validation layers and `spirv-val` stay silent, and the frame is correct on this
+GPU. This chapter ran that way until chapter 5.4 found the rule. A feature whose absence nobody
+reports is still a feature the program is required to enable.
 
 `shaderSampledImageArrayNonUniformIndexing`, `descriptorBindingPartiallyBound` and
 `descriptorBindingVariableDescriptorCount` are the other three you will meet in bindless code, and

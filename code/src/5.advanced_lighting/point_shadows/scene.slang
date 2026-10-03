@@ -196,10 +196,8 @@ float3 shade(VSOutput input, float3 albedo) {
     float3 to_eye = normalize(globals.view_position.xyz - input.world_position);
 
     float3 total = globals.ambient.rgb * albedo;
-    // Unrolled, so that every index into shadow_maps is a constant. An array of
-    // descriptors indexed by a value computed at run time asks the device for a feature
-    // this series has not enabled; a constant asks for nothing.
-    [ForceUnroll]
+    // shadow_maps is indexed by the loop counter, which is not a constant. That is legal
+    // because the device enables shaderSampledImageArrayDynamicIndexing, for 3.4.
     for (uint i = 0; i < kLampCount; ++i) {
         total += lamp_light(globals.lamps[i], input.world_position, normal, to_eye,
                             albedo) *

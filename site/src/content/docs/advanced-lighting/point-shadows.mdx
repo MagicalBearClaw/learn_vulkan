@@ -881,9 +881,9 @@ behind itself. 152 pixels change, most of them at the edge of the square of floo
 warm lamp, and none of them gets lighter. Near an edge the two axes' distances are nearly equal, which is what
 being near the edge means, so the point's own depth is the better guess.
 
-### A loop the compiler has to unroll
+### An array indexed by a loop
 
-`shade` adds the three lamps up in a loop, and the loop has `[ForceUnroll]` on it:
+`shade` adds the three lamps up in a loop, and indexes `shadow_maps` with the loop counter:
 
 ```slang title="code/src/5.advanced_lighting/point_shadows/scene.slang"
 float3 shade(VSOutput input, float3 albedo) {
@@ -893,10 +893,8 @@ float3 shade(VSOutput input, float3 albedo) {
     float3 to_eye = normalize(globals.view_position.xyz - input.world_position);
 
     float3 total = globals.ambient.rgb * albedo;
-    // Unrolled, so that every index into shadow_maps is a constant. An array of
-    // descriptors indexed by a value computed at run time asks the device for a feature
-    // this series has not enabled; a constant asks for nothing.
-    [ForceUnroll]
+    // shadow_maps is indexed by the loop counter, which is not a constant. That is legal
+    // because the device enables shaderSampledImageArrayDynamicIndexing, for 3.4.
     for (uint i = 0; i < kLampCount; ++i) {
         total += lamp_light(globals.lamps[i], input.world_position, normal, to_eye,
                             albedo) *
@@ -919,14 +917,17 @@ float4 lampFragmentMain(VSOutput input) : SV_Target {
 }
 ```
 
-Without it, Slang keeps the loop, and the SPIR-V indexes `shadow_maps` with the loop variable:
-two sampling instructions instead of six. The specification allows that only with the
-`shaderSampledImageArrayDynamicIndexing` feature enabled, and this series has never enabled
-it. Without the feature, an array of sampled images "must be indexed only by **constant
-integral expressions**". A loop counter is not one. Nothing reports the difference: the
-validation layers are silent and `spirv-val` accepts the module, and the frame differs by 5
-pixels, by one level each. The rule lives in the description of a feature that nobody checks at
-run time. Unrolling makes every index a literal 0, 1 or 2, and the rule is kept.
+A loop counter is not a **constant integral expression**, and the specification allows an array
+of sampled images to be indexed by anything else only with the
+`shaderSampledImageArrayDynamicIndexing` feature enabled. The device enables it, since 3.4.
+Nothing would report its absence: with the feature turned off, the validation layers are silent,
+`spirv-val` accepts the module and the frame is unchanged. This chapter is where that came to
+light, and 3.4, whose texture array has the same need, ran without the feature until then.
+
+Slang's `[ForceUnroll]` on the loop would avoid the question entirely: it copies the body three
+times with the literal indices 0, 1 and 2, six sampling instructions in the SPIR-V instead of
+two. The frame differs from the looped one by 5 pixels, each by one level, which is the
+compiler arranging the arithmetic differently.
 
 ## Bias, for a lamp
 
@@ -1668,9 +1669,10 @@ and `PipelineBuilder::view_mask`. Both are shown in "One multiview pass" above.
 - the depth a face stored, recomputed in the shader from the major component
 - multiview: the `multiview` feature, `PipelineBuilder::view_mask`, `SV_ViewID`, and six faces
   in one pass
-- a descriptor array of three cubes, and a loop unrolled to keep its indices constant
+- a descriptor array of three cubes, indexed by a loop counter
 - a constant depth bias, for the floor the lamps look straight down on
 - the comparison sampler moved into `vkcommon`
+- `shaderSampledImageArrayDynamicIndexing` enabled, which 3.4 needed and lacked
 - 38 chapters in the build now
 
 ## Words introduced in this chapter
@@ -1690,7 +1692,7 @@ and `PipelineBuilder::view_mask`. Both are shown in "One multiview pass" above.
 | **constant depth bias** | a depth offset of a fixed number of the depth format's steps, the same for every triangle |
 | **unit in the last place** | one step between neighbouring values of a floating-point number |
 | **seamless filtering** | a cube map's filtering reading across a face's edge into the neighbouring face |
-| **constant integral expression** | an integer the compiler knows, which is all an array of sampled images may be indexed by without the dynamic-indexing feature |
+| **constant integral expression** | an integer the compiler knows, which is all an array of sampled images may be indexed by without `shaderSampledImageArrayDynamicIndexing` |
 
 ## Exercises
 
@@ -1705,7 +1707,7 @@ and `PipelineBuilder::view_mask`. Both are shown in "One multiview pass" above.
    Predict what happens before you run it.
 5. Replace the three cube images with one cube array of 18 layers, read through
    `SamplerCubeArrayShadow`. Which device feature does that need, and does the loop in `shade`
-   still have to be unrolled?
+   still need `shaderSampledImageArrayDynamicIndexing`?
 6. Move a lamp to where the stacked crate's top corner is 0.05 units from it. What does the near
    plane do to the crate's shadow, and what is the smallest near plane that fixes it?
 
