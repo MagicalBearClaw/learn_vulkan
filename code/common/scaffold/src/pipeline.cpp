@@ -243,6 +243,11 @@ PipelineBuilder& PipelineBuilder::depth_bias(float constant_factor, float slope_
     return *this;
 }
 
+PipelineBuilder& PipelineBuilder::view_mask(uint32_t mask) {
+    view_mask_ = mask;
+    return *this;
+}
+
 PipelineBuilder& PipelineBuilder::stencil_attachment(VkFormat format) {
     stencil_format_ = format;
     return *this;
@@ -464,7 +469,7 @@ VkPipeline PipelineBuilder::build() const {
     const VkPipelineRenderingCreateInfo rendering_info{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
         .pNext = nullptr,
-        .viewMask = 0,
+        .viewMask = view_mask_,
         .colorAttachmentCount = colour_count,
         .pColorAttachmentFormats = &colour_format_,
         .depthAttachmentFormat = depth_format_,

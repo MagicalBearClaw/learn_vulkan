@@ -220,6 +220,12 @@
       "sample": "5.advanced_lighting/shadow_mapping",
       "previous": "5.advanced_lighting/gamma_correction",
       "article": "advanced-lighting/shadow-mapping.mdx"
+    },
+    {
+      "id": "5.4.point_shadows",
+      "sample": "5.advanced_lighting/point_shadows",
+      "previous": "5.advanced_lighting/shadow_mapping",
+      "article": "advanced-lighting/point-shadows.mdx"
     }
   ]
 }

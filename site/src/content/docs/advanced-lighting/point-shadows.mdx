@@ -1,0 +1,1713 @@
+---
+title: "Point shadows"
+description: Six cameras at each lamp filling a cube of depth, the face layout derived from the specification's table and the mirror it implies, the depth a face stored recomputed from a distance, multiview drawing all six faces in one pass, and the one surface slope-scaled bias cannot reach.
+sidebar:
+  order: 4
+---
+
+<figure>
+  <img src="/learn_vulkan/img/reference/5.4.point_shadows.png" alt="A tiled floor at night seen from above and in front, with five wooden crates and a tall thin post lit by three small lamps: a pale blue one at the left, a warm white one in the middle and a pink one at the right. Every crate and the post throws a separate shadow away from each lamp, so the shadows fan out in several directions and each is tinted by the lamps that still reach it" />
+  <figcaption>Chapter 5.4. Every lamp casts its own shadows, in every direction. A shadow from one
+  lamp is still lit by the other two, which is why the shadows have colours.</figcaption>
+</figure>
+
+5.3 gave the sun a camera. The sun is far enough away that its rays are parallel, so one box
+held every ray that mattered, and one square image held the box. 5.2's lamps are not like
+that. A lamp sits in the room and shines in every direction: up at nothing, down at the
+floor, sideways at the crates around it. No single camera sees in every direction, and no
+single square image holds what they would see.
+
+This chapter brings the three lamps back, in the same places and the same colours, into the
+room 5.3 lit with the sun. Each lamp gets six cameras and a depth image with six layers, one
+per camera. Shadows cast by a lamp in all directions are **point shadows**. The keys:
+
+- <kbd>1</kbd> shadows on or off
+- <kbd>2</kbd> fill each lamp's cube with six rendering passes, or with one multiview pass
+- <kbd>3</kbd> how the cubes are read: one texel, bilinear, or nine bilinear reads
+- <kbd>4</kbd> set the lamps moving, each around a small circle
+
+```
+[info] 1 shadows, 2 six passes or multiview, 3 filter, 4 move the lamps.
+[info] shadows on, one multiview pass per lamp, 3x3 bilinear taps
+[info] shadow cubes, one multiview pass per lamp: GPU  0.023 ms
+```
+
+The camera now starts higher, looking down at the floor, because that is where the shadows
+fall.
+
+## Six cameras around a lamp
+
+Take any direction out of the lamp, as a vector (x, y, z). One of the three components is the
+largest in size: that is the vector's **major axis**. With its sign, it says which of six
+directions the vector leans furthest towards: +x, −x, +y, −y, +z or −z. Every direction has
+one, so the six sets of directions with the same major axis cover every direction there is.
+Ties sit on the boundaries between sets, and have zero area.
+
+The set whose major axis is +x is every direction with |y| ≤ x and |z| ≤ x. Seen from the lamp
+that is a square pyramid around the +x axis, whose sides lean out at y/x = ±1 and z/x = ±1.
+The tangent of 45° is 1, so its half-angle is 45° in both directions. A perspective camera
+at the lamp, looking along +x, with a vertical field of view of 90° and a square image, sees
+exactly that pyramid. Six such cameras, one along each axis, see every direction once.
+
+Those six images are the six faces of a cube centred on the lamp, which is the shape 4.4 used
+for a sky. A depth image with six layers, made cube-compatible and read through a cube view,
+is a **cube shadow map**. The shader reads it the way 4.4 read its sky: it passes a direction,
+and the sampler picks the face from the direction's major axis and the texel from the other
+two components. Each layer of the image is one **cube face**.
+
+```cpp title="code/src/5.advanced_lighting/point_shadows/main.cpp"
+// Where lamp i is at time t: its place, or a point on a small circle around it.
+[[nodiscard]] glm::vec3 lamp_position(uint32_t i, float t) {
+    const float angle = kOrbitRates[i] * t;
+    return kLamps[i].position +
+           kOrbitRadius * glm::vec3(std::cos(angle), 0.0F, std::sin(angle));
+}
+
+// The six cameras a lamp needs: one at the lamp, looking down each axis, each seeing
+// exactly a quarter turn across so that together they leave no gap and no overlap.
+[[nodiscard]] std::array<glm::mat4, kFaceCount> cube_view_projections(glm::vec3 lamp) {
+    // A square, 90-degree frustum. There is no y flip here, unlike every other camera
+    // in the series: the specification fixes which way up a cube face is read, and the
+    // up vectors in kCubeFaces already lay each face out that way. The article works
+    // through what that does to triangle winding.
+    const glm::mat4 projection =
+        glm::perspective(glm::radians(90.0F), 1.0F, kShadowNear, kShadowFar);
+
+    std::array<glm::mat4, kFaceCount> faces{};
+    for (uint32_t face = 0; face < kFaceCount; ++face) {
+        const glm::mat4 view =
+            glm::lookAt(lamp, lamp + kCubeFaces[face].forward, kCubeFaces[face].up);
+        faces[face] = projection * view;
+    }
+    return faces;
+}
+```
+
+## Which way up a face is
+
+A camera makes an image, and a cube lookup reads one. For the comparison to mean anything, a
+texel the lookup reads has to be the texel the camera drew in that direction. The lookup's
+side of the agreement is fixed. The specification's table, in the chapter on texture
+operations, gives for each major axis the face's layer and two coordinates, s<sub>c</sub> and
+t<sub>c</sub>:
+
+| major axis | layer | s<sub>c</sub> | t<sub>c</sub> |
+|---|---|---|---|
+| +x | 0 | −z | −y |
+| −x | 1 | +z | −y |
+| +y | 2 | +x | +z |
+| −y | 3 | +x | −z |
+| +z | 4 | +x | −y |
+| −z | 5 | −x | −y |
+
+and then s = ½·s<sub>c</sub>/|m| + ½ and t = ½·t<sub>c</sub>/|m| + ½, where m is the major
+component. s runs across the face from 0 to 1 and t runs down it, so t = 0 is the first row of
+texels in memory.
+
+The camera's side is the rasteriser. A clip-space position comes out of the vertex shader, the
+divide gives normalised device coordinates, and the viewport puts x<sub>ndc</sub> = −1 at
+column 0 and y<sub>ndc</sub> = −1 at row 0. So the camera agrees with the lookup exactly when
+
+```
+   x_ndc = s_c / |m|        y_ndc = t_c / |m|
+```
+
+for every point it draws. Take +x. `glm::lookAt(eye, eye + forward, up)` builds a view space
+whose x axis is `normalize(cross(forward, up))` and whose y axis is `cross(x axis, forward)`.
+`glm::perspective` with no y flip then gives x<sub>ndc</sub> = x<sub>view</sub>/d and
+y<sub>ndc</sub> = y<sub>view</sub>/d, where d is the distance along the camera's axis. For +x,
+d is the vector's x component, so the camera needs x<sub>view</sub> = −z and
+y<sub>view</sub> = −y. With `up` = (0, −1, 0):
+
+```
+   x axis = cross((1,0,0), (0,−1,0)) = (0, 0, −1)     so x_view = −z
+   y axis = cross((0,0,−1), (1,0,0)) = (0, −1, 0)     so y_view = −y
+```
+
+That is the table's row. The other five rows work the same way, and `kCubeFaces` holds the
+answers:
+
+```cpp title="code/src/5.advanced_lighting/point_shadows/main.cpp"
+// The six directions a cube map faces, in the order the specification gives its array
+// layers, and for each the "up" vector that lays the face out the way a cube lookup will
+// read it. The article derives every one of these from the specification's table.
+struct CubeFace {
+    glm::vec3 forward;
+    glm::vec3 up;
+};
+constexpr std::array<CubeFace, kFaceCount> kCubeFaces{{
+    {{1, 0, 0}, {0, -1, 0}},   // +X
+    {{-1, 0, 0}, {0, -1, 0}},  // -X
+    {{0, 1, 0}, {0, 0, 1}},    // +Y
+    {{0, -1, 0}, {0, 0, -1}},  // -Y
+    {{0, 0, 1}, {0, -1, 0}},   // +Z
+    {{0, 0, -1}, {0, -1, 0}},  // -Z
+}};
+
+// One bit per face: all six views of a multiview pass.
+constexpr uint32_t kAllFaces = (1U << kFaceCount) - 1;
+```
+
+### The mirror
+
+Every camera in this series has flipped y in its projection, because Vulkan's clip-space y
+points down. These six do not, because the table, not a monitor, decides which way up the
+image goes. That has a consequence for triangles.
+
+Compare the +x face with an ordinary camera standing at the lamp and looking along +x. The
+ordinary camera has `up` = +y, and its right-hand side is cross(forward, up) = +z. Changing
+`up` to −y rolls the camera half a turn, which negates both of its image axes. Leaving out the
+y flip negates y a second time. What remains is x negated: the face is the ordinary camera's
+picture with left and right swapped, a **mirror image**. That is the −z in the table's first
+row: a cube face is what you would see looking out from the centre of the cube, reflected.
+
+A mirror reverses the order in which a triangle's corners go round. Every triangle this series
+draws goes counter-clockwise when its front faces the camera, and 1.13's pipelines say so with
+`VK_FRONT_FACE_COUNTER_CLOCKWISE`. In a cube face the same triangle goes clockwise, so the
+shadow pipelines declare `VK_FRONT_FACE_CLOCKWISE`, and back-face culling keeps culling what it
+should.
+
+The mistake is quiet. Leave the shadow pipelines on counter-clockwise and the culling keeps the
+faces turned away from the lamp and discards the ones facing it. The floor, seen from above,
+disappears from the cubes, and each crate's far side casts its shadow instead of its near side.
+The frame looks right at first glance: 6,776 pixels change, 5,953 of them brighter. The extra
+light is along the line where each crate meets the floor:
+
+<figure>
+  <img src="/learn_vulkan/img/5.4/winding.png" alt="Two enlarged crops of the base of a crate where its shadow begins. Left: the shadow meets the crate cleanly. Right: a thin bright line runs along the bottom edge of the crate, and the start of the shadow is streaked" />
+  <figcaption>The base of the front crate, three times enlarged. Left: front face clockwise. Right: counter-clockwise, as every other pipeline in the series has it. Light leaks under the crate.</figcaption>
+</figure>
+
+Adding the y flip every other camera makes, with counter-clockwise front faces to match it,
+turns each face upside down relative to the table. That mistake is loud: 215,810 pixels
+change, and shadows land where no crate could cast them.
+
+<figure>
+  <img src="/learn_vulkan/img/5.4/y-flip.png" alt="The chapter's scene twice, side by side. Left: correct shadows. Right: shadows fall in the wrong directions, the post has a dark band across its middle, and the stacked crate is dark where it should be lit" />
+  <figcaption>Left: the cube faces as the table lays them out. Right: with the y flip every other camera in the series makes.</figcaption>
+</figure>
+
+## The depth a face stored
+
+5.3's fragment shader found itself in the shadow map by multiplying its position by the sun's
+matrix. Here there are six matrices per lamp, and the fragment shader does not know which
+face saw it. It can work that out, and it does not need any matrix to do it.
+
+The face that saw the point is the one its major axis picks. Let the offset from the lamp to
+the point be (x, y, z) and let m = max(|x|, |y|, |z|). That face's camera looks along the major
+axis, so the point's distance along the camera's line of sight is m. In view space the camera
+looks down −z, so z<sub>view</sub> = −m. `glm::perspective`, with the project's
+`GLM_FORCE_DEPTH_ZERO_TO_ONE`, has as its last two rows
+
+```
+   z_clip = −f/(f − n) · z_view  −  f·n/(f − n)
+   w_clip = −z_view
+```
+
+and with z<sub>view</sub> = −m the depth after the divide is
+
+```
+   depth = z_clip / w_clip  =  f/(f − n)  −  f·n / ((f − n) · m)
+```
+
+which is 0 at m = n and 1 at m = f. Nothing in it depends on which face, or on the face's x
+and y: the depth a face stored for a point depends only on the point's major component.
+
+```slang title="code/src/5.advanced_lighting/point_shadows/scene.slang"
+// The depth a cube face stored for a point at `offset` from its lamp. The face is the
+// one whose axis is offset's largest component, and that component is the point's
+// distance along the face camera's line of sight; the rest is that camera's projection.
+float cube_depth(float3 offset) {
+    float3 size = abs(offset);
+    float along = max(size.x, max(size.y, size.z));
+    float n = push.globals.shadow_near;
+    float f = push.globals.shadow_far;
+    return f / (f - n) - f * n / ((f - n) * along);
+}
+```
+
+This is the depth the rasteriser computed, written in closed form, so the stored depth and
+the shader's should be the same number. They are, on this GPU, to the last bit. That is
+measured below, and it turns out to matter.
+
+A perspective depth is not a linear function of distance. With n = 0.1 and f = 40:
+
+| m | 0.55 | 1 | 5 | 25 |
+|---|---|---|---|---|
+| depth | 0.8202 | 0.9023 | 0.9825 | 0.9985 |
+| depth per unit of m | 0.33 | 0.10 | 0.0040 | 0.00016 |
+
+The last row is the derivative, f·n/((f − n)·m²). A 32-bit float between 0.5 and 1 has steps
+of 2<sup>−24</sup>, about 6.0 × 10<sup>−8</sup>, so at 5 units one step of stored depth is
+about 15 µm of distance and at 25 units about 0.37 mm. `D32_SFLOAT` resolves the room easily.
+
+```cpp title="code/src/5.advanced_lighting/point_shadows/main.cpp"
+// Texels along each side of each face.
+constexpr uint32_t kShadowMapSize = 1024;
+constexpr uint32_t kFaceCount = 6;
+
+// Depth from each lamp is kept between these distances, measured along whichever axis a
+// face looks down. The floor's farthest corner is 26 units along an axis from the lamp
+// furthest from it, wherever key 4 has moved the lamps.
+constexpr float kShadowNear = 0.1F;
+constexpr float kShadowFar = 40.0F;
+
+```
+
+The far plane is a distance along a face's axis, not from the lamp, so what it has to reach is
+the largest major component of any point on the floor. That is 26 units, from the blue lamp to
+the opposite corner with the lamp moved as far as key 4 takes it. 40 is comfortable.
+
+## Filling the cube
+
+### The image and its views
+
+The image is 4.4's cube, with depth in it instead of six files:
+
+```cpp title="code/src/5.advanced_lighting/point_shadows/main.cpp"
+    void create_shadow_cubes() {
+        // 5.3's format question, asked again: the faces are rendered into and then
+        // sampled, and filtered by key 3's bilinear modes.
+        constexpr VkFormat kShadowFormat = VK_FORMAT_D32_SFLOAT;
+        VkFormatProperties properties{};
+        vkGetPhysicalDeviceFormatProperties(context().physical_device(), kShadowFormat,
+                                            &properties);
+        const VkFormatFeatureFlags features = properties.optimalTilingFeatures;
+        constexpr VkFormatFeatureFlags kRequired =
+            VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT |
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+        if ((features & kRequired) != kRequired) {
+            throw std::runtime_error(
+                "D32_SFLOAT cannot be both rendered into and sampled on this GPU");
+        }
+        const bool filterable =
+            (features & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0;
+        if (!filterable) {
+            spdlog::warn("D32_SFLOAT cannot be filtered here; bilinear reads fall back "
+                         "to one texel");
+        }
+
+        for (uint32_t lamp = 0; lamp < kLampCount; ++lamp) {
+            ShadowCube& cube = shadow_cubes_[lamp];
+            // 4.4's cube, made from depth instead of loaded from six files.
+            cube.image = vkc::Image(
+                context(),
+                vkc::ImageDesc{
+                    .format = kShadowFormat,
+                    .extent = {kShadowMapSize, kShadowMapSize},
+                    .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                             VK_IMAGE_USAGE_SAMPLED_BIT,
+                    .mip_levels = 1,
+                    .aspect = VK_IMAGE_ASPECT_DEPTH_BIT,
+                    .array_layers = kFaceCount,
+                    .cube = true,
+                });
+            const std::string name = std::format("shadow cube {}", lamp);
+            context().name(cube.image.handle(), VK_OBJECT_TYPE_IMAGE, name.c_str());
+
+            for (uint32_t face = 0; face < kFaceCount; ++face) {
+                cube.face_views[face] = create_face_view(cube.image.handle(), face);
+            }
+        }
+
+        // 5.3's two comparison samplers, now made by vkcommon, with one difference: no
+        // border. A cube has no outside -- every direction lands on some face -- and the
+        // specification says a cube image ignores the sampler's address modes. A
+        // bilinear read that runs off one face's edge takes its missing texels from the
+        // neighbouring face instead.
+        const auto shadow_sampler = [&](VkFilter filter) {
+            return vkc::Sampler(context(),
+                                vkc::SamplerDesc{
+                                    .mag_filter = filter,
+                                    .min_filter = filter,
+                                    .mipmap_mode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+                                    .address_mode = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                    .anisotropy = false,
+                                    .compare = true,
+                                    .compare_op = VK_COMPARE_OP_LESS_OR_EQUAL,
+                                });
+        };
+        shadow_nearest_sampler_ = shadow_sampler(VK_FILTER_NEAREST);
+        shadow_linear_sampler_ =
+            shadow_sampler(filterable ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+    }
+```
+
+`vkc::Image` gives the image one view, of type `VK_IMAGE_VIEW_TYPE_CUBE`, covering all six
+layers. The camera pass samples through it. A rendering pass can also draw into it: the
+specification rules out only three-dimensional views as rendering attachments, and the
+validation layers accept a cube view. A pass without a view mask, though, draws into the first
+layer of its attachment's view, and the cube view's first layer is always +x. Drawing into face
+3 alone takes a view that starts at layer 3. Each face gets one, a
+`VK_IMAGE_VIEW_TYPE_2D` view of a single layer, a **layer view**:
+
+```cpp title="code/src/5.advanced_lighting/point_shadows/main.cpp"
+    // A second view of one layer of a cube, as an ordinary 2D image. A rendering pass
+    // without a view mask draws into the first layer of its attachment's view, so to
+    // draw into face 3 alone, a pass needs a view that starts at layer 3.
+    [[nodiscard]] VkImageView create_face_view(VkImage image, uint32_t face) {
+        const VkImageViewCreateInfo info{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .image = image,
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = VK_FORMAT_D32_SFLOAT,
+            .components = {},
+            .subresourceRange =
+                {
+                    .aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT,
+                    .baseMipLevel = 0,
+                    .levelCount = 1,
+                    .baseArrayLayer = face,
+                    .layerCount = 1,
+                },
+        };
+        VkImageView view = VK_NULL_HANDLE;
+        VK_CHECK(vkCreateImageView(context().device(), &info, nullptr, &view));
+        return view;
+    }
+```
+
+```cpp title="code/src/5.advanced_lighting/point_shadows/main.cpp"
+// One lamp's shadow cube, and the views it is rendered through.
+struct ShadowCube {
+    // A cube-compatible depth image of six layers. Its own view is a CUBE view of all
+    // six: the camera pass samples through it, and the multiview fill renders into it.
+    vkc::Image image;
+    // Each layer alone, as a 2D view, for the six-pass fill.
+    std::array<VkImageView, kFaceCount> face_views{};
+
+    void destroy(VkDevice device) noexcept {
+        for (VkImageView view : face_views) {
+            vkDestroyImageView(device, view, nullptr);
+        }
+        image.destroy();
+    }
+};
+```
+
+Three lamps, six faces each, 1024 × 1024 texels of four bytes: 72 MiB of depth. 5.3's one map
+was 4 MiB.
+
+### Six passes
+
+The direct way to fill a cube is six times over. Each face gets a rendering pass of its own,
+into its layer view, and each pass draws the whole scene with that face's matrix. The vertex
+shader finds the matrix from `face_base`, a new push constant:
+
+```cpp title="code/src/5.advanced_lighting/point_shadows/main.cpp"
+// 4.5's push constants with one more field, which fills the four bytes of padding that
+// were already at the end: which of Globals::faces the shadow pass draws with.
+struct PushConstants {
+    VkDeviceAddress globals;   // 0
+    VkDeviceAddress draws;     // 8
+    VkDeviceAddress vertices;  // 16
+    uint32_t draw_index;       // 24
+    uint32_t face_base;        // 28
+};
+static_assert(offsetof(PushConstants, face_base) == 28);
+static_assert(sizeof(PushConstants) == 32);
+
+// Where each object's DrawData sits in the array the frame writes. The order is fixed by
+// write_draws() below and nothing else may reorder it.
+constexpr uint32_t kFloorDraw = 0;
+constexpr uint32_t kFirstCrateDraw = kFloorDraw + 1;
+constexpr uint32_t kFirstLampDraw =
+    kFirstCrateDraw + static_cast<uint32_t>(kCrates.size());
+constexpr uint32_t kDrawCount = kFirstLampDraw + kLampCount;
+```
+
+```cpp title="code/src/5.advanced_lighting/point_shadows/main.cpp"
+private:
+    // ---------------------------------------------------------------------------
+    // Pass one: depth from each lamp, in six directions
+    // ---------------------------------------------------------------------------
+
+    void render_shadow_cube(VkCommandBuffer cmd, uint32_t lamp) {
+        const ShadowCube& cube = shadow_cubes_[lamp];
+
+        // 5.3's two barriers, unchanged. image_barrier() covers every array layer, so
+        // one call moves all six faces.
+        vkc::image_barrier(cmd, cube.image.handle(), VK_IMAGE_LAYOUT_UNDEFINED,
+                           VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                           VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                           VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                           VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                               VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                           VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                               VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                           VK_IMAGE_ASPECT_DEPTH_BIT);
+
+        const uint32_t first_face = lamp * kFaceCount;
+        if (fill_ == FillMode::SixPasses) {
+            // Six rendering passes, each into one layer through its own 2D view, each
+            // drawing the whole scene with its own face's matrix.
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, face_pipeline_);
+            for (uint32_t face = 0; face < kFaceCount; ++face) {
+                begin_shadow_pass(cmd, cube.face_views[face], /*view_mask=*/0);
+                draw_geometry(cmd, first_face + face);
+                vkCmdEndRendering(cmd);
+            }
+        } else {
+            // One rendering pass into all six layers. The view mask says which layers;
+            // every draw is then run once per set bit, and the vertex shader is told
+            // which run it is in.
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, multiview_pipeline_);
+            begin_shadow_pass(cmd, cube.image.view(), kAllFaces);
+            draw_geometry(cmd, first_face);
+            vkCmdEndRendering(cmd);
+        }
+
+        vkc::image_barrier(cmd, cube.image.handle(),
+                           VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                           VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                           VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                           VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                           VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                           VK_IMAGE_ASPECT_DEPTH_BIT);
+    }
+
+    // 5.3's depth-only rendering instance, into whichever view it is given. With a view
+    // mask, layerCount is ignored: the mask is what says how many layers are drawn.
+    static void begin_shadow_pass(VkCommandBuffer cmd, VkImageView view,
+                                  uint32_t view_mask) {
+        const VkRenderingAttachmentInfo depth_attachment{
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .pNext = nullptr,
+            .imageView = view,
+            .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+            .resolveMode = VK_RESOLVE_MODE_NONE,
+            .resolveImageView = VK_NULL_HANDLE,
+            .resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .clearValue = {.depthStencil = {.depth = 1.0F, .stencil = 0}},
+        };
+        const VkExtent2D extent{kShadowMapSize, kShadowMapSize};
+        const VkRenderingInfo rendering{
+            .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .renderArea = {.offset = {0, 0}, .extent = extent},
+            .layerCount = 1,
+            .viewMask = view_mask,
+            .colorAttachmentCount = 0,
+            .pColorAttachments = nullptr,
+            .pDepthAttachment = &depth_attachment,
+            .pStencilAttachment = nullptr,
+        };
+        vkCmdBeginRendering(cmd, &rendering);
+        set_viewport(cmd, extent);
+    }
+```
+
+That is 18 rendering passes a frame. Each draws the floor and six crates, so the scene is
+recorded 126 times to make three cubes.
+
+### One multiview pass
+
+**Multiview** is the API's way of saying the same draws into several layers at once.
+`VkRenderingInfo::viewMask` is a **view mask**: one bit per layer of the attachments, and the
+pass draws every set layer. Each draw recorded in the pass is then carried out once for each
+set bit, and the vertex shader is told which time it is: the **view index**. The specification
+is plain about what `layerCount` means then. It is "the number of layers rendered to in each
+attachment when `viewMask` is 0", which leaves it no meaning otherwise. Setting it to 0 in a
+multiview pass gives no message and an identical frame. Setting it to 0 in the six-pass path
+gives:
+
+```
+vkCmdBeginRendering(): pRenderingInfo viewMask and layerCount are both zero.
+The Vulkan spec states: If viewMask is 0, layerCount must not be 0
+(https://docs.vulkan.org/spec/latest/chapters/renderpass.html#VUID-VkRenderingInfo-viewMask-06069)
+```
+
+So one pass per lamp, with a mask of 0b111111 and the cube view as the attachment, draws all six
+faces from one recording of the scene: three passes and 21 draws a frame. The view index
+reaches the shader as `SV_ViewID`, which is SPIR-V's `ViewIndex`. The specification says that
+outside a multiview pass it is zero, so one vertex shader serves both paths: `face_base` names
+the first face, and the view index counts on from it.
+
+```slang title="code/src/5.advanced_lighting/point_shadows/scene.slang"
+// The shadow pass, for both ways of filling a cube. SV_ViewID is which view of a
+// multiview pass this run of the shader belongs to: 0 to 5 when the pass draws all six
+// faces at once, and always 0 in an ordinary pass, where face_base alone names the face.
+[shader("vertex")]
+float4 shadowVertexMain(uint vertex_id : SV_VulkanVertexID,
+                        uint view : SV_ViewID) : SV_Position {
+    Vertex vertex = push.vertices[vertex_id];
+    DrawData draw = push.draws[push.draw_index];
+    float4 world = mul(draw.model, float4(vertex.position, 1.0));
+    return mul(push.globals.faces[push.face_base + view], world);
+}
+```
+
+`maxMultiviewViewCount`, the most views one pass may have, is at least 6 on every device: the
+specification's table of required limits gives 6 as its minimum, which is one cube. This RTX
+4080 reports 32.
+
+Three things in `vkcommon` have to agree with this. The device has to enable the
+`multiview` feature, which every Vulkan 1.1 implementation supports:
+
+```cpp title="code/common/scaffold/src/device.cpp"
+    // One rendering pass drawing the same triangles into several layers of the
+    // attachments at once, each through its own matrix. Chapter 5.4 renders the six faces
+    // of a cube map this way and explains it.
+    VkPhysicalDeviceVulkan11Features features11{};
+    features11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+    features11.pNext = &features13;
+    features11.multiview = VK_TRUE;
+
+    VkPhysicalDeviceVulkan12Features features12{};
+    features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    features12.pNext = &features11;
+```
+
+and a pipeline used inside a multiview pass has to be built with the same mask, in
+`VkPipelineRenderingCreateInfo::viewMask`, which `PipelineBuilder` has so far always set to 0:
+
+```cpp title="code/common/scaffold/include/vkc/pipeline.hpp"
+    // The views a multiview rendering pass draws, one bit per layer, which must match
+    // VkRenderingInfo::viewMask of every pass the pipeline is used in. 0, the default, is
+    // an ordinary pass. Chapter 5.4 is the first to set it, for the six faces of a cube.
+    PipelineBuilder& view_mask(uint32_t mask);
+```
+
+```cpp title="code/common/scaffold/include/vkc/pipeline.hpp"
+    VkFormat colour_format_ = VK_FORMAT_UNDEFINED;
+    uint32_t view_mask_ = 0;
+```
+
+```cpp title="code/common/scaffold/src/pipeline.cpp"
+PipelineBuilder& PipelineBuilder::view_mask(uint32_t mask) {
+    view_mask_ = mask;
+    return *this;
+}
+```
+
+```cpp title="code/common/scaffold/src/pipeline.cpp"
+    const VkPipelineRenderingCreateInfo rendering_info{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+        .pNext = nullptr,
+        .viewMask = view_mask_,
+        .colorAttachmentCount = colour_count,
+```
+
+The two shadow pipelines are the same but for the mask:
+
+```cpp title="code/src/5.advanced_lighting/point_shadows/main.cpp"
+    void create_pipelines() {
+        const VkDevice device = context().device();
+
+        const VkPushConstantRange push_range{
+            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+            .offset = 0,
+            .size = sizeof(PushConstants),
+        };
+        const std::array<VkDescriptorSetLayout, 2> set_layouts{texture_set_layout_,
+                                                               shadow_set_layout_};
+        const VkPipelineLayoutCreateInfo layout_info{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .setLayoutCount = static_cast<uint32_t>(set_layouts.size()),
+            .pSetLayouts = set_layouts.data(),
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &push_range,
+        };
+        VK_CHECK(
+            vkCreatePipelineLayout(device, &layout_info, nullptr, &pipeline_layout_));
+
+        const VkShaderModule scene_shader =
+            vkc::load_shader(device, LVK_CHAPTER_ID, "scene.slang");
+
+        const auto camera_pipeline = [&](const char* fragment_entry) {
+            return vkc::PipelineBuilder(device)
+                .shaders(scene_shader, "vertexMain", fragment_entry)
+                .colour_attachment(swapchain().format())
+                .cull(VK_CULL_MODE_BACK_BIT, VK_FRONT_FACE_COUNTER_CLOCKWISE)
+                .depth(depth_format_, /*test=*/true, /*write=*/true)
+                .layout(pipeline_layout_)
+                .build();
+        };
+        opaque_pipeline_ = camera_pipeline("fragmentMain");
+        lamp_pipeline_ = camera_pipeline("lampFragmentMain");
+
+        // The two shadow pipelines differ only in their view mask, which has to match
+        // the rendering pass each is used in. The front face is CLOCKWISE: a cube face
+        // is a mirror image of what an ordinary camera would show, and the article
+        // works out why.
+        const auto shadow_pipeline = [&](uint32_t view_mask) {
+            return vkc::PipelineBuilder(device)
+                .shaders(scene_shader, "shadowVertexMain", "")
+                .cull(VK_CULL_MODE_BACK_BIT, VK_FRONT_FACE_CLOCKWISE)
+                .depth(VK_FORMAT_D32_SFLOAT, /*test=*/true, /*write=*/true)
+                .depth_bias(kConstantBias, kSlopeBias)
+                .view_mask(view_mask)
+                .layout(pipeline_layout_)
+                .build();
+        };
+        face_pipeline_ = shadow_pipeline(0);
+        multiview_pipeline_ = shadow_pipeline(kAllFaces);
+
+        vkDestroyShaderModule(device, scene_shader, nullptr);
+
+        context().name(opaque_pipeline_, VK_OBJECT_TYPE_PIPELINE, "scene opaque");
+        context().name(lamp_pipeline_, VK_OBJECT_TYPE_PIPELINE, "lamp");
+        context().name(face_pipeline_, VK_OBJECT_TYPE_PIPELINE, "shadow, one face");
+        context().name(multiview_pipeline_, VK_OBJECT_TYPE_PIPELINE, "shadow, multiview");
+    }
+```
+
+The two paths give the same pixels. With each of the three filters, the frame from six passes
+and the frame from multiview differ in 0 pixels. What changes is the work. On the RTX 4080 the
+shadow cubes take 0.033 ms of GPU time with six passes and 0.023 ms with multiview, averaged
+over a second by 4.6's timer. Both numbers are small because the scene is seven boxes. The
+difference is the cost of 15 more rendering passes, and the CPU's side of it, 105 more draws
+recorded, grows with every object in the scene.
+
+### Barriers
+
+5.3's two barriers move the whole image. `vkc::image_barrier` names
+`VK_REMAINING_ARRAY_LAYERS`, so one call covers all six faces, and each cube needs the same two
+calls the square map did. Synchronization validation, switched on as 5.3 described, reports
+nothing for any of the 24 combinations of keys 1 to 4.
+
+## Asking the cube
+
+### The samplers and the array
+
+The comparison sampler is 5.3's, now made by `vkcommon`, with one setting changed. A cube has
+no outside: every direction lands on some face. The specification says a cube image ignores
+the sampler's address modes. With linear filtering, a read that runs off the edge of a face
+takes the missing texels from the neighbouring face, so a bilinear comparison near an edge is
+still a comparison of four real texels. That is **seamless filtering**, and in Vulkan it is not
+an option to turn on. With nearest filtering there is no read to run off: the address is
+clamped to the face's edge. The border colour that kept 5.3's outside lit has nothing to do.
+
+The descriptor set holds the three cubes as an array of three, one binding with
+`descriptorCount` 3, and each write fills one element of it through `dstArrayElement`:
+
+```cpp title="code/src/5.advanced_lighting/point_shadows/main.cpp"
+    void create_descriptors() {
+        const VkDevice device = context().device();
+
+        const VkDescriptorSetLayoutBinding texture_binding{
+            .binding = 0,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+            .pImmutableSamplers = nullptr,
+        };
+        const VkDescriptorSetLayoutCreateInfo texture_layout_info{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .bindingCount = 1,
+            .pBindings = &texture_binding,
+        };
+        VK_CHECK(vkCreateDescriptorSetLayout(device, &texture_layout_info, nullptr,
+                                             &texture_set_layout_));
+
+        // Set 1 is one binding holding an array of three descriptors, one cube per lamp.
+        const VkDescriptorSetLayoutBinding shadow_binding{
+            .binding = 0,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = kLampCount,
+            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+            .pImmutableSamplers = nullptr,
+        };
+        const VkDescriptorSetLayoutCreateInfo shadow_layout_info{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .bindingCount = 1,
+            .pBindings = &shadow_binding,
+        };
+        VK_CHECK(vkCreateDescriptorSetLayout(device, &shadow_layout_info, nullptr,
+                                             &shadow_set_layout_));
+
+        // Two texture sets, and two shadow sets of three descriptors each: one with the
+        // nearest comparison sampler, one with the linear.
+        constexpr uint32_t kSets = 4;
+        constexpr uint32_t kDescriptors = 2 + 2 * kLampCount;
+        const VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                             kDescriptors};
+        const VkDescriptorPoolCreateInfo pool_info{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .maxSets = kSets,
+            .poolSizeCount = 1,
+            .pPoolSizes = &pool_size,
+        };
+        VK_CHECK(vkCreateDescriptorPool(device, &pool_info, nullptr, &descriptor_pool_));
+
+        crate_set_ = allocate_set(texture_set_layout_);
+        write_image(crate_set_, 0, crate_map_.view(), sampler_.handle());
+        floor_set_ = allocate_set(texture_set_layout_);
+        write_image(floor_set_, 0, floor_map_.view(), sampler_.handle());
+
+        // Each cube through its own CUBE view, the one vkc::Image made with it.
+        shadow_nearest_set_ = allocate_set(shadow_set_layout_);
+        shadow_linear_set_ = allocate_set(shadow_set_layout_);
+        for (uint32_t lamp = 0; lamp < kLampCount; ++lamp) {
+            const VkImageView view = shadow_cubes_[lamp].image.view();
+            write_image(shadow_nearest_set_, lamp, view,
+                        shadow_nearest_sampler_.handle());
+            write_image(shadow_linear_set_, lamp, view, shadow_linear_sampler_.handle());
+        }
+    }
+
+    [[nodiscard]] VkDescriptorSet allocate_set(VkDescriptorSetLayout layout) {
+        const VkDescriptorSetAllocateInfo alloc{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .pNext = nullptr,
+            .descriptorPool = descriptor_pool_,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &layout,
+        };
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        VK_CHECK(vkAllocateDescriptorSets(context().device(), &alloc, &set));
+        return set;
+    }
+
+    // 5.3's write_image(), with the binding replaced by an element of binding 0's array:
+    // dstArrayElement is which of the three descriptors this write fills.
+    void write_image(VkDescriptorSet set, uint32_t element, VkImageView view,
+                     VkSampler sampler) {
+        const VkDescriptorImageInfo image_info{
+            .sampler = sampler,
+            .imageView = view,
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
+        const VkWriteDescriptorSet write{
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .pNext = nullptr,
+            .dstSet = set,
+            .dstBinding = 0,
+            .dstArrayElement = element,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .pImageInfo = &image_info,
+            .pBufferInfo = nullptr,
+            .pTexelBufferView = nullptr,
+        };
+        vkUpdateDescriptorSets(context().device(), 1, &write, 0, nullptr);
+    }
+```
+
+```slang title="code/src/5.advanced_lighting/point_shadows/scene.slang"
+[[vk::binding(0, 0)]] Sampler2D base_colour_map;
+
+// One cube per lamp, each through a comparison sampler. A cube is read by direction, not
+// by a uv pair: the direction picks the face and the texel on it.
+[[vk::binding(0, 1)]] SamplerCubeShadow shadow_maps[kLampCount];
+```
+
+### The lookup
+
+```slang title="code/src/5.advanced_lighting/point_shadows/scene.slang"
+// How much of lamp `lamp` reaches this point: 1 in full light, 0 in full shadow, and
+// fractions along the edges when the filter reads more than one texel.
+float lamp_visibility(uint lamp, float3 world_position) {
+    Globals globals = *push.globals;
+    if ((globals.flags & kShadowsOn) == 0) {
+        return 1.0;
+    }
+
+    float3 offset = world_position - globals.lamps[lamp].position.xyz;
+    float depth = cube_depth(offset);
+
+    // Beyond the far plane the comparison would always fail. The far plane reaches the
+    // corners of the floor, so this only matters to a reader who moves a lamp outside.
+    if (depth > 1.0) {
+        return 1.0;
+    }
+
+    if (globals.filter != kFilterPcf3x3) {
+        return shadow_maps[lamp].SampleCmpLevelZero(offset, depth);
+    }
+
+    // 5.3's nine bilinear reads, one texel apart, now on a cube face. The two directions
+    // across the face are the two axes that are not its own, and one texel along them
+    // is 2 / size of the face at distance 1 -- so 2 * along / size at this distance.
+    float3 size = abs(offset);
+    float along = max(size.x, max(size.y, size.z));
+    float3 across_a;
+    float3 across_b;
+    if (along == size.x) {
+        across_a = float3(0, 1, 0);
+        across_b = float3(0, 0, 1);
+    } else if (along == size.y) {
+        across_a = float3(1, 0, 0);
+        across_b = float3(0, 0, 1);
+    } else {
+        across_a = float3(1, 0, 0);
+        across_b = float3(0, 1, 0);
+    }
+    float step = 2.0 * along * globals.shadow_texel;
+
+    float sum = 0.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            // Every tap is compared against this point's own depth, as in 5.3. A tap
+            // that crosses an edge reads the next face, whose depths are measured along
+            // another axis -- but near an edge the two distances are nearly equal,
+            // which is what being near the edge means.
+            float3 tap = offset + (float(x) * across_a + float(y) * across_b) * step;
+            sum += shadow_maps[lamp].SampleCmpLevelZero(tap, depth);
+        }
+    }
+    return sum / 9.0;
+}
+```
+
+The one-read path passes the offset itself as the direction. The sampler normalises nothing and
+needs nothing normalised: only the ratios of the components choose the face and the texel.
+
+The nine-read path is 5.3's, moved onto a cube face. Across the face the two directions are the
+axes that are not the major one. The face spans −m to m in each of them, at distance m, in
+`kShadowMapSize` texels, so one texel there is 2m/size. Each tap is the offset moved by whole
+texels across the face.
+
+Every tap compares against the point's own depth. A tap near an edge may cross onto the next
+face, whose depths are measured along a different axis, and it is tempting to compute each
+tap's depth from its own vector instead. Try it, and it is worse. A tap vector is the
+point moved across the face, and it is no longer on the surface. Measured along the next face's
+axis, it is further from the lamp than the floor in that direction, so the floor appears to be
+behind itself. 152 pixels change, most of them at the edge of the square of floor below the
+warm lamp, and none of them gets lighter. Near an edge the two axes' distances are nearly equal, which is what
+being near the edge means, so the point's own depth is the better guess.
+
+### A loop the compiler has to unroll
+
+`shade` adds the three lamps up in a loop, and the loop has `[ForceUnroll]` on it:
+
+```slang title="code/src/5.advanced_lighting/point_shadows/scene.slang"
+float3 shade(VSOutput input, float3 albedo) {
+    Globals globals = *push.globals;
+
+    float3 normal = normalize(input.normal);
+    float3 to_eye = normalize(globals.view_position.xyz - input.world_position);
+
+    float3 total = globals.ambient.rgb * albedo;
+    // Unrolled, so that every index into shadow_maps is a constant. An array of
+    // descriptors indexed by a value computed at run time asks the device for a feature
+    // this series has not enabled; a constant asks for nothing.
+    [ForceUnroll]
+    for (uint i = 0; i < kLampCount; ++i) {
+        total += lamp_light(globals.lamps[i], input.world_position, normal, to_eye,
+                            albedo) *
+                 lamp_visibility(i, input.world_position);
+    }
+    return total;
+}
+
+[shader("fragment")]
+float4 fragmentMain(VSOutput input) : SV_Target {
+    float3 tint = push.draws[push.draw_index].colour.rgb;
+    float3 albedo = base_colour_map.Sample(input.uv).rgb * tint;
+    return float4(shade(input, albedo), 1.0);
+}
+
+// The lamp itself: its colour, unlit.
+[shader("fragment")]
+float4 lampFragmentMain(VSOutput input) : SV_Target {
+    return float4(push.draws[push.draw_index].colour.rgb, 1.0);
+}
+```
+
+Without it, Slang keeps the loop, and the SPIR-V indexes `shadow_maps` with the loop variable:
+two sampling instructions instead of six. The specification allows that only with the
+`shaderSampledImageArrayDynamicIndexing` feature enabled, and this series has never enabled
+it. Without the feature, an array of sampled images "must be indexed only by **constant
+integral expressions**". A loop counter is not one. Nothing reports the difference: the
+validation layers are silent and `spirv-val` accepts the module, and the frame differs by 5
+pixels, by one level each. The rule lives in the description of a feature that nobody checks at
+run time. Unrolling makes every index a literal 0, 1 or 2, and the rule is kept.
+
+## Bias, for a lamp
+
+### Slope-scaled, again
+
+5.3 derived its slope-scaled bias from one fact: for a flat surface, the hardware's slope term
+is the change in depth across one texel of the shadow map. Nothing in that argument used the
+projection, so it holds for a perspective face as it held for the sun's box. The factors come
+out the same. Pixels darker than the final frame by more than two levels:
+
+| slope bias | 0 | 1 | 2 | 4 | 8 |
+|---|---|---|---|---|---|
+| one texel | 541,262 | 289 | 203 | 0 | 0 |
+| bilinear | 716,868 | 501 | 249 | 0 | 0 |
+| 3×3 reads | 734,363 | 646,058 | 656 | 0 | 0 |
+
+The few hundred left at 1 and 2 are on faces the lamps light at a grazing angle: the side of
+the stacked crates and the top of the post. Going from 4 to 8 changes 1,093 pixels with the
+3×3 reads, all on the edges of such faces, and no shadow comes away from its crate.
+
+<figure>
+  <img src="/learn_vulkan/img/5.4/acne.png" alt="The chapter's scene covered in fine dark stripes and rings, on the floor and on every crate. Directly below the warm lamp is a clean square of floor with no stripes" />
+  <figcaption>Slope bias 0, one texel per read. The stripes ring each lamp. The clean square below the warm lamp is the next section.</figcaption>
+</figure>
+
+### Zero slope
+
+Below each lamp there is a square of floor with no acne in it at all, even at bias 0. It is
+the part of the floor the −y face sees: from (−m, −m) to (m, m) around the point below the
+lamp, where m is the lamp's height. The −y camera looks straight down at it, so every point of
+that floor is at the same distance along the camera's axis. Its depth is the same everywhere
+on the face. It has **zero slope**: no texel's depth differs from its neighbour's, so there is
+no acne, and there is also nothing for a slope-scaled bias to scale. Whatever bias that square
+gets from the slope term is zero.
+
+So the floor below a lamp is lit only if the depth the rasteriser stored and the depth the
+shader computed compare as equal or the right way round. Both are the same formula, worked by
+different hardware. Shifting the shader's depth by single steps of the float, a
+**unit in the last place**, finds where they stand:
+
+- With n = 0.1 they are equal. One step towards the lamp keeps the square lit. One step away
+  darkens 11,751 pixels. 5.3's exercise 6 asked whether `VK_COMPARE_OP_LESS` instead of
+  `LESS_OR_EQUAL` changes anything: here, with no constant bias, it darkens 11,714 pixels.
+  The square is lit by the "or equal".
+- With n = 0.01 they are not. The stored depth lands one or two steps beyond the shader's, the
+  square fails its comparison, and 11,725 pixels go dark.
+
+<figure>
+  <img src="/learn_vulkan/img/5.4/head-on.png" alt="Two enlarged crops of the floor below the warm lamp. Left: a dark square patch on the floor, sharply edged. Right: the same floor evenly lit" />
+  <figcaption>The floor below the warm lamp, with the near plane at 0.01. Left: no constant bias. Right: constant bias 4.</figcaption>
+</figure>
+
+A tie decided by rounding is not something to ship. The slope term cannot help, but
+`depthBiasConstantFactor` can. 5.3 found it useless for acne, because acne needs thousands of
+its units. Here it needs very few. 5.3 derived its unit for `D32_SFLOAT`:
+2<sup>e − 23</sup>, where e is the exponent of the triangle's largest depth. Below a lamp the
+floor's depth in the −y face is 0.82, between 0.5 and 1, so e is −1 and the unit is
+2<sup>−24</sup>: one step of the stored value. A **constant depth bias** of 4 moves every
+stored depth four steps away:
+
+```cpp title="code/src/5.advanced_lighting/point_shadows/main.cpp"
+// 5.3's slope-scaled bias for 3x3 bilinear taps. The article explains why 5.3's argument
+// carries over to a perspective projection unchanged.
+constexpr float kSlopeBias = 4.0F;
+// And, for the first time, a constant one: four steps of the depth format. A surface
+// that faces a lamp head-on has no slope for the slope term to scale, and the article
+// measures what that leaves to chance.
+constexpr float kConstantBias = 4.0F;
+```
+
+With it, `LESS` darkens nothing, and the near plane at 0.01 gives a frame that differs from the
+shipped one in 13 pixels. At the square's distance four steps are 0.7 µm, so no shadow moves.
+
+## The lamps in their own cubes
+
+The lamp spheres are drawn in the camera pass and not in the shadow pass. Drawn into the cubes,
+each sphere would sit around its own lamp's cameras. Two things would still save the room.
+Seen from inside, every triangle of a sphere faces away, and back-face culling discards it. And
+the near plane at 0.1 is outside the sphere's radius of 0.06, so every triangle is clipped
+anyway. Each is enough alone: with either, drawing the spheres changes 4,698 pixels by at most 5
+levels, which are the bulbs' small shadows from the other two lamps. With neither, no culling and
+a near plane at 0.01, a lamp's sphere fills all six of its faces and 745,192 pixels go dark.
+
+## The application
+
+```cpp title="code/src/5.advanced_lighting/point_shadows/main.cpp"
+// 5.4 Point shadows
+//
+// 5.2's three lamps, back in the room 5.3 lit with the sun, and now casting shadows. A
+// lamp shines in every direction, so its shadow map is a cube: six square depth images,
+// one for each way out of the lamp, filled from the lamp's position every frame. The
+// camera pass then asks each lamp's cube whether anything stands between the lamp and
+// the point being lit.
+//
+//   1  shadows on or off
+//   2  fill each cube with six rendering passes, or with one multiview pass
+//   3  how the cubes are read: one texel, bilinear, or 3x3 bilinear taps
+//   4  set the lamps moving
+```
+
+```cpp title="code/src/5.advanced_lighting/point_shadows/main.cpp"
+#include <vkc/pipeline.hpp>
+#include <vkc/timer.hpp>
+```
+
+```cpp title="code/src/5.advanced_lighting/point_shadows/main.cpp"
+#include <format>
+#include <numbers>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+```
+
+`<numbers>` and `<utility>` come back with 5.2's `make_sphere`, which draws the lamps again:
+
+```cpp title="code/src/5.advanced_lighting/point_shadows/main.cpp"
+[[nodiscard]] std::pair<std::vector<Vertex>, std::vector<uint16_t>> make_sphere(
+    uint32_t rings, uint32_t segments, float radius) {
+    std::vector<Vertex> vertices;
+    std::vector<uint16_t> indices;
+    vertices.reserve(static_cast<size_t>(rings + 1) * (segments + 1));
+    indices.reserve(static_cast<size_t>(rings) * segments * 6);
+
+    for (uint32_t ring = 0; ring <= rings; ++ring) {
+        const float v = static_cast<float>(ring) / static_cast<float>(rings);
+        const float phi = v * std::numbers::pi_v<float>;
+        for (uint32_t segment = 0; segment <= segments; ++segment) {
+            const float u = static_cast<float>(segment) / static_cast<float>(segments);
+            const float theta = u * 2.0F * std::numbers::pi_v<float>;
+            const glm::vec3 normal{std::sin(phi) * std::cos(theta), std::cos(phi),
+                                   std::sin(phi) * std::sin(theta)};
+            vertices.push_back({normal * radius, normal, {u, v}});
+        }
+    }
+
+    for (uint32_t ring = 0; ring < rings; ++ring) {
+        for (uint32_t segment = 0; segment < segments; ++segment) {
+            const auto a = static_cast<uint16_t>(ring * (segments + 1) + segment);
+            const auto b = static_cast<uint16_t>(a + segments + 1);
+            indices.insert(indices.end(), {a, static_cast<uint16_t>(a + 1), b,
+                                           static_cast<uint16_t>(a + 1),
+                                           static_cast<uint16_t>(b + 1), b});
+        }
+    }
+    return {std::move(vertices), std::move(indices)};
+}
+```
+
+The lamps are 5.2's, and they can move:
+
+```cpp title="code/src/5.advanced_lighting/point_shadows/main.cpp"
+// 5.3's six placements: 5.2's four crates, the small one stacked on the first, and the
+// post.
+constexpr std::array<Placement, 6> kCrates{{
+    {{-2.20F, kFloorY, 0.75F}, 0.36F, {1.0F, 1.0F}},
+    {{2.05F, kFloorY, -1.05F}, -0.72F, {1.0F, 1.0F}},
+    {{-1.35F, kFloorY, -3.40F}, 0.18F, {1.0F, 1.0F}},
+    {{3.10F, kFloorY, 1.60F}, 0.95F, {1.0F, 1.0F}},
+    {{-2.15F, kFloorY + 1.0F, 0.70F}, 1.10F, {0.55F, 0.55F}},
+    {{0.35F, kFloorY, -1.90F}, 0.30F, {0.30F, 2.60F}},
+}};
+
+constexpr glm::vec4 kWhite{1.0F};
+
+// 5.2's three lamps, in the same places and the same colours.
+struct LampPlacement {
+    glm::vec3 position;
+    glm::vec3 colour;
+};
+
+constexpr uint32_t kLampCount = 3;
+constexpr std::array<LampPlacement, kLampCount> kLamps{{
+    {{0.0F, kFloorY + 0.55F, -0.60F}, {1.0F, 0.87F, 0.68F}},
+    {{-3.30F, kFloorY + 0.90F, -2.50F}, {0.50F, 0.68F, 1.0F}},
+    {{2.90F, kFloorY + 0.80F, 0.10F}, {1.0F, 0.52F, 0.46F}},
+}};
+constexpr float kLampRadius = 0.06F;
+constexpr float kLampIntensity = 2.0F;
+
+// With key 4, each lamp circles its own place, this far out and this fast.
+constexpr float kOrbitRadius = 0.70F;
+constexpr std::array<float, kLampCount> kOrbitRates{0.60F, -0.45F, 0.75F};
+
+// 5.2's night.
+constexpr glm::vec3 kAmbient{0.020F, 0.022F, 0.030F};
+```
+
+```cpp title="code/src/5.advanced_lighting/point_shadows/main.cpp"
+
+// How the shadow pass fills the cubes: what key 2 switches between.
+enum class FillMode : uint32_t { SixPasses = 0, Multiview = 1 };
+constexpr std::array<const char*, 2> kFillNames{"six passes per lamp",
+                                                "one multiview pass per lamp"};
+
+// 5.3's three ways of reading a shadow map. The values are Globals::filter.
+enum class ShadowFilter : uint32_t { OneTexel = 0, Bilinear = 1, Pcf3x3 = 2 };
+
+constexpr std::array<const char*, 3> kFilterNames{"one texel", "bilinear",
+                                                  "3x3 bilinear taps"};
+
+// ---------------------------------------------------------------------------
+// What the shaders read through a pointer
+// ---------------------------------------------------------------------------
+
+// The bits of Globals::flags.
+constexpr uint32_t kShadowsOn = 1U << 0;
+
+// 5.2's lamp, unchanged.
+struct Lamp {
+    glm::vec4 position;  // w unused
+    glm::vec4 colour;    // rgb already scaled by kLampIntensity, w unused
+};
+static_assert(sizeof(Lamp) == 32);
+
+// 5.2's Globals, with eighteen matrices -- six faces for each of three lamps -- and what
+// the fragment shader needs to turn a distance into the depth a face stored.
+struct Globals {
+    glm::mat4 view;                                          // 0
+    glm::mat4 projection;                                    // 64
+    glm::vec4 view_position;                                 // 128
+    glm::vec4 ambient;                                       // 144
+    std::array<Lamp, kLampCount> lamps;                      // 160
+    std::array<glm::mat4, kLampCount * kFaceCount> faces;    // 256, lamp * 6 + face
+    float shadow_near;                                       // 1408
+    float shadow_far;                                        // 1412
+    float shadow_texel;                                      // 1416, in uv units
+    uint32_t flags;                                          // 1420
+    uint32_t filter;                                         // 1424
+};
+static_assert(offsetof(Globals, faces) == 256);
+static_assert(offsetof(Globals, shadow_near) == 1408);
+static_assert(sizeof(Globals) == 1428);
+```
+
+`Globals` grows to 1,428 bytes, almost all of it the eighteen matrices. The frame arena's 64 KiB
+still holds it many times over:
+
+```cpp title="code/src/5.advanced_lighting/point_shadows/main.cpp"
+// 64 KiB, against the under 3 KiB a frame actually uses. Arena sizing is a guess that
+// wants to be generous: too small throws above, too large costs address space nobody is
+// competing for.
+constexpr VkDeviceSize kArenaBytes = 64 * 1024;
+```
+
+```cpp title="code/src/5.advanced_lighting/point_shadows/main.cpp"
+class PointShadowsApp : public vkc::App {
+public:
+    using vkc::App::App;
+
+protected:
+    void on_start() override {
+        cube_ = upload_mesh(context(), kCubeVertices, kCubeIndices);
+        floor_ = upload_mesh(context(), kFloorVertices, kFloorIndices);
+
+        const auto [sphere_vertices, sphere_indices] = make_sphere(16, 32, kLampRadius);
+        lamp_ = upload_mesh(context(), sphere_vertices, sphere_indices);
+
+        depth_format_ = vkc::choose_depth_format(context().physical_device());
+
+        load_textures();
+        create_shadow_cubes();
+        create_arenas();
+        create_descriptors();
+        create_depth_buffer(swapchain().extent());
+        create_pipelines();
+        timer_.create(context());
+
+        draws_.reserve(kDrawCount);
+
+        camera_.position = {0.4F, 2.6F, 7.2F};
+        camera_.pitch = -24.0F;
+
+        spdlog::info("1 shadows, 2 six passes or multiview, 3 filter, 4 move the lamps.");
+        log_mode();
+    }
+
+    void on_resize(VkExtent2D extent) override { create_depth_buffer(extent); }
+
+    void on_event(const SDL_Event& event) override {
+        camera_.handle_event(event, window().handle());
+
+        if (event.type != SDL_EVENT_KEY_DOWN || event.key.repeat) {
+            return;
+        }
+        switch (event.key.scancode) {
+            case SDL_SCANCODE_1:
+                shadows_ = !shadows_;
+                log_mode();
+                break;
+            case SDL_SCANCODE_2:
+                fill_ = fill_ == FillMode::SixPasses ? FillMode::Multiview
+                                                     : FillMode::SixPasses;
+                log_mode();
+                break;
+            case SDL_SCANCODE_3:
+                filter_ = static_cast<ShadowFilter>(
+                    (static_cast<uint32_t>(filter_) + 1) % kFilterNames.size());
+                log_mode();
+                break;
+            case SDL_SCANCODE_4:
+                moving_ = !moving_;
+                log_mode();
+                break;
+            default:
+                break;
+        }
+    }
+
+    void on_shutdown() override {
+        const VkDevice device = context().device();
+
+        timer_.destroy();
+        vkDestroyPipeline(device, lamp_pipeline_, nullptr);
+        vkDestroyPipeline(device, multiview_pipeline_, nullptr);
+        vkDestroyPipeline(device, face_pipeline_, nullptr);
+        vkDestroyPipeline(device, opaque_pipeline_, nullptr);
+        vkDestroyPipelineLayout(device, pipeline_layout_, nullptr);
+        vkDestroyDescriptorPool(device, descriptor_pool_, nullptr);
+        vkDestroyDescriptorSetLayout(device, shadow_set_layout_, nullptr);
+        vkDestroyDescriptorSetLayout(device, texture_set_layout_, nullptr);
+
+        shadow_linear_sampler_.destroy();
+        shadow_nearest_sampler_.destroy();
+        for (ShadowCube& cube : shadow_cubes_) {
+            cube.destroy(device);
+        }
+
+        sampler_.destroy();
+        floor_map_.destroy();
+        crate_map_.destroy();
+
+        for (FrameArena& arena : arenas_) {
+            arena.destroy();
+        }
+        depth_.destroy();
+        lamp_.destroy();
+        floor_.destroy();
+        cube_.destroy();
+    }
+
+    void on_render(const vkc::FrameInfo& frame) override {
+        camera_.update(delta_time());
+        if (moving_) {
+            lamp_time_ += delta_time();
+        }
+
+        const uint32_t slot = frame.frame_number % vkc::kFramesInFlight;
+        record_gpu_time(timer_.read(slot));
+
+        FrameArena& arena = arenas_[slot];
+        arena.reset();
+
+        write_globals(arena, frame.extent);
+        write_draws(arena);
+
+        // Only the shadow cubes are timed: they are what key 2 changes.
+        timer_.reset(frame.cmd, slot);
+        timer_.begin(frame.cmd, slot);
+        for (uint32_t lamp = 0; lamp < kLampCount; ++lamp) {
+            render_shadow_cube(frame.cmd, lamp);
+        }
+        timer_.end(frame.cmd, slot);
+
+        render_scene(frame);
+    }
+```
+
+```cpp title="code/src/5.advanced_lighting/point_shadows/main.cpp"
+    void render_scene(const vkc::FrameInfo& frame) {
+        vkc::begin_rendering(frame.cmd, frame.view, depth_.view(), frame.extent,
+                             {{0.0F, 0.0F, 0.0F, 1.0F}});
+        set_viewport(frame.cmd, frame.extent);
+
+        const VkDescriptorSet shadow_set =
+            filter_ == ShadowFilter::OneTexel ? shadow_nearest_set_ : shadow_linear_set_;
+        vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                pipeline_layout_, 1, 1, &shadow_set, 0, nullptr);
+
+        vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, opaque_pipeline_);
+        draw_geometry(frame.cmd, 0);
+
+        // The lamps themselves, drawn only here. In the shadow pass each would sit
+        // around its own lamp's camera, and only two accidents would keep it from hiding
+        // the room: seen from inside, every triangle faces away and is culled, and the
+        // near plane is further out than the sphere's radius.
+        bind_indices(frame.cmd, lamp_);
+        vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, lamp_pipeline_);
+        for (uint32_t i = 0; i < kLampCount; ++i) {
+            push(frame.cmd, lamp_.vertex_address, kFirstLampDraw + i, 0);
+            vkCmdDrawIndexed(frame.cmd, lamp_.index_count, 1, 0, 0, 0);
+        }
+
+        vkCmdEndRendering(frame.cmd);
+    }
+
+    // The floor and every crate, with whatever pipeline is bound. face_base is read only
+    // by the shadow pass's vertex shader.
+    void draw_geometry(VkCommandBuffer cmd, uint32_t face_base) {
+        bind_indices(cmd, floor_);
+        bind_texture(cmd, floor_set_);
+        push(cmd, floor_.vertex_address, kFloorDraw, face_base);
+        vkCmdDrawIndexed(cmd, floor_.index_count, 1, 0, 0, 0);
+
+        bind_indices(cmd, cube_);
+        bind_texture(cmd, crate_set_);
+        for (uint32_t i = 0; i < kCrates.size(); ++i) {
+            push(cmd, cube_.vertex_address, kFirstCrateDraw + i, face_base);
+            vkCmdDrawIndexed(cmd, cube_.index_count, 1, 0, 0, 0);
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Filling the arena
+    // ---------------------------------------------------------------------------
+
+    void write_globals(FrameArena& arena, VkExtent2D extent) {
+        Globals globals{
+            .view = camera_.view(),
+            .projection = projection(extent),
+            .view_position = glm::vec4(camera_.position, 1.0F),
+            .ambient = glm::vec4(kAmbient, 1.0F),
+            .lamps = {},
+            .faces = {},
+            .shadow_near = kShadowNear,
+            .shadow_far = kShadowFar,
+            .shadow_texel = 1.0F / static_cast<float>(kShadowMapSize),
+            .flags = shadows_ ? kShadowsOn : 0U,
+            .filter = static_cast<uint32_t>(filter_),
+        };
+        for (uint32_t i = 0; i < kLampCount; ++i) {
+            const glm::vec3 position = lamp_position(i, lamp_time_);
+            globals.lamps[i] = Lamp{
+                .position = glm::vec4(position, 1.0F),
+                .colour = glm::vec4(kLamps[i].colour * kLampIntensity, 1.0F),
+            };
+            const std::array<glm::mat4, kFaceCount> faces =
+                cube_view_projections(position);
+            std::copy(faces.begin(), faces.end(), globals.faces.begin() + i * kFaceCount);
+        }
+        globals_address_ = arena.write(&globals, sizeof(globals));
+    }
+
+    void write_draws(FrameArena& arena) {
+        draws_.clear();
+
+        draws_.push_back(draw_data_of(glm::mat4(1.0F), kWhite));
+
+        for (const Placement& crate : kCrates) {
+            draws_.push_back(draw_data_of(crate_model(crate), kWhite));
+        }
+
+        for (uint32_t i = 0; i < kLampCount; ++i) {
+            const glm::mat4 model =
+                glm::translate(glm::mat4(1.0F), lamp_position(i, lamp_time_));
+            draws_.push_back(draw_data_of(model, glm::vec4(kLamps[i].colour, 1.0F)));
+        }
+
+        draws_address_ = arena.write(draws_.data(), draws_.size() * sizeof(DrawData));
+    }
+
+    // 4.7's once-a-second average of what the timer measured.
+    void record_gpu_time(double ms) {
+        if (ms >= 0.0) {
+            gpu_ms_ += ms;
+            ++gpu_samples_;
+        }
+        if (elapsed() - stats_started_ < 1.0F || gpu_samples_ == 0) {
+            return;
+        }
+        spdlog::info("shadow cubes, {}: GPU {:6.3f} ms",
+                     kFillNames[static_cast<uint32_t>(fill_)], gpu_ms_ / gpu_samples_);
+        gpu_ms_ = 0.0;
+        gpu_samples_ = 0;
+        stats_started_ = elapsed();
+    }
+
+    void log_mode() const {
+        spdlog::info("shadows {}, {}, {}{}", shadows_ ? "on" : "off",
+                     kFillNames[static_cast<uint32_t>(fill_)],
+                     kFilterNames[static_cast<uint32_t>(filter_)],
+                     moving_ ? ", lamps moving" : "");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Frame plumbing
+    // ---------------------------------------------------------------------------
+
+    void push(VkCommandBuffer cmd, VkDeviceAddress vertices, uint32_t draw_index,
+              uint32_t face_base) {
+        const PushConstants constants{
+            .globals = globals_address_,
+            .draws = draws_address_,
+            .vertices = vertices,
+            .draw_index = draw_index,
+            .face_base = face_base,
+        };
+        vkCmdPushConstants(cmd, pipeline_layout_,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                           sizeof(constants), &constants);
+    }
+```
+
+`write_globals` builds the eighteen matrices every frame, because key 4 can move the lamps.
+`record_gpu_time` is 4.7's once-a-second average.
+
+```cpp title="code/src/5.advanced_lighting/point_shadows/main.cpp"
+    vkc::Camera camera_;
+
+    Mesh cube_;
+    Mesh floor_;
+    Mesh lamp_;
+
+    VkFormat depth_format_ = VK_FORMAT_UNDEFINED;
+    vkc::Image depth_;
+
+    // One arena per frame in flight, and the addresses this frame wrote into it.
+    std::array<FrameArena, vkc::kFramesInFlight> arenas_;
+    VkDeviceAddress globals_address_ = 0;
+    VkDeviceAddress draws_address_ = 0;
+    std::vector<DrawData> draws_;
+
+    vkc::Image crate_map_;
+    vkc::Image floor_map_;
+    vkc::Sampler sampler_;
+
+    std::array<ShadowCube, kLampCount> shadow_cubes_;
+    vkc::Sampler shadow_nearest_sampler_;
+    vkc::Sampler shadow_linear_sampler_;
+
+    VkDescriptorSet crate_set_ = VK_NULL_HANDLE;
+    VkDescriptorSet floor_set_ = VK_NULL_HANDLE;
+    VkDescriptorSet shadow_nearest_set_ = VK_NULL_HANDLE;
+    VkDescriptorSet shadow_linear_set_ = VK_NULL_HANDLE;
+
+    VkDescriptorSetLayout texture_set_layout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout shadow_set_layout_ = VK_NULL_HANDLE;
+    VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
+
+    VkPipelineLayout pipeline_layout_ = VK_NULL_HANDLE;
+    VkPipeline opaque_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline lamp_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline face_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline multiview_pipeline_ = VK_NULL_HANDLE;
+
+    vkc::GpuTimer timer_;
+    double gpu_ms_ = 0.0;
+    uint32_t gpu_samples_ = 0;
+    float stats_started_ = 0.0F;
+
+    bool shadows_ = true;
+    FillMode fill_ = FillMode::Multiview;
+    ShadowFilter filter_ = ShadowFilter::Pcf3x3;
+    bool moving_ = false;
+    float lamp_time_ = 0.0F;
+};
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    try {
+        vkc::App::Options options{};
+        options.title = "LearnVulkan 5.4 - Point shadows";
+        PointShadowsApp app(vkc::App::parse_args(argc, argv, options));
+        return app.run();
+    } catch (const std::exception& error) {
+        spdlog::error("{}", error.what());
+        return EXIT_FAILURE;
+    }
+}
+```
+
+```slang title="code/src/5.advanced_lighting/point_shadows/scene.slang"
+// 5.4 The scene shader, lit by three lamps, each with a cube of depth to say where it
+// cannot reach.
+//
+// vertexMain is 5.2's. shadowVertexMain is 5.3's, choosing among eighteen matrices
+// instead of using one. The lighting is 5.2's sum over lamps, with each lamp's share
+// multiplied by how much of that lamp the point can see.
+
+struct Vertex {
+    float3 position;
+    float3 normal;
+    float2 uv;
+};
+
+static const uint kLampCount = 3;
+static const uint kFaceCount = 6;
+
+struct Lamp {
+    float4 position;
+    float4 colour;
+};
+
+// Matches Globals in main.cpp, 1428 bytes, scalar layout.
+struct Globals {
+    float4x4 view;
+    float4x4 projection;
+    float4 view_position;
+    float4 ambient;
+    Lamp lamps[kLampCount];
+    float4x4 faces[kLampCount * kFaceCount];
+    float shadow_near;
+    float shadow_far;
+    float shadow_texel;
+    uint flags;
+    uint filter;
+};
+
+static const uint kShadowsOn = 1u << 0;
+
+static const uint kFilterOneTexel = 0;
+static const uint kFilterBilinear = 1;
+static const uint kFilterPcf3x3 = 2;
+
+struct DrawData {
+    float4x4 model;
+    float3x3 normal_matrix;
+    float4 colour;
+};
+
+struct PushConstants {
+    Globals* globals;
+    DrawData* draws;
+    Vertex* vertices;
+    uint draw_index;
+    uint face_base;
+};
+[[vk::push_constant]] PushConstants push;
+```
+
+```slang title="code/src/5.advanced_lighting/point_shadows/scene.slang"
+struct VSOutput {
+    float4 position : SV_Position;
+    [[vk::location(0)]] float3 world_position;
+    [[vk::location(1)]] float3 normal;
+    [[vk::location(2)]] float2 uv;
+};
+
+static const float kShininess = 64.0;
+static const float kSpecularStrength = 0.5;
+
+static const float kConstantTerm = 1.0;
+static const float kLinearTerm = 0.09;
+static const float kQuadraticTerm = 0.032;
+
+[shader("vertex")]
+VSOutput vertexMain(uint vertex_id : SV_VulkanVertexID) {
+    Vertex vertex = push.vertices[vertex_id];
+    DrawData draw = push.draws[push.draw_index];
+
+    VSOutput output;
+    float4 world = mul(draw.model, float4(vertex.position, 1.0));
+    output.world_position = world.xyz;
+    output.position = mul(push.globals.projection, mul(push.globals.view, world));
+    output.normal = mul(draw.normal_matrix, vertex.normal);
+    output.uv = vertex.uv;
+    return output;
+}
+
+```
+
+```slang title="code/src/5.advanced_lighting/point_shadows/scene.slang"
+// 5.2's lamp_light(), unchanged: one lamp, without the ambient.
+float3 lamp_light(Lamp lamp, float3 world_position, float3 normal, float3 to_eye,
+                  float3 albedo) {
+    float3 offset = lamp.position.xyz - world_position;
+    float distance = length(offset);
+    float3 to_light = offset / distance;
+
+    float attenuation = 1.0 / (kConstantTerm + kLinearTerm * distance +
+                               kQuadraticTerm * distance * distance);
+
+    float facing = dot(normal, to_light);
+    if (facing <= 0.0) {
+        return float3(0.0);
+    }
+
+    float3 halfway = normalize(to_light + to_eye);
+    float specular_amount = pow(max(dot(normal, halfway), 0.0), kShininess);
+
+    float3 diffuse = facing * albedo;
+    float3 specular = specular_amount * kSpecularStrength;
+    return lamp.colour.rgb * (diffuse + specular) * attenuation;
+}
+```
+
+```cmake title="code/src/5.advanced_lighting/point_shadows/CMakeLists.txt"
+add_chapter(5.4.point_shadows
+    SOURCES main.cpp
+    SHADERS scene.slang
+)
+```
+
+:::note[What moved into vkcommon]
+5.3's comparison sampler, as 5.3 said it would when a second chapter wanted one. `SamplerDesc`
+has three new fields, `compare`, `compare_op` and `border_colour`, and a sampler made without
+them is exactly what it was before:
+
+```cpp title="code/common/scaffold/include/vkc/image.hpp"
+// How to read between texels. Kept separate from Image on purpose: a sampler is an
+// independent object in Vulkan, and a handful of them serve a whole scene.
+struct SamplerDesc {
+    VkFilter mag_filter = VK_FILTER_LINEAR;
+    VkFilter min_filter = VK_FILTER_LINEAR;
+    VkSamplerMipmapMode mipmap_mode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    VkSamplerAddressMode address_mode = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    bool anisotropy = true;
+    // Makes this a comparison sampler: each texel read is compared with a value the
+    // shader supplies, using compare_op, and the filtered results of the comparisons
+    // come back instead of the texels. Chapter 5.3 wrote one out for its shadow map.
+    bool compare = false;
+    VkCompareOp compare_op = VK_COMPARE_OP_LESS_OR_EQUAL;
+    // What a read outside the image returns when address_mode is CLAMP_TO_BORDER.
+    VkBorderColor border_colour = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
+};
+```
+
+```cpp title="code/common/scaffold/src/image.cpp"
+        .compareEnable = desc.compare ? VK_TRUE : VK_FALSE,
+        .compareOp = desc.compare ? desc.compare_op : VK_COMPARE_OP_ALWAYS,
+        .minLod = 0.0F,
+        .maxLod = VK_LOD_CLAMP_NONE,
+        .borderColor = desc.border_colour,
+```
+
+Two other changes are new code rather than moved code: the `multiview` feature in `device.cpp`
+and `PipelineBuilder::view_mask`. Both are shown in "One multiview pass" above.
+:::
+
+## What changed since 5.3
+
+- 5.2's three lamps back, the sun gone
+- a cube shadow map per lamp: a cube-compatible depth image, its cube view, and a 2D view per
+  face
+- six cameras per lamp, with the face layout derived from the specification's table, and the
+  mirror that makes the shadow pipelines' front face clockwise
+- the depth a face stored, recomputed in the shader from the major component
+- multiview: the `multiview` feature, `PipelineBuilder::view_mask`, `SV_ViewID`, and six faces
+  in one pass
+- a descriptor array of three cubes, and a loop unrolled to keep its indices constant
+- a constant depth bias, for the floor the lamps look straight down on
+- the comparison sampler moved into `vkcommon`
+- 38 chapters in the build now
+
+## Words introduced in this chapter
+
+| | |
+|---|---|
+| **point shadow** | a shadow cast by a light at a point in the scene, which can fall in any direction from it |
+| **cube shadow map** | six depth images, one per face of a cube around a light, read by direction |
+| **cube face** | one of the six layers of a cube image, seen by a camera looking along one axis |
+| **major axis** | the axis of a direction vector's largest component, with its sign; it picks the cube face |
+| **mirror image** | a picture with one axis reversed, which reverses the winding of every triangle in it |
+| **multiview** | drawing the same commands into several layers of the attachments in one rendering pass |
+| **view mask** | the bits saying which layers a multiview pass draws, one bit per layer |
+| **view index** | which of a multiview pass's views a shader invocation is working on; `SV_ViewID` in Slang |
+| **layer view** | an image view that starts at one layer of an image and covers some of its layers |
+| **zero slope** | a surface whose depth does not change across the shadow map, because it faces the light's camera head-on |
+| **constant depth bias** | a depth offset of a fixed number of the depth format's steps, the same for every triangle |
+| **unit in the last place** | one step between neighbouring values of a floating-point number |
+| **seamless filtering** | a cube map's filtering reading across a face's edge into the neighbouring face |
+| **constant integral expression** | an integer the compiler knows, which is all an array of sampled images may be indexed by without the dynamic-indexing feature |
+
+## Exercises
+
+1. Set `kShadowMapSize` to 256. Where do the shadows get blockier first: near the lamps or far
+   from them? Work out the size of one texel at 1 unit and at 10 units from a lamp, and check.
+2. Give the six-pass path its own pipeline without `view_mask`, delete the multiview one, and
+   remove `SV_ViewID` from the shader. Does anything else need to change? Then put it all back
+   and do the opposite.
+3. Raise the warm lamp to 3 units above the floor. How big is the zero-slope square now? Set
+   `kConstantBias` to 0, and find out whether this height happens to round the right way.
+4. Draw the lamp spheres in the shadow pass with `VK_CULL_MODE_NONE` and a near plane of 0.05.
+   Predict what happens before you run it.
+5. Replace the three cube images with one cube array of 18 layers, read through
+   `SamplerCubeArrayShadow`. Which device feature does that need, and does the loop in `shade`
+   still have to be unrolled?
+6. Move a lamp to where the stacked crate's top corner is 0.05 units from it. What does the near
+   plane do to the crate's shadow, and what is the smallest near plane that fixes it?
+
+Next: 5.5 Normal mapping. The crates are flat boxes painted to look like planks. The next
+chapter makes their surfaces catch the light as if the planks were really there.

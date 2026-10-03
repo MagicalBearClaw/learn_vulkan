@@ -88,6 +88,11 @@ public:
     // at all, for a depth-only pass like chapter 5.3's shadow map.
     PipelineBuilder& colour_attachment(VkFormat format);
 
+    // The views a multiview rendering pass draws, one bit per layer, which must match
+    // VkRenderingInfo::viewMask of every pass the pipeline is used in. 0, the default, is
+    // an ordinary pass. Chapter 5.4 is the first to set it, for the six faces of a cube.
+    PipelineBuilder& view_mask(uint32_t mask);
+
     // Standard source-over alpha blending. Off by default: an opaque fragment shader
     // output simply replaces whatever was in the attachment.
     PipelineBuilder& alpha_blending(bool enabled);
@@ -132,6 +137,7 @@ private:
     VkFrontFace front_face_ = VK_FRONT_FACE_COUNTER_CLOCKWISE;
 
     VkFormat colour_format_ = VK_FORMAT_UNDEFINED;
+    uint32_t view_mask_ = 0;
     VkFormat depth_format_ = VK_FORMAT_UNDEFINED;
     bool depth_test_ = false;
     bool depth_write_ = false;

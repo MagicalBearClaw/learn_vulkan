@@ -176,9 +176,17 @@ void Device::create_device() {
     // was needed, since nothing in the series discards a fragment before then.
     features13.shaderDemoteToHelperInvocation = VK_TRUE;
 
+    // One rendering pass drawing the same triangles into several layers of the
+    // attachments at once, each through its own matrix. Chapter 5.4 renders the six faces
+    // of a cube map this way and explains it.
+    VkPhysicalDeviceVulkan11Features features11{};
+    features11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+    features11.pNext = &features13;
+    features11.multiview = VK_TRUE;
+
     VkPhysicalDeviceVulkan12Features features12{};
     features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
-    features12.pNext = &features13;
+    features12.pNext = &features11;
     features12.bufferDeviceAddress = VK_TRUE;
     features12.descriptorIndexing = VK_TRUE;
     // descriptorIndexing is a headline, not a switch: it reports that the implementation

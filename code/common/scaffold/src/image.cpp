@@ -429,11 +429,11 @@ Sampler::Sampler(Context& context, const SamplerDesc& desc)
         .mipLodBias = 0.0F,
         .anisotropyEnable = desc.anisotropy ? VK_TRUE : VK_FALSE,
         .maxAnisotropy = context.gpu_properties().limits.maxSamplerAnisotropy,
-        .compareEnable = VK_FALSE,
-        .compareOp = VK_COMPARE_OP_ALWAYS,
+        .compareEnable = desc.compare ? VK_TRUE : VK_FALSE,
+        .compareOp = desc.compare ? desc.compare_op : VK_COMPARE_OP_ALWAYS,
         .minLod = 0.0F,
         .maxLod = VK_LOD_CLAMP_NONE,
-        .borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
+        .borderColor = desc.border_colour,
         .unnormalizedCoordinates = VK_FALSE,
     };
     VK_CHECK(vkCreateSampler(device_, &info, nullptr, &sampler_));

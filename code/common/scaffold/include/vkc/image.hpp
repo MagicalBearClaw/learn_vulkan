@@ -132,6 +132,13 @@ struct SamplerDesc {
     VkSamplerMipmapMode mipmap_mode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
     VkSamplerAddressMode address_mode = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     bool anisotropy = true;
+    // Makes this a comparison sampler: each texel read is compared with a value the
+    // shader supplies, using compare_op, and the filtered results of the comparisons
+    // come back instead of the texels. Chapter 5.3 wrote one out for its shadow map.
+    bool compare = false;
+    VkCompareOp compare_op = VK_COMPARE_OP_LESS_OR_EQUAL;
+    // What a read outside the image returns when address_mode is CLAMP_TO_BORDER.
+    VkBorderColor border_colour = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
 };
 
 class Sampler {
