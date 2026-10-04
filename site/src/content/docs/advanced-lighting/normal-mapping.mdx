@@ -19,12 +19,12 @@ as flat as the steel around it.
 Modelling the detail would fix that, at a price. A rivet that catches the light as a dome needs
 a dome, and a dome that looks round up close needs a few hundred triangles. Each crate face
 has eight rivets, four grooves and a bevelled frame, so the twelve triangles of a crate would
-become tens of thousands, and the shadow pass would draw every one of them eighteen times.
+become more than ten thousand, and the shadow pass would draw every one of them eighteen times.
 
 The lighting does not need any of that geometry. Every lighting calculation since 2.2 has used
 the position for distances and for the directions to the lamp and to the eye; what decides how
-a surface turns towards them is the **normal**. The eye judges shape almost entirely from how brightness changes
-across a surface. Give each texel of a face its own normal, and the face is lit as if it had
+a surface turns towards them is the **normal**. Much of what the eye reads as shape comes from
+how brightness changes across a surface. Give each texel of a face its own normal, and the face is lit as if it had
 the shape those normals describe, while staying two triangles.
 
 This chapter gives the crates and the floor a texture of normals each. The keys:
@@ -91,8 +91,8 @@ crate's height field follows the same regions its diffuse map was painted from: 
 stands at the top, the rivets rise from it as caps of a sphere, the planks sit lower with a
 three-texel slope down from the frame's inner edge, and each gap between planks is a groove,
 sloping to nothing over three texels on either side. The edges are slopes, not steps, because a
-step has all of its slope in one texel, which becomes a line one texel wide in the normal map
-and flickers under every filter.
+step has all of its slope in one texel, which becomes a line one texel wide in the normal map:
+the narrowest feature a texture can hold, and the first to alias.
 
 The normal of a height field follows from its two slopes. Move one unit along x and the surface
 rises by ∂h/∂x, so the vector (1, 0, ∂h/∂x) lies in the surface; so does (0, 1, ∂h/∂y). Their
@@ -116,9 +116,9 @@ the height field put it instead of half a texel to one side.
 
 `dh_dup` is the slope *up* the image, the height one row above minus one row below, because y
 in the map points up and the rows count down. The function scales the heights before taking
-differences; the scale sets how steep every edge is. In the crate's map the grooves and the
-sides of the rivets lean 40° to 60° from straight out, and the frame's inner bevel, the steepest
-edge, about 80°.
+differences; the scale sets how steep every edge is. In the crate's map the sides of the grooves
+lean up to 57° from straight out and the sides of the rivets up to 55°; the frame's inner bevel
+is the steepest edge, at up to 81°.
 
 Reading back a few texels confirms the convention. A flat plank stores (128, 128, 255). The
 rivet centred on texel (28, 28) stores (131, 171, 247) six texels above its centre, where its
@@ -146,27 +146,26 @@ space at a point.
 ### Solving for them
 
 Across one triangle, position is a linear function of uv. Moving du along u and dv along v moves
-the point by du × ∂p/∂u + dv × ∂p/∂v, where ∂p/∂u and ∂p/∂v are two unknown vectors, the same
+the point by du ∂p/∂u + dv ∂p/∂v, where ∂p/∂u and ∂p/∂v are two unknown vectors, the same
 everywhere on the triangle. Each edge of the triangle is a move whose uv difference is known.
 For the edges from corner a to b and from a to c:
 
 ```
-edge1 = du1 × ∂p/∂u + dv1 × ∂p/∂v
-edge2 = du2 × ∂p/∂u + dv2 × ∂p/∂v
+edge1 = du1 * ∂p/∂u + dv1 * ∂p/∂v
+edge2 = du2 * ∂p/∂u + dv2 * ∂p/∂v
 ```
 
 That is two vector equations for two vector unknowns, the same 2×2 system for each of x, y and
-z. Its determinant is d = du1 × dv2 − du2 × dv1, and the solution is:
+z. Its determinant is d = du1 dv2 − du2 dv1, and the solution is:
 
 ```
-∂p/∂u = (edge1 × dv2 − edge2 × dv1) / d
-∂p/∂v = (edge2 × du1 − edge1 × du2) / d
+∂p/∂u = (edge1 * dv2 − edge2 * dv1) / d
+∂p/∂v = (edge2 * du1 − edge1 * du2) / d
 ```
 
-The determinant is twice the triangle's signed area in uv. When it is zero, the triangle covers
-no area of the texture and there is no ∂p/∂u to find. That happens on the lamp spheres: at each
-pole a whole row of corners sits at one point, so the triangles there have two corners in the
-same place. The code skips them.
+The determinant is twice the triangle's signed area in uv. When it is zero, the triangle's uvs
+lie on one line, it covers no area of the texture, and there is no ∂p/∂u to find. No triangle in
+this scene is like that, but a model from elsewhere can have them, so the code skips them.
 
 The tables of corners stay as 5.4 wrote them, under a new name, and a function turns them into
 the vertices the shader reads:
@@ -222,9 +221,9 @@ the offsets the shader assumes.
         const glm::vec2 duv1 = b.uv - a.uv;
         const glm::vec2 duv2 = c.uv - a.uv;
 
-        // The determinant of the two uv differences. Zero means the triangle covers no
-        // area of the texture -- a sphere's pole, where a whole row of corners sits at
-        // one point -- and there is no dp_du to find.
+        // The determinant of the two uv differences. Zero means the triangle's uvs lie on
+        // one line, so it covers no area of the texture and there is no dp_du to find.
+        // None of this chapter's meshes has such a triangle; a model from elsewhere can.
         const float det = duv1.x * duv2.y - duv2.x * duv1.y;
         if (std::abs(det) < 1e-12F) {
             continue;
@@ -241,9 +240,9 @@ the offsets the shader assumes.
 ```
 
 Each corner sums ∂p/∂u and ∂p/∂v over every triangle that uses it. On a smooth mesh that is an
-average across the corner's neighbours, the same idea 3.1 used for vertex normals. The cube's
-corners each belong to one face, so each of its sums comes from that face's two triangles,
-which agree.
+average across the corner's neighbours, the same idea 3.1 described for vertex normals. The
+cube's corners each belong to one face, so each of its sums comes from one or both of that
+face's two triangles, which agree.
 
 ### Straightening and handedness
 
@@ -299,9 +298,14 @@ Logging every corner's tangent at start-up shows +1 on all six faces of the cube
 floor: the front face has its tangent along +x and cross(n, t) = +y, which is up both in the
 world and in the image.
 
-The sphere goes through the same function, which is why the zero-area triangles at its poles
-had to be skipped. Its pole corners come out with no direction at all, and get an arbitrary one.
-The lamps are never normal mapped, so nothing reads it.
+The lamp spheres go through the same function, and their poles are the one place it has
+nothing to work with. A whole row of corners sits at each pole, at one point but with different
+u, so a triangle with two of its corners there has an edge of zero length, and contributes
+nothing to ∂p/∂u. Most pole corners also belong to a triangle that reaches the next ring and
+get their direction from that. One corner in each pole row has no such triangle, the first at
+the top and the last at the bottom: of the sphere's 561 corners, those 2 come out with no
+direction and take an arbitrary one. The lamps are never
+normal mapped, so nothing reads it.
 
 ```cpp title="code/src/5.advanced_lighting/normal_mapping/main.cpp"
 [[nodiscard]] std::pair<std::vector<Corner>, std::vector<uint16_t>> make_sphere(
@@ -371,15 +375,18 @@ such edges, and a non-uniform scale does not keep it so. That is why the normal 
 the inverse transpose, and why the tangent must not: put the tangent through the normal matrix
 and, under a non-uniform scale, it would leave the surface.
 
-The handedness sign passes through untouched. A model matrix that mirrors the object, with a
-negative determinant as 4.2 found, would flip it; nothing in this scene is mirrored.
+The handedness sign passes through untouched. A model matrix that mirrors the object, one with
+a negative determinant as in 4.2, reverses which way every cross product of transformed vectors
+points, so the bitangent would come out upside down unless w were multiplied by the
+determinant's sign. Nothing in this scene is mirrored, and the shader does not do it.
 
 ## Reading the map
 
 The fragment shader now has three things that vary across the triangle: the normal, the tangent
-and the uv. Interpolation leaves both vectors shorter than one, and leaves the tangent not quite
-perpendicular to the interpolated normal, because the two were interpolated separately.
-Gram-Schmidt in the shader repairs both, exactly as on the CPU:
+and the uv. Wherever the vertices disagree, interpolation leaves both vectors shorter than one,
+and the tangent not quite perpendicular to the interpolated normal, because the two were
+interpolated separately. On the cube's flat faces the vertices agree and nothing goes wrong, but
+the shader cannot know that. Gram-Schmidt repairs both, exactly as on the CPU:
 
 ```slang title="code/src/5.advanced_lighting/normal_mapping/scene.slang"
 float3 shading_normal(VSOutput input, float3 normal) {
@@ -431,8 +438,9 @@ come out dimmer than the flat surface beside it, and dimmer still at a distance,
 mip levels average more.
 
 The result of all this is the **shading normal**, the one the lighting uses. The interpolated
-vertex normal, which says which way the triangle itself faces, is the **geometric normal**. Until
-this chapter they were the same thing. The fragment shader now keeps both:
+vertex normal, which describes the surface the triangles actually form, is the **geometric
+normal**. On these flat faces it is exactly the triangle's own normal. Until this chapter the two
+were the same thing. The fragment shader now keeps both:
 
 ```slang title="code/src/5.advanced_lighting/normal_mapping/scene.slang"
 [shader("fragment")]
@@ -491,14 +499,14 @@ float3 lamp_light(Lamp lamp, float3 world_position, float3 normal, float3 surfac
 ```
 
 The first is 5.1's facing test: is the lamp in front of this surface at all? That is a question
-about the triangle, and it uses the geometric normal. A normal map can lean the shading normal
+about the surface the triangles form, and it uses the geometric normal. A normal map can lean the shading normal
 by 60° or more, so a lamp a little behind a face can be in front of a texel's shading normal,
 and without the test, light would reach the side of a face turned away from it. The second
 question is how much light the surface takes in and reflects towards the eye, and that is the
 shading normal's job: Lambert's cosine and the specular lobe both use it.
 
 The opening view has such a place. Move the facing test onto the shading normal and 1,874 pixels
-change, by up to 109 levels out of 255, nearly all of them in one strip: the right-hand edge of
+change, by up to 109 levels out of 255, most of them in one strip: the right-hand edge of
 the big crate's front face, where the frame's outer bevel leans round the corner towards the
 lamp that lights the side face. The front face itself is turned away from that lamp, and the
 shadow does not remove the strip: these counts are with shadows on.
@@ -514,7 +522,7 @@ bevel on a real corner would catch that lamp, so the strip on the right is what 
 describes would do. But it is light arriving at a surface the lamp is behind, and the rule that
 lets it through has no limit: any texel whose map leans towards a lamp is lit by it, on whatever
 face. The guard gives up the strip to keep lamps off faces they are behind. With shadows switched
-off as well, the two tests differ on 4,365 pixels, spread over more of the crates.
+off as well, the two tests differ on 4,365 pixels, spread across more of the crates' faces.
 
 <figure>
   <img src="/learn_vulkan/img/5.5/normals.png" alt="A close view of a crate face drawn in flat pastel colours instead of shading. The face is a pale salmon colour, the floor behind it pale green, the crate's left face pale violet. The plank gaps are thin magenta lines with yellow edges, the rivets are small domes shaded from yellow at the top to pink at the bottom, and the frame's inner edge is outlined in yellow on the left and pale violet on the right" />
@@ -592,9 +600,10 @@ static const uint kShowNormals = 1u << 2;
 </figure>
 
 A flipped map looks wrong in a particular way: lit from the side as it should be, but lit from
-below when the light is above. Bumps read as dents and dents as bumps, which is the same mistake
-seen two ways. When a map from elsewhere does this, the cure is to negate green, either once in
-the image or every time in the shader, as key 3 does.
+below when the light is above. Only the vertical lean is reversed, so the fault is easiest to see
+on round features like the rivets, whose highlight slides to the wrong half. When a map from
+elsewhere does this, the cure is to negate green, either once in the image or every time in the
+shader, as key 3 does.
 
 ## The descriptors
 
@@ -678,8 +687,9 @@ element, because each of its sets had a single binding:
             .dstArrayElement = element,
 ```
 
-Drawing binds the set for the current way of reading. The shadow pass binds it too: its vertex
-shader reads nothing from set 0, but the bind is shared with the camera pass and costs nothing.
+Drawing binds the set for the current way of reading. The shadow pass binds it too, because
+`draw_geometry` is shared with the camera pass; its vertex shader reads nothing from set 0, and a
+bound set that nothing reads does no harm.
 
 ```cpp title="code/src/5.advanced_lighting/normal_mapping/main.cpp"
     void draw_geometry(VkCommandBuffer cmd, uint32_t face_base) {
@@ -696,8 +706,8 @@ shader reads nothing from set 0, but the bind is shared with the camera pass and
 ## What a normal map cannot do
 
 Look at the edges of the crates. Every outline is still a straight line: the frame's bevel, so
-convincing on the face, does not round the crate's corner, and a rivet on the edge of a face does
-not stick out past it. The outline of an object against what is behind it, its **silhouette**,
+convincing on the face, does not round the crate's corner, and a rivet near the edge of a face
+does not break its outline. The outline of an object against what is behind it, its **silhouette**,
 is drawn by the triangles, and a normal map does not move a single one.
 
 The shadows say the same thing. The shadow pass reads only positions; the rivets cast no
@@ -939,7 +949,7 @@ class NormalMappingApp : public vkc::App {
 | **TBN matrix** | the matrix whose columns are the tangent, the bitangent and the normal, which carries a tangent-space direction into world space |
 | **Gram-Schmidt** | making vectors perpendicular by removing from each its projection onto the ones already fixed |
 | **shading normal** | the normal the lighting uses: here, the normal map's direction carried into the world |
-| **geometric normal** | the normal of the triangle itself, from the vertices; it says which side of the surface a lamp is on |
+| **geometric normal** | the normal the vertices give, describing the surface the triangles actually form; it says which side of that surface a lamp is on |
 | **normal map convention** | which way a normal map's y axis points, up the image or down it; nothing in the file records it |
 | **silhouette** | an object's outline against what is behind it, drawn by its triangles and untouched by a normal map |
 
@@ -948,8 +958,9 @@ class NormalMappingApp : public vkc::App {
 1. Set `NORMAL_STRENGTH` in `tools/make_textures.py` to 6 and regenerate. Where does the
    crate stop looking like relief and start looking like a drawing of relief? Look at the edges
    from a low angle.
-2. Load the normal maps with `vkc::load_texture`'s default format, without changing anything
-   else. Which key now shows the right picture?
+2. Drop the format argument from the UNORM line of `load_pair`, so that it takes
+   `vkc::load_texture`'s default. What does key 2 switch between now? Without key 2 to compare
+   against, what in the picture would tell you the maps were being misread?
 3. Mirror the front face's uvs by swapping u = 0 and u = 1 in its four rows of `kCubeVertices`.
    What does `with_tangents` now give that face as its handedness? Press key 4 and compare the
    rivets with the other faces, then set w to +1 by hand and look again.

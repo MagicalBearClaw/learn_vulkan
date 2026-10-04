@@ -394,9 +394,9 @@ struct Mesh {
         const glm::vec2 duv1 = b.uv - a.uv;
         const glm::vec2 duv2 = c.uv - a.uv;
 
-        // The determinant of the two uv differences. Zero means the triangle covers no
-        // area of the texture -- a sphere's pole, where a whole row of corners sits at
-        // one point -- and there is no dp_du to find.
+        // The determinant of the two uv differences. Zero means the triangle's uvs lie on
+        // one line, so it covers no area of the texture and there is no dp_du to find.
+        // None of this chapter's meshes has such a triangle; a model from elsewhere can.
         const float det = duv1.x * duv2.y - duv2.x * duv1.y;
         if (std::abs(det) < 1e-12F) {
             continue;

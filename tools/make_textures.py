@@ -406,9 +406,9 @@ def ground_texture() -> bytearray:
 # Normal maps, for chapter 5.5
 # ---------------------------------------------------------------------------
 
-# A multiplier on every slope in the normal maps. At 2 the grooves and the sides of the
-# rivets lean 40 to 60 degrees from straight out, and the crate frame's inner bevel, the
-# steepest edge in either map, about 80: enough to read as relief under a lamp.
+# A multiplier on every slope in the normal maps. At 2 the sides of the crate's grooves and
+# rivets lean up to 55-57 degrees from straight out, and the frame's inner bevel, the
+# steepest edge in either map, up to 81: enough to read as relief under a lamp.
 NORMAL_STRENGTH = 2.0
 
 
