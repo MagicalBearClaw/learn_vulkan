@@ -806,10 +806,16 @@ is the only sensible answer.
 matches the scene's layout — the same `Globals`, and set 1 as a `SamplerCube`:
 
 ```slang title="code/src/4.advanced_vulkan/cubemaps/environment.slang"
-struct VSInput {
+// One input struct per vertex shader, each declaring only the attributes its pipeline
+// is given. A shader input with no attribute behind it is as much an error as an
+// attribute no shader reads, and the validation layers report both.
+struct SkyVSInput {
+    [[vk::location(0)]] float3 position;
+};
+
+struct MirrorVSInput {
     [[vk::location(0)]] float3 position;
     [[vk::location(1)]] float3 normal;
-    [[vk::location(2)]] float2 uv;
 };
 
 struct Globals {
@@ -858,7 +864,7 @@ struct SkyVSOutput {
 };
 
 [shader("vertex")]
-SkyVSOutput vertexMain(VSInput input) {
+SkyVSOutput vertexMain(SkyVSInput input) {
     SkyVSOutput output;
 
     // The skybox is a unit cube centred on the origin, so a vertex's own position *is*
@@ -928,7 +934,7 @@ struct MirrorVSOutput {
 };
 
 [shader("vertex")]
-MirrorVSOutput mirrorVertexMain(VSInput input) {
+MirrorVSOutput mirrorVertexMain(MirrorVSInput input) {
     MirrorVSOutput output;
     float4 world = mul(push.model, float4(input.position, 1.0));
     output.world_position = world.xyz;
@@ -1370,6 +1376,14 @@ location 1 not consumed by vertex shader.
 vkCreateGraphicsPipelines(): pCreateInfos[0].pVertexInputState Vertex attribute at
 location 2 not consumed by vertex shader.
 ```
+
+The rule runs the other way too, which is why each shader has its own input struct rather
+than sharing one. Keep a single three-attribute `VSInput` for both, and the sky's shader
+still declares inputs at locations 1 and 2 although it never reads them. A pipeline that
+supplies only location 0 then has shader inputs with nothing behind them, and the
+validation layers report each one as an error: `pVertexAttributeDescriptions does not have
+a Location 1, but [EntryPoint "vertexMain", VK_SHADER_STAGE_VERTEX_BIT] has [Input variable,
+Location 1, "input.normal"] at that Location`.
 
 The layout is 4.3's with the texture set layout's new name, and the shared opening takes the
 module and the attributes:

@@ -320,10 +320,10 @@ private:
         // with the module and linking is what produces one SPIR-V binary holding the
         // whole pipeline -- both stages, one module.
         std::vector<slang::IComponentType*> components{module};
-        const SlangInt entry_point_count = module->getDefinedEntryPointCount();
+        const SlangInt32 entry_point_count = module->getDefinedEntryPointCount();
         std::vector<Slang::ComPtr<slang::IEntryPoint>> entry_points(
             static_cast<size_t>(entry_point_count));
-        for (SlangInt i = 0; i < entry_point_count; ++i) {
+        for (SlangInt32 i = 0; i < entry_point_count; ++i) {
             const auto index = static_cast<size_t>(i);
             if (SLANG_FAILED(
                     module->getDefinedEntryPoint(i, entry_points[index].writeRef()))) {

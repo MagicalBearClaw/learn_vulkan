@@ -167,7 +167,9 @@ def main() -> int:
     failures = []
 
     for binary in binaries:
-        name = binary.name
+        # Not binary.stem: a chapter id is full of dots, and on Linux there is no suffix
+        # to strip, so stem would cut "1.7.hello_triangle" down to "1.7".
+        name = binary.name.removesuffix(".exe")
         destination = (REFERENCE_DIR if args.update else out_dir) / f"{name}.png"
 
         print(f"{name}: rendering {CAPTURE_FRAME} frames")

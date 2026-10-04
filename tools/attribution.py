@@ -148,10 +148,10 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.cmake:
-        targets = [(str(p.relative_to(CODE)), p)
+        targets = [(p.relative_to(CODE).as_posix(), p)
                    for p in sorted((CODE / "1.getting_started").glob("*/CMakeLists.txt"))]
     else:
-        targets = [(str(p.relative_to(COMMON)), p)
+        targets = [(p.relative_to(COMMON).as_posix(), p)
                    for p in sorted(COMMON.rglob("*.hpp")) + sorted(COMMON.rglob("*.cpp"))]
 
     everything = shown_lines(sorted(GETTING_STARTED.glob("*.mdx")))

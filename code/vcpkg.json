@@ -16,8 +16,14 @@
       "default-features": false,
       "features": [
         "vulkan",
-        "wayland",
-        "x11"
+        {
+          "name": "wayland",
+          "platform": "linux"
+        },
+        {
+          "name": "x11",
+          "platform": "linux"
+        }
       ]
     },
     "shader-slang",

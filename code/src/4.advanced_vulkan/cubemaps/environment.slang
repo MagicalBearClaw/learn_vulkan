@@ -7,10 +7,16 @@
 // the camera to the vertex; the sphere looks up the direction the world reflects into.
 // That is the whole idea of the chapter, and both halves of it are below.
 
-struct VSInput {
+// One input struct per vertex shader, each declaring only the attributes its pipeline
+// is given. A shader input with no attribute behind it is as much an error as an
+// attribute no shader reads, and the validation layers report both.
+struct SkyVSInput {
+    [[vk::location(0)]] float3 position;
+};
+
+struct MirrorVSInput {
     [[vk::location(0)]] float3 position;
     [[vk::location(1)]] float3 normal;
-    [[vk::location(2)]] float2 uv;
 };
 
 struct Globals {
@@ -57,7 +63,7 @@ struct SkyVSOutput {
 };
 
 [shader("vertex")]
-SkyVSOutput vertexMain(VSInput input) {
+SkyVSOutput vertexMain(SkyVSInput input) {
     SkyVSOutput output;
 
     // The skybox is a unit cube centred on the origin, so a vertex's own position *is*
@@ -100,7 +106,7 @@ struct MirrorVSOutput {
 };
 
 [shader("vertex")]
-MirrorVSOutput mirrorVertexMain(VSInput input) {
+MirrorVSOutput mirrorVertexMain(MirrorVSInput input) {
     MirrorVSOutput output;
     float4 world = mul(push.model, float4(input.position, 1.0));
     output.world_position = world.xyz;

@@ -132,10 +132,10 @@ VkShaderModule load_shader(VkDevice device, std::string_view chapter_id,
     // module. Composing them with the module itself and linking is what produces one
     // binary holding the whole pipeline.
     std::vector<slang::IComponentType*> components{module};
-    const SlangInt entry_point_count = module->getDefinedEntryPointCount();
+    const SlangInt32 entry_point_count = module->getDefinedEntryPointCount();
     std::vector<Slang::ComPtr<slang::IEntryPoint>> entry_points(
         static_cast<size_t>(entry_point_count));
-    for (SlangInt i = 0; i < entry_point_count; ++i) {
+    for (SlangInt32 i = 0; i < entry_point_count; ++i) {
         const size_t index = static_cast<size_t>(i);
         if (SLANG_FAILED(
                 module->getDefinedEntryPoint(i, entry_points[index].writeRef()))) {
