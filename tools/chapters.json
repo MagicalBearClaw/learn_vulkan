@@ -226,6 +226,12 @@
       "sample": "5.advanced_lighting/point_shadows",
       "previous": "5.advanced_lighting/shadow_mapping",
       "article": "advanced-lighting/point-shadows.mdx"
+    },
+    {
+      "id": "5.5.normal_mapping",
+      "sample": "5.advanced_lighting/normal_mapping",
+      "previous": "5.advanced_lighting/point_shadows",
+      "article": "advanced-lighting/normal-mapping.mdx"
     }
   ]
 }

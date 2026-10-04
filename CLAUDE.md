@@ -110,9 +110,17 @@ cd site && npx astro build < /dev/null
   output that a distro's version bump can invalidate, so the library set has to be
   pinned. A missing library is a vcpkg error, not something CMake works around.
 - **Two presets on each platform.** `linux-debug` / `linux-release` and
-  `x64-debug` / `x64-release`. All of them build **all 38 chapters**, Part 3 included.
+  `x64-debug` / `x64-release`. All of them build **all 39 chapters**, Part 3 included.
   Verified by building every chapter warning-free and running `tools/capture.py --all`
-  against the build tree: every chapter renders 0.00% different.
+  against the build tree: every chapter renders 0.00% different. Chapters up to 5.4 were
+  verified that way on Linux; all 39 on Windows with `x64-debug` (MSVC, Vulkan SDK
+  1.4.363), which caught two things the Linux runs had not: MSVC's narrowing warning on
+  Slang's 32-bit entry-point index, and 4.4's shader inputs with no vertex attribute
+  behind them. 5.5 has not been built with clang yet.
+- **Windows notes.** SDL3's `wayland` and `x11` features are marked `"platform": "linux"`
+  in `vcpkg.json`; vcpkg refuses them on Windows. The Python tools read the articles as
+  UTF-8, so on Windows run them with `PYTHONUTF8=1`, or they fail on the first non-ASCII
+  character.
 - **Part 3 is no longer gated.** Assimp was once optional, because it is large and slow
   to compile and the system-packages mode could not be relied on to have it; vcpkg builds
   it once and caches it, so `code/src/CMakeLists.txt` now adds the model-loading chapters

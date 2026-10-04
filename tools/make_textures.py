@@ -403,6 +403,140 @@ def ground_texture() -> bytearray:
 
 
 # ---------------------------------------------------------------------------
+# Normal maps, for chapter 5.5
+# ---------------------------------------------------------------------------
+
+# A multiplier on every slope in the normal maps. At 2 the grooves and the sides of the
+# rivets lean 40 to 60 degrees from straight out, and the crate frame's inner bevel, the
+# steepest edge in either map, about 80: enough to read as relief under a lamp.
+NORMAL_STRENGTH = 2.0
+
+
+def ramp(distance: float, width: float) -> float:
+    """0 at an edge, rising smoothly to 1 at `width` texels inside it.
+
+    A height field with hard steps has slopes only on the one texel where the step is,
+    which a normal map turns into a one-texel line that aliases under every filter. A
+    ramp a few texels wide gives the slope room to be filtered.
+    """
+
+    return smoothstep(0.0, width, distance)
+
+
+def crate_height(x: float, y: float) -> float:
+    """The crate's surface as a height field, 0 to 1.35, shaped by the same regions as
+    crate_diffuse(): the steel frame stands proud of the planks, the rivets are domes on
+    the frame, and the gaps between planks are grooves.
+
+    Coordinates are continuous texel positions, so the normal map can take differences
+    at sub-texel spacing.
+    """
+
+    # Rivets first: a spherical cap on top of the frame.
+    for cx in (FRAME / 2, SIZE / 2, SIZE - FRAME / 2):
+        for cy in (FRAME / 2, SIZE / 2, SIZE - FRAME / 2):
+            if cx == SIZE / 2 and cy == SIZE / 2:
+                continue
+            r2 = (x - cx) ** 2 + (y - cy) ** 2
+            if r2 <= RIVET_RADIUS**2:
+                return 1.0 + 0.35 * math.sqrt(1.0 - r2 / RIVET_RADIUS**2)
+
+    # Distance from the frame's inner edge, positive inside the planks' area.
+    inside = min(x - FRAME, y - FRAME, SIZE - FRAME - x, SIZE - FRAME - y)
+    if inside <= 0.0:
+        # The frame: a flat bar with a bevel down its outer edge, where the crate's
+        # faces meet.
+        outer = min(x, y, SIZE - x, SIZE - y)
+        return 0.75 + 0.25 * ramp(outer, 4.0)
+
+    # The planks, falling away from the frame's inner edge down a three-texel bevel.
+    plank_top = 0.30 + 0.70 * (1.0 - ramp(inside, 3.0))
+
+    # Grooves between planks: down to nothing over three texels either side of each gap.
+    inner = SIZE - 2 * FRAME
+    plank_height = inner / PLANKS
+    along = (y - FRAME) % plank_height
+    to_gap = min(along, plank_height - along)
+    groove = ramp(to_gap, 3.0)
+
+    # No grain. The diffuse map's grain bands step every 24 texels, which reads as wood
+    # in colour and as a row of seams in relief: the planks are planed flat instead.
+    return plank_top * groove
+
+
+def ground_height(x: float, y: float) -> float:
+    """The floor as a height field: flagstones, with sunken joints between them and a
+    slight unevenness across each stone. The joints line up with ground_texture()'s."""
+
+    stone = 128
+    joint = 4.0
+    # Distance to the nearest joint centre line, in texels.
+    to_x = abs(((x + stone / 2 - joint / 2) % stone) - stone / 2)
+    to_y = abs(((y + stone / 2 - joint / 2) % stone) - stone / 2)
+    edge = min(to_x, to_y) - joint / 2
+    sunk = ramp(edge, 3.0)
+
+    # A gentle bump per stone, centred on it, so each stone catches the light a little
+    # differently from its neighbours.
+    sx, sy = int(x // stone), int(y // stone)
+    lean_x = hash_noise(sx, sy, 71) - 0.5
+    lean_y = hash_noise(sx, sy, 73) - 0.5
+    u = (x % stone) / stone - 0.5
+    v = (y % stone) / stone - 0.5
+    tilt = 0.04 * (lean_x * u + lean_y * v)
+
+    return (0.6 + tilt) * sunk
+
+
+def normal_map(height, scale: float, wrap: bool) -> bytearray:
+    """Turn a height field into a tangent-space normal map.
+
+    The surface z = scale * h(x, y) has the normal (-dh/dx, -dh/dy, 1) before
+    normalising. Both derivatives are central differences one texel apart.
+
+    The convention is glTF's: x is the direction of increasing u, y points *up* the
+    image -- towards decreasing v, because the image's first row is v = 0 -- and z points
+    out of the surface. So the y derivative is taken upwards, which is minus the row
+    direction.
+    """
+
+    pixels = bytearray(SIZE * SIZE * 4)
+    for row in range(SIZE):
+        for col in range(SIZE):
+            x = col + 0.5
+            y = row + 0.5
+
+            def h(px: float, py: float) -> float:
+                if wrap:
+                    px %= SIZE
+                    py %= SIZE
+                else:
+                    px = min(max(px, 0.0), SIZE - 1e-3)
+                    py = min(max(py, 0.0), SIZE - 1e-3)
+                return scale * height(px, py)
+
+            dh_dx = (h(x + 1.0, y) - h(x - 1.0, y)) / 2.0
+            dh_dup = (h(x, y - 1.0) - h(x, y + 1.0)) / 2.0
+
+            nx, ny, nz = normalise(-dh_dx, -dh_dup, 1.0)
+            encode = lambda c: int(round((c * 0.5 + 0.5) * 255.0))
+            offset = (row * SIZE + col) * 4
+            pixels[offset : offset + 4] = bytes((encode(nx), encode(ny), encode(nz), 255))
+    return pixels
+
+
+def crate_normal() -> bytearray:
+    # The heights are 0..1.35 and the features a few texels wide, so a scale in texels
+    # of the same order turns them into slopes of a sensible steepness.
+    return normal_map(crate_height, 6.0 * NORMAL_STRENGTH, wrap=False)
+
+
+def ground_normal() -> bytearray:
+    # The floor tiles, so its differences wrap round the edges of the image.
+    return normal_map(ground_height, 4.0 * NORMAL_STRENGTH, wrap=True)
+
+
+# ---------------------------------------------------------------------------
 # The sky cubemap, for chapter 4.4
 # ---------------------------------------------------------------------------
 
@@ -604,6 +738,8 @@ def main() -> int:
         ("lvk_crate_specular.png", crate_specular()),
         ("lvk_foliage.png", foliage_texture()),
         ("lvk_ground.png", ground_texture()),
+        ("lvk_crate_normal.png", crate_normal()),
+        ("lvk_ground_normal.png", ground_normal()),
     ):
         target = OUT_DIR / name
         write_png(target, SIZE, SIZE, pixels)

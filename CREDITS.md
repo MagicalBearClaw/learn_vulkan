@@ -29,6 +29,8 @@ committed so that a fresh clone can run the texture chapters without fetching an
 | `assets/textures/lvk_crate_specular.png` | 2.4 | The matching specular map: bright steel, near-black wood |
 | `assets/textures/lvk_foliage.png` | 4.2 | Fern cutout: an intricate alpha silhouette, with leaf colour bled into every transparent texel |
 | `assets/textures/lvk_ground.png` | 4.2 | Flagstone ground: deliberately low-contrast, for scenes where the floor is not the subject |
+| `assets/textures/lvk_crate_normal.png` | 5.5 | The crate's normal map: the steel frame raised, the rivets domed, the gaps between planks grooved. Computed from a height field shaped by the same regions as the diffuse map, in glTF's convention (+Y up the image) |
+| `assets/textures/lvk_ground_normal.png` | 5.5 | The flagstones' normal map: sunken joints aligned with `lvk_ground.png`'s, and a slight lean per stone |
 | `assets/textures/lvk_sky_{px,nx,py,ny,pz,nz}.png` | 4.4 | The six faces of a sky cubemap, in Vulkan's face order. Not drawn as six pictures but evaluated from one function of direction, so the faces agree along their twelve shared edges by construction |
 
 Regenerate them with:

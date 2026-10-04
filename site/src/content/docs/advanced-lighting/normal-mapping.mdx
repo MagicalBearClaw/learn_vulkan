@@ -1,0 +1,967 @@
+---
+title: "Normal mapping"
+description: A normal per texel instead of per vertex. Drawing a normal map from a height field, the tangent and its handedness worked out from the uvs, the basis that carries a texel's direction into the world, why the map must be read as UNORM, which way its green channel points, and what a normal map cannot change.
+sidebar:
+  order: 5
+---
+
+<figure>
+  <img src="/learn_vulkan/img/reference/5.5.normal_mapping.png" alt="Two wooden crates with steel frames, one stacked on the other, on a tiled floor at night, lit by a small pale blue lamp to the right. The planks have visible grooves between them, the rivets on the frames are round and lit on the side towards the lamp, and the joints between the floor tiles catch the light along one edge" />
+  <figcaption>Chapter 5.5. The same twelve triangles per crate as in 5.4. The grooves, the rivets and the
+  bevels are all in a texture.</figcaption>
+</figure>
+
+5.4's crates are cubes with a picture of a crate on each face. Under a lamp the picture gives
+them away: light falls on a plank and on the gap beside it in exactly the same way, because as
+far as the lighting knows, both are the same flat square. A rivet painted in light grey is lit
+as flat as the steel around it.
+
+Modelling the detail would fix that, at a price. A rivet that catches the light as a dome needs
+a dome, and a dome that looks round up close needs a few hundred triangles. Each crate face
+has eight rivets, four grooves and a bevelled frame, so the twelve triangles of a crate would
+become tens of thousands, and the shadow pass would draw every one of them eighteen times.
+
+The lighting does not need any of that geometry. Every lighting calculation since 2.2 has used
+the position for distances and for the directions to the lamp and to the eye; what decides how
+a surface turns towards them is the **normal**. The eye judges shape almost entirely from how brightness changes
+across a surface. Give each texel of a face its own normal, and the face is lit as if it had
+the shape those normals describe, while staying two triangles.
+
+This chapter gives the crates and the floor a texture of normals each. The keys:
+
+- <kbd>1</kbd> normal maps on or off
+- <kbd>2</kbd> read the normal maps as UNORM, or wrongly as SRGB
+- <kbd>3</kbd> read the green channel as stored, or flipped
+- <kbd>4</kbd> show the normals as colours
+- <kbd>5</kbd> set the lamps moving
+
+```
+[info] 1 normal maps, 2 UNORM or SRGB, 3 flip green, 4 show normals, 5 move the lamps.
+[info] normal maps on, read as UNORM, green as stored
+```
+
+The room is 5.4's, shadows and all. The camera starts closer, beside the stacked crates,
+because the detail is small.
+
+<figure>
+  <img src="/learn_vulkan/img/5.5/on-off.png" alt="The same crate face twice, side by side, lit by a warm lamp. Left: the planks, the gaps and the rivets are flat colour, and the light falls evenly across them. Right: each gap is a groove with a bright edge below it and a dark edge above, the rivets are lit domes with a highlight, and the frame has a bevel along its inner edge" />
+  <figcaption>Left: normal maps off, key 1. Right: on. The geometry is the same.</figcaption>
+</figure>
+
+## A direction per texel
+
+A **normal map** is a texture whose texels are directions. A direction is three numbers
+between −1 and 1, and an RGBA8 texel holds four numbers between 0 and 255, so each component c
+is stored as the byte nearest to (c × 0.5 + 0.5) × 255. Reading it back is the reverse: the
+shader is handed byte / 255, and doubles it and subtracts one.
+
+The direction a normal map stores is not a world-space direction. The crate's map is drawn
+once and used on all six faces of every crate, each facing a different way, and on crates
+rotated by different angles. A world-space normal per texel would be right for one face of one
+crate. What the map stores instead is the normal relative to the surface it is painted on:
+how far it leans from straight out, and in which direction across the texture. The frame those
+directions are measured in is the surface's **tangent space**:
+
+- x points across the image, the direction in which u increases
+- y points up the image
+- z points straight out of the surface
+
+A flat patch of surface has the normal (0, 0, 1) in this frame: no lean either way, and all of
+it outwards. That stores as about (128, 128, 255), which is a pale violet blue. A normal map is
+blue wherever the surface is flat, and every other colour in it is a lean. Red above 128 leans
+towards +x, green above 128 leans up the image.
+
+Up the image deserves care, because in Vulkan v runs the other way. Since 1.11 the first row
+of an image has been v = 0 and v grows down the image, so "up the image" is the direction of
+decreasing v. The choice of y as up is not this series' to make freely: a normal map is drawn
+by one program and read by another, and the two have to agree. This series uses the same
+convention as glTF, whose specification puts +X to the right, +Y up and +Z towards the viewer.
+Many tools can also write the opposite, with y pointing down the image; key 3 shows what
+reading such a map with the wrong assumption looks like. Which way y points is the map's
+**normal map convention**, and it is not recorded anywhere in the file.
+
+## Drawing the map
+
+The two maps, `lvk_crate_normal.png` and `lvk_ground_normal.png`, are drawn by
+`tools/make_textures.py` like every other texture in the series, and they are drawn the way
+normal maps usually are: from a shape.
+
+A **height field** is a surface given as a height above each point of a plane, z = h(x, y). The
+crate's height field follows the same regions its diffuse map was painted from: the steel frame
+stands at the top, the rivets rise from it as caps of a sphere, the planks sit lower with a
+three-texel slope down from the frame's inner edge, and each gap between planks is a groove,
+sloping to nothing over three texels on either side. The edges are slopes, not steps, because a
+step has all of its slope in one texel, which becomes a line one texel wide in the normal map
+and flickers under every filter.
+
+The normal of a height field follows from its two slopes. Move one unit along x and the surface
+rises by ∂h/∂x, so the vector (1, 0, ∂h/∂x) lies in the surface; so does (0, 1, ∂h/∂y). Their
+cross product is perpendicular to both:
+
+```
+(1, 0, ∂h/∂x) × (0, 1, ∂h/∂y) = (−∂h/∂x, −∂h/∂y, 1)
+```
+
+Normalised, that is the normal. The slopes come from a **central difference**: the height one
+texel ahead minus the height one texel behind, over the two texels between them. It is centred
+on the texel it is for, which a one-sided difference is not, and that keeps every feature where
+the height field put it instead of half a texel to one side.
+
+```python title="tools/make_textures.py"
+            dh_dx = (h(x + 1.0, y) - h(x - 1.0, y)) / 2.0
+            dh_dup = (h(x, y - 1.0) - h(x, y + 1.0)) / 2.0
+
+            nx, ny, nz = normalise(-dh_dx, -dh_dup, 1.0)
+```
+
+`dh_dup` is the slope *up* the image, the height one row above minus one row below, because y
+in the map points up and the rows count down. The function scales the heights before taking
+differences; the scale sets how steep every edge is. In the crate's map the grooves and the
+sides of the rivets lean 40° to 60° from straight out, and the frame's inner bevel, the steepest
+edge, about 80°.
+
+Reading back a few texels confirms the convention. A flat plank stores (128, 128, 255). The
+rivet centred on texel (28, 28) stores (131, 171, 247) six texels above its centre, where its
+surface faces up the image, and (132, 70, 241) six texels below. Six texels to its right it
+stores (185, 123, 241), and six to its left (84, 124, 247). Up is green above 128 and right is
+red above 128.
+
+The 128 is worth a second look. Zero would be stored exactly by 127.5, which a byte cannot
+hold, so the flat normal is stored as 128 and read back as 2 × 128 / 255 − 1 = 0.0039 instead of
+0. A flat texel leans by 0.32°, which no one will see.
+
+## A tangent at every corner
+
+To use a direction measured in tangent space, the shader has to know, at each point, which
+world direction each axis of that frame points in. z is easy: it is the normal the vertices
+already carry. x and y are the surface directions in which the texture's u and v change, and
+those depend on how the texture was laid onto the triangles. Nothing in 5.4's vertices says,
+so this chapter works it out.
+
+The **tangent** is the direction along the surface in which u increases. The **bitangent** is
+the third axis, along the surface and perpendicular to the tangent; this series points it up
+the image, towards decreasing v. Tangent, bitangent and normal together are the axes of tangent
+space at a point.
+
+### Solving for them
+
+Across one triangle, position is a linear function of uv. Moving du along u and dv along v moves
+the point by du × ∂p/∂u + dv × ∂p/∂v, where ∂p/∂u and ∂p/∂v are two unknown vectors, the same
+everywhere on the triangle. Each edge of the triangle is a move whose uv difference is known.
+For the edges from corner a to b and from a to c:
+
+```
+edge1 = du1 × ∂p/∂u + dv1 × ∂p/∂v
+edge2 = du2 × ∂p/∂u + dv2 × ∂p/∂v
+```
+
+That is two vector equations for two vector unknowns, the same 2×2 system for each of x, y and
+z. Its determinant is d = du1 × dv2 − du2 × dv1, and the solution is:
+
+```
+∂p/∂u = (edge1 × dv2 − edge2 × dv1) / d
+∂p/∂v = (edge2 × du1 − edge1 × du2) / d
+```
+
+The determinant is twice the triangle's signed area in uv. When it is zero, the triangle covers
+no area of the texture and there is no ∂p/∂u to find. That happens on the lamp spheres: at each
+pole a whole row of corners sits at one point, so the triangles there have two corners in the
+same place. The code skips them.
+
+The tables of corners stay as 5.4 wrote them, under a new name, and a function turns them into
+the vertices the shader reads:
+
+```cpp title="code/src/5.advanced_lighting/normal_mapping/main.cpp"
+// A corner of a face as the tables below write it: 5.4's vertex under a new name. The
+// tables stay as they were, and the tangent is worked out from them rather than typed in.
+struct Corner {
+    glm::vec3 position;
+    glm::vec3 normal;
+    glm::vec2 uv;
+};
+
+// What the shader reads: a corner with a tangent. xyz is the direction of increasing u,
+// along the surface; w is +1 or -1, saying whether the bitangent -- up the image -- is
+// cross(normal, tangent) or its opposite.
+struct Vertex {
+    glm::vec3 position;  // 0
+    glm::vec3 normal;    // 12
+    glm::vec2 uv;        // 24
+    glm::vec4 tangent;   // 32
+};
+static_assert(offsetof(Vertex, tangent) == 32);
+static_assert(sizeof(Vertex) == 48);
+
+// 2.4's cube, which is the crates.
+constexpr float kH = 0.5F;
+constexpr std::array<Corner, 24> kCubeVertices{{
+```
+
+```cpp title="code/src/5.advanced_lighting/normal_mapping/main.cpp"
+constexpr std::array<Corner, 4> kFloorVertices{{
+```
+
+The vertex grows from 32 bytes to 48. It is read through a pointer, as in every chapter since
+4.5, so the shader's `struct Vertex` and this one must agree byte for byte, and the asserts pin
+the offsets the shader assumes.
+
+```cpp title="code/src/5.advanced_lighting/normal_mapping/main.cpp"
+[[nodiscard]] std::vector<Vertex> with_tangents(std::span<const Corner> corners,
+                                                std::span<const uint16_t> indices) {
+    std::vector<glm::vec3> along_u(corners.size(), glm::vec3(0.0F));
+    std::vector<glm::vec3> along_v(corners.size(), glm::vec3(0.0F));
+
+    for (size_t i = 0; i + 2 < indices.size(); i += 3) {
+        const std::array<uint16_t, 3> ids{indices[i], indices[i + 1], indices[i + 2]};
+        const Corner& a = corners[ids[0]];
+        const Corner& b = corners[ids[1]];
+        const Corner& c = corners[ids[2]];
+
+        const glm::vec3 edge1 = b.position - a.position;
+        const glm::vec3 edge2 = c.position - a.position;
+        const glm::vec2 duv1 = b.uv - a.uv;
+        const glm::vec2 duv2 = c.uv - a.uv;
+
+        // The determinant of the two uv differences. Zero means the triangle covers no
+        // area of the texture -- a sphere's pole, where a whole row of corners sits at
+        // one point -- and there is no dp_du to find.
+        const float det = duv1.x * duv2.y - duv2.x * duv1.y;
+        if (std::abs(det) < 1e-12F) {
+            continue;
+        }
+        const float r = 1.0F / det;
+        const glm::vec3 dp_du = (edge1 * duv2.y - edge2 * duv1.y) * r;
+        const glm::vec3 dp_dv = (edge2 * duv1.x - edge1 * duv2.x) * r;
+
+        for (const uint16_t id : ids) {
+            along_u[id] += dp_du;
+            along_v[id] += dp_dv;
+        }
+    }
+```
+
+Each corner sums ∂p/∂u and ∂p/∂v over every triangle that uses it. On a smooth mesh that is an
+average across the corner's neighbours, the same idea 3.1 used for vertex normals. The cube's
+corners each belong to one face, so each of its sums comes from that face's two triangles,
+which agree.
+
+### Straightening and handedness
+
+A sum of ∂p/∂u vectors is along the surface in the average, but not exactly perpendicular to
+the corner's normal, which was averaged separately. Taking away its component along the normal,
+then normalising, leaves a unit vector that is perpendicular to the normal. That is
+**Gram-Schmidt**: making a set of vectors perpendicular by removing from each its projection
+onto the ones already fixed. Here there are only two, and one step does it.
+
+```cpp title="code/src/5.advanced_lighting/normal_mapping/main.cpp"
+    std::vector<Vertex> vertices;
+    vertices.reserve(corners.size());
+    for (size_t i = 0; i < corners.size(); ++i) {
+        const Corner& corner = corners[i];
+        const glm::vec3 n = corner.normal;
+
+        glm::vec3 t = along_u[i] - n * glm::dot(n, along_u[i]);
+        if (glm::length(t) < 1e-6F) {
+            // No triangle gave this corner a direction. Any direction along the surface
+            // will do, because nothing that reaches here is normal mapped.
+            const glm::vec3 other =
+                std::abs(n.x) < 0.9F ? glm::vec3(1, 0, 0) : glm::vec3(0, 1, 0);
+            t = glm::cross(n, other);
+        }
+        t = glm::normalize(t);
+
+        // The image's first row is v = 0, so up the image is towards decreasing v.
+        const glm::vec3 up = -along_v[i];
+        const float handedness = glm::dot(glm::cross(n, t), up) < 0.0F ? -1.0F : 1.0F;
+
+        vertices.push_back(Vertex{
+            .position = corner.position,
+            .normal = n,
+            .uv = corner.uv,
+            .tangent = glm::vec4(t, handedness),
+        });
+    }
+    return vertices;
+}
+```
+
+The bitangent is not stored. Once the normal and the tangent are fixed, a unit vector
+perpendicular to both can point only one of two ways: cross(n, t), or the opposite. Which one is
+up the image depends on how the texture was laid down, and the fourth component of the
+tangent records it as +1 or −1. That sign is the frame's **handedness**: whether x, y and z, in
+that order, turn the way the right-hand rule from 1.14 says, or the mirror way.
+
+It is −1 where the texture was laid on back to front. Modellers often do that on purpose: a
+symmetric object, like the two halves of a face, can use one half of the texture for both sides
+by mirroring the uvs of one side, which halves the texture. Those are **mirrored UVs**, and on
+the mirrored side the image's up is the other perpendicular. Nothing in this scene is mirrored.
+Logging every corner's tangent at start-up shows +1 on all six faces of the cube and on the
+floor: the front face has its tangent along +x and cross(n, t) = +y, which is up both in the
+world and in the image.
+
+The sphere goes through the same function, which is why the zero-area triangles at its poles
+had to be skipped. Its pole corners come out with no direction at all, and get an arbitrary one.
+The lamps are never normal mapped, so nothing reads it.
+
+```cpp title="code/src/5.advanced_lighting/normal_mapping/main.cpp"
+[[nodiscard]] std::pair<std::vector<Corner>, std::vector<uint16_t>> make_sphere(
+    uint32_t rings, uint32_t segments, float radius) {
+    std::vector<Corner> vertices;
+```
+
+```cpp title="code/src/5.advanced_lighting/normal_mapping/main.cpp"
+        cube_ = upload_mesh(context(), with_tangents(kCubeVertices, kCubeIndices),
+                            kCubeIndices);
+        floor_ = upload_mesh(context(), with_tangents(kFloorVertices, kFloorIndices),
+                             kFloorIndices);
+
+        const auto [sphere_corners, sphere_indices] = make_sphere(16, 32, kLampRadius);
+        lamp_ = upload_mesh(context(), with_tangents(sphere_corners, sphere_indices),
+                            sphere_indices);
+```
+
+A model loader would do this for you: Assimp has a post-processing pass that computes tangents
+and bitangents, and a glTF file can carry tangents with exactly this layout, xyz and a sign in
+w. Part 3's helmets did not use them, because nothing in Part 3 was normal mapped.
+
+## Into the world
+
+The shader's vertex gains the same field:
+
+```slang title="code/src/5.advanced_lighting/normal_mapping/scene.slang"
+// 5.4's vertex, with a tangent: the direction of increasing u along the surface, and in
+// w, which way the bitangent points.
+struct Vertex {
+    float3 position;
+    float3 normal;
+    float2 uv;
+    float4 tangent;
+};
+```
+
+The vertex shader moves the tangent into world space and hands it to the fragment shader, in a
+fourth location:
+
+```slang title="code/src/5.advanced_lighting/normal_mapping/scene.slang"
+struct VSOutput {
+    float4 position : SV_Position;
+    [[vk::location(0)]] float3 world_position;
+    [[vk::location(1)]] float3 normal;
+    [[vk::location(2)]] float2 uv;
+    [[vk::location(3)]] float4 tangent;
+};
+```
+
+```slang title="code/src/5.advanced_lighting/normal_mapping/scene.slang"
+    output.normal = mul(draw.normal_matrix, vertex.normal);
+    output.uv = vertex.uv;
+    // The tangent lies along the surface, so it moves with the model matrix, as an edge
+    // of a triangle would. w = 0 because it is a direction: no translation. The normal
+    // matrix is only for the normal, which is perpendicular to the surface.
+    output.tangent = float4(mul(draw.model, float4(vertex.tangent.xyz, 0.0)).xyz,
+                            vertex.tangent.w);
+```
+
+The tangent and the normal go through different matrices, and the difference is the one 2.2
+drew for the normal matrix. A tangent is a direction *within* the surface: the difference
+between two nearby points on it. Whatever the model matrix does to the points, it does to their
+difference, so the tangent transforms like an edge, by the model matrix, with w = 0 so that the
+translation drops out. The normal is the one direction that has to stay perpendicular to all
+such edges, and a non-uniform scale does not keep it so. That is why the normal goes through
+the inverse transpose, and why the tangent must not: put the tangent through the normal matrix
+and, under a non-uniform scale, it would leave the surface.
+
+The handedness sign passes through untouched. A model matrix that mirrors the object, with a
+negative determinant as 4.2 found, would flip it; nothing in this scene is mirrored.
+
+## Reading the map
+
+The fragment shader now has three things that vary across the triangle: the normal, the tangent
+and the uv. Interpolation leaves both vectors shorter than one, and leaves the tangent not quite
+perpendicular to the interpolated normal, because the two were interpolated separately.
+Gram-Schmidt in the shader repairs both, exactly as on the CPU:
+
+```slang title="code/src/5.advanced_lighting/normal_mapping/scene.slang"
+float3 shading_normal(VSOutput input, float3 normal) {
+    uint flags = push.globals.flags;
+    if ((flags & kNormalMapsOn) == 0) {
+        return normal;
+    }
+
+    // Interpolation leaves the tangent neither unit length nor quite perpendicular to
+    // the interpolated normal. Removing its component along the normal, then
+    // normalising, restores both: Gram-Schmidt, one step of it.
+    float3 tangent = input.tangent.xyz;
+    tangent = normalize(tangent - normal * dot(normal, tangent));
+    // The third axis, up the image. w says whether up the image is this cross product or
+    // its opposite; main.cpp worked out which, from the uvs.
+    float3 bitangent = cross(normal, tangent) * input.tangent.w;
+
+    // Each channel was stored as c * 0.5 + 0.5, to fit -1..1 into a UNORM's 0..1.
+    float3 local = normal_map.Sample(input.uv).xyz * 2.0 - 1.0;
+    if ((flags & kFlipGreen) != 0) {
+        local.y = -local.y;
+    }
+
+    // The three columns of the basis, weighted by the three components: the matrix
+    // whose columns are T, B and N, times the vector. Filtering and mipmapping average
+    // texels, and an average of unit vectors is shorter than one, so it is normalised.
+    return normalize(tangent * local.x + bitangent * local.y + normal * local.z);
+}
+```
+
+The last line is a matrix product written out. The matrix whose columns are the tangent, the
+bitangent and the normal, all in world space, is the **TBN matrix**. A direction with components
+(x, y, z) in tangent space is x of the first axis, y of the second and z of the third, which is
+the TBN matrix times (x, y, z), and that is what the line computes, a column at a time. 1.12
+called this reading a matrix as its columns: the columns are where the frame's axes end up.
+
+Its columns are perpendicular unit vectors, so its inverse is its transpose. That allows the
+opposite arrangement, which is common: carry the lamp and eye directions *into* tangent space
+with the transpose, once per vertex, and compare them with the map's normal as it stands. It
+pays when one direction per lamp can be computed at the vertices and interpolated. Here each
+fragment computes its own direction to each of three lamps anyway, and the shadow lookups need
+world-space positions, so the shader carries the one normal out instead.
+
+The normalisation at the end is not tidiness. Bilinear filtering averages four texels, and the
+mip chain that `vkc::load_texture` builds averages every 2×2 block into one texel of the next
+level. An average of unit vectors is shorter than one unit wherever they disagree: two normals
+60° apart average to a vector of length cos 30° = 0.87. Unnormalised, every edge in the map would
+come out dimmer than the flat surface beside it, and dimmer still at a distance, where smaller
+mip levels average more.
+
+The result of all this is the **shading normal**, the one the lighting uses. The interpolated
+vertex normal, which says which way the triangle itself faces, is the **geometric normal**. Until
+this chapter they were the same thing. The fragment shader now keeps both:
+
+```slang title="code/src/5.advanced_lighting/normal_mapping/scene.slang"
+[shader("fragment")]
+float4 fragmentMain(VSOutput input) : SV_Target {
+    float3 surface = normalize(input.normal);
+    float3 normal = shading_normal(input, surface);
+
+    // A direction drawn as a colour: each component from -1..1 to 0..1. Facing +x is
+    // red, +y green, +z blue.
+    if ((push.globals.flags & kShowNormals) != 0) {
+        return float4(normal * 0.5 + 0.5, 1.0);
+    }
+
+    float3 tint = push.draws[push.draw_index].colour.rgb;
+    float3 albedo = base_colour_map.Sample(input.uv).rgb * tint;
+    return float4(shade(input, surface, normal, albedo), 1.0);
+}
+```
+
+and passes both to `shade`, which passes both to each lamp:
+
+```slang title="code/src/5.advanced_lighting/normal_mapping/scene.slang"
+float3 shade(VSOutput input, float3 surface, float3 normal, float3 albedo) {
+    Globals globals = *push.globals;
+
+    float3 to_eye = normalize(globals.view_position.xyz - input.world_position);
+
+    float3 total = globals.ambient.rgb * albedo;
+    for (uint i = 0; i < kLampCount; ++i) {
+        total += lamp_light(globals.lamps[i], input.world_position, normal, surface,
+                            to_eye, albedo) *
+                 lamp_visibility(i, input.world_position);
+    }
+    return total;
+}
+```
+
+### Two normals, two questions
+
+`lamp_light` asks two questions of the surface, and they want different normals:
+
+```slang title="code/src/5.advanced_lighting/normal_mapping/scene.slang"
+float3 lamp_light(Lamp lamp, float3 world_position, float3 normal, float3 surface,
+                  float3 to_eye, float3 albedo) {
+    float3 offset = lamp.position.xyz - world_position;
+    float distance = length(offset);
+    float3 to_light = offset / distance;
+
+    float attenuation = 1.0 / (kConstantTerm + kLinearTerm * distance +
+                               kQuadraticTerm * distance * distance);
+
+    if (dot(surface, to_light) <= 0.0) {
+        return float3(0.0);
+    }
+    float facing = max(dot(normal, to_light), 0.0);
+```
+
+The first is 5.1's facing test: is the lamp in front of this surface at all? That is a question
+about the triangle, and it uses the geometric normal. A normal map can lean the shading normal
+by 60° or more, so a lamp a little behind a face can be in front of a texel's shading normal,
+and without the test, light would reach the side of a face turned away from it. The second
+question is how much light the surface takes in and reflects towards the eye, and that is the
+shading normal's job: Lambert's cosine and the specular lobe both use it.
+
+The opening view has such a place. Move the facing test onto the shading normal and 1,874 pixels
+change, by up to 109 levels out of 255, nearly all of them in one strip: the right-hand edge of
+the big crate's front face, where the frame's outer bevel leans round the corner towards the
+lamp that lights the side face. The front face itself is turned away from that lamp, and the
+shadow does not remove the strip: these counts are with shadows on.
+
+<figure>
+  <img src="/learn_vulkan/img/5.5/facing.png" alt="Two enlarged crops of the right-hand corner of a crate, where its dark front face meets its lit orange side face. Left: the front face's steel frame is dark right up to the corner. Right: a thin bright strip runs down the front face along the corner" />
+  <figcaption>Twice enlarged. Left: the facing test on the geometric normal. Right: on the shading
+  normal. The strip is the frame's bevel, lit by a lamp its own face is turned away from.</figcaption>
+</figure>
+
+Which picture is right is not clear-cut, and that is the honest summary of the guard. A real
+bevel on a real corner would catch that lamp, so the strip on the right is what the shape the map
+describes would do. But it is light arriving at a surface the lamp is behind, and the rule that
+lets it through has no limit: any texel whose map leans towards a lamp is lit by it, on whatever
+face. The guard gives up the strip to keep lamps off faces they are behind. With shadows switched
+off as well, the two tests differ on 4,365 pixels, spread over more of the crates.
+
+<figure>
+  <img src="/learn_vulkan/img/5.5/normals.png" alt="A close view of a crate face drawn in flat pastel colours instead of shading. The face is a pale salmon colour, the floor behind it pale green, the crate's left face pale violet. The plank gaps are thin magenta lines with yellow edges, the rivets are small domes shaded from yellow at the top to pink at the bottom, and the frame's inner edge is outlined in yellow on the left and pale violet on the right" />
+  <figcaption>Key 4: each pixel's shading normal as a colour. The swapchain is sRGB, so these are
+  paler than the stored values would be: the written 0.5 is displayed as the encoded 0.74.</figcaption>
+</figure>
+
+Key 4 draws the world-space shading normal as a colour, each component moved from −1..1 to
+0..1, the same encoding the map uses. The floor faces +y and is green. The crate face faces mostly
++x and is salmon. The detail shows as the map's edges, now in world directions.
+
+## UNORM, not SRGB
+
+A normal map is data, like 2.4's specular map, and is loaded with a UNORM format so that the
+shader receives byte / 255 untouched. Key 2 loads the same file a second time with
+`VK_FORMAT_R8G8B8A8_SRGB` and binds that instead:
+
+```cpp title="code/src/5.advanced_lighting/normal_mapping/main.cpp"
+        // A normal map is data, like 2.4's specular map: its bytes are directions, and
+        // the only right format is UNORM, which hands the shader byte / 255 unchanged.
+        // The SRGB copy is key 2's, and is there only to be wrong.
+        const auto load_pair = [&](const char* file, std::array<vkc::Image, 2>& pair) {
+            const std::filesystem::path path = vkc::asset_path(file);
+            pair[static_cast<uint32_t>(NormalRead::Unorm)] =
+                vkc::load_texture(context(), path, VK_FORMAT_R8G8B8A8_UNORM);
+            pair[static_cast<uint32_t>(NormalRead::Srgb)] =
+                vkc::load_texture(context(), path, VK_FORMAT_R8G8B8A8_SRGB);
+        };
+        load_pair("textures/lvk_crate_normal.png", crate_normals_);
+        load_pair("textures/lvk_ground_normal.png", floor_normals_);
+```
+
+```cpp title="code/src/5.advanced_lighting/normal_mapping/main.cpp"
+// The pair of normal maps a surface has: the right way to read one, and key 2's wrong
+// way. The two images hold the same bytes; only the format they were created with
+// differs.
+enum class NormalRead : uint32_t { Unorm = 0, Srgb = 1 };
+constexpr std::array<const char*, 2> kReadNames{"read as UNORM", "read as SRGB"};
+```
+
+Through the SRGB image the sampler applies 2.4's decoding curve to every channel before the
+shader sees it. The curve leaves 0 and 1 where they are and pulls everything between them
+down. A flat texel's 128 becomes 0.216 instead of 0.502, which the shader turns into −0.568
+instead of 0. Its 255 stays 1. The flat normal (0, 0, 1) is read as (−0.568, −0.568, 1), which
+normalises to a direction 38.8° from straight out, leaning towards −x and −y: left and down the
+image. Every flat texel on every surface leans that way, and the features lean with it.
+
+<figure>
+  <img src="/learn_vulkan/img/5.5/srgb.png" alt="The same crate face twice, side by side. Left: correctly lit, with a bright highlight across the planks on the left. Right: the whole face is darker and evenly orange, the highlight is gone, and the grooves are darker lines with little relief" />
+  <figcaption>Left: the normal map read as UNORM. Right: as SRGB, key 2. Every flat texel leans 38.8°
+  left and down, away from the lamp.</figcaption>
+</figure>
+
+It is easy to make this mistake, because a normal map is a PNG like a colour texture and
+`vkc::load_texture` defaults to SRGB. Nothing reports it. The validation layers cannot know what
+the bytes mean, and the scene still looks lit. It looks lit from the wrong place.
+
+## Which way is up
+
+Key 3 negates the green component after it is read, which is what reading a map drawn in the
+other convention, with y pointing down the image, would do. Red is untouched, so nothing changes
+side to side. Everything that leans up the image now leans down it.
+
+```slang title="code/src/5.advanced_lighting/normal_mapping/scene.slang"
+static const uint kNormalMapsOn = 1u << 0;
+static const uint kFlipGreen = 1u << 1;
+static const uint kShowNormals = 1u << 2;
+```
+
+<figure>
+  <img src="/learn_vulkan/img/5.5/green.png" alt="Two enlarged crops of a rivet and a plank gap. Left: the rivet's highlight is in its upper half and the bright edge of the groove is below the dark gap. Right: the rivet's highlight is in its lower half and the bright edge is above the gap" />
+  <figcaption>Three times enlarged. Left: green as stored. Right: flipped, key 3. The lamp and the
+  camera are both above this gap, so the edge that should catch the light is the one facing up,
+  below the gap.</figcaption>
+</figure>
+
+A flipped map looks wrong in a particular way: lit from the side as it should be, but lit from
+below when the light is above. Bumps read as dents and dents as bumps, which is the same mistake
+seen two ways. When a map from elsewhere does this, the cure is to negate green, either once in
+the image or every time in the shader, as key 3 does.
+
+## The descriptors
+
+Set 0 gains a binding. The base colour map stays at 0, and the normal map goes at 1:
+
+```slang title="code/src/5.advanced_lighting/normal_mapping/scene.slang"
+[[vk::binding(0, 0)]] Sampler2D base_colour_map;
+// The surface's normals, one per texel, in the surface's own basis.
+[[vk::binding(1, 0)]] Sampler2D normal_map;
+```
+
+```cpp title="code/src/5.advanced_lighting/normal_mapping/main.cpp"
+        // Set 0 gains a second binding: the base colour map at 0, as before, and the
+        // normal map at 1. Both are read by the fragment shader alone.
+        const std::array<VkDescriptorSetLayoutBinding, 2> texture_bindings{{
+            {
+                .binding = 0,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .descriptorCount = 1,
+                .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+                .pImmutableSamplers = nullptr,
+            },
+            {
+                .binding = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .descriptorCount = 1,
+                .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+                .pImmutableSamplers = nullptr,
+            },
+        }};
+        const VkDescriptorSetLayoutCreateInfo texture_layout_info{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .bindingCount = static_cast<uint32_t>(texture_bindings.size()),
+            .pBindings = texture_bindings.data(),
+        };
+```
+
+Each surface now has two texture sets, one per way of reading its normal map, and key 2 picks
+which is bound. That makes four texture sets of two descriptors each, and one shadow set of
+three, since this chapter keeps only 5.4's linear comparison sampler:
+
+```cpp title="code/src/5.advanced_lighting/normal_mapping/main.cpp"
+        constexpr uint32_t kSets = 4 + 1;
+        constexpr uint32_t kDescriptors = 4 * 2 + kLampCount;
+```
+
+```cpp title="code/src/5.advanced_lighting/normal_mapping/main.cpp"
+        for (uint32_t read = 0; read < 2; ++read) {
+            crate_sets_[read] = allocate_set(texture_set_layout_);
+            write_image(crate_sets_[read], 0, 0, crate_map_.view(), sampler_.handle());
+            write_image(crate_sets_[read], 1, 0, crate_normals_[read].view(),
+                        sampler_.handle());
+
+            floor_sets_[read] = allocate_set(texture_set_layout_);
+            write_image(floor_sets_[read], 0, 0, floor_map_.view(), sampler_.handle());
+            write_image(floor_sets_[read], 1, 0, floor_normals_[read].view(),
+                        sampler_.handle());
+        }
+
+        shadow_set_ = allocate_set(shadow_set_layout_);
+        for (uint32_t lamp = 0; lamp < kLampCount; ++lamp) {
+            write_image(shadow_set_, 0, lamp, shadow_cubes_[lamp].view(),
+                        shadow_sampler_.handle());
+        }
+```
+
+`write_image` takes the binding as a parameter again. 5.4 had replaced it with the array
+element, because each of its sets had a single binding:
+
+```cpp title="code/src/5.advanced_lighting/normal_mapping/main.cpp"
+    // 5.4's write_image(), with the binding back as a parameter: set 0 now has two.
+    void write_image(VkDescriptorSet set, uint32_t binding, uint32_t element,
+                     VkImageView view, VkSampler sampler) {
+```
+
+```cpp title="code/src/5.advanced_lighting/normal_mapping/main.cpp"
+            .dstSet = set,
+            .dstBinding = binding,
+            .dstArrayElement = element,
+```
+
+Drawing binds the set for the current way of reading. The shadow pass binds it too: its vertex
+shader reads nothing from set 0, but the bind is shared with the camera pass and costs nothing.
+
+```cpp title="code/src/5.advanced_lighting/normal_mapping/main.cpp"
+    void draw_geometry(VkCommandBuffer cmd, uint32_t face_base) {
+        const auto read = static_cast<uint32_t>(read_);
+
+        bind_indices(cmd, floor_);
+        bind_texture(cmd, floor_sets_[read]);
+```
+
+```cpp title="code/src/5.advanced_lighting/normal_mapping/main.cpp"
+        bind_texture(cmd, crate_sets_[read]);
+```
+
+## What a normal map cannot do
+
+Look at the edges of the crates. Every outline is still a straight line: the frame's bevel, so
+convincing on the face, does not round the crate's corner, and a rivet on the edge of a face does
+not stick out past it. The outline of an object against what is behind it, its **silhouette**,
+is drawn by the triangles, and a normal map does not move a single one.
+
+The shadows say the same thing. The shadow pass reads only positions; the rivets cast no
+shadows and the grooves catch none, and each crate's shadow is the shadow of a cube. A normal map
+changes how light is reflected, not where the surface is, so anything that depends on where the
+surface is, its outline, what it hides, what it shadows, is untouched. That limit is what the
+next chapter starts on.
+
+## The shadows, trimmed
+
+5.4's keys for comparing the two ways of filling a cube and the three ways of reading one are
+gone, and with them the per-face views, the six-pass pipeline, the nearest comparison sampler
+and the GPU timer. What is left is the multiview fill and the 3×3 reads, unchanged:
+
+```cpp title="code/src/5.advanced_lighting/normal_mapping/main.cpp"
+    // 5.4's multiview fill. The six-pass fill and its per-face views are gone: they were
+    // there to compare the two, and that comparison was 5.4's.
+    void render_shadow_cube(VkCommandBuffer cmd, uint32_t lamp) {
+        const vkc::Image& cube = shadow_cubes_[lamp];
+
+        vkc::image_barrier(cmd, cube.handle(), VK_IMAGE_LAYOUT_UNDEFINED,
+```
+
+```cpp title="code/src/5.advanced_lighting/normal_mapping/main.cpp"
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, shadow_pipeline_);
+        begin_shadow_pass(cmd, cube.view());
+        draw_geometry(cmd, lamp * kFaceCount);
+        vkCmdEndRendering(cmd);
+
+        vkc::image_barrier(cmd, cube.handle(),
+```
+
+```cpp title="code/src/5.advanced_lighting/normal_mapping/main.cpp"
+    static void begin_shadow_pass(VkCommandBuffer cmd, VkImageView view) {
+```
+
+```cpp title="code/src/5.advanced_lighting/normal_mapping/main.cpp"
+            .viewMask = kAllFaces,
+```
+
+```cpp title="code/src/5.advanced_lighting/normal_mapping/main.cpp"
+        vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                pipeline_layout_, 1, 1, &shadow_set_, 0, nullptr);
+```
+
+The cubes are plain `vkc::Image`s now, with nothing beside them:
+
+```cpp title="code/src/5.advanced_lighting/normal_mapping/main.cpp"
+        for (uint32_t lamp = 0; lamp < kLampCount; ++lamp) {
+            shadow_cubes_[lamp] = vkc::Image(
+```
+
+```cpp title="code/src/5.advanced_lighting/normal_mapping/main.cpp"
+            context().name(shadow_cubes_[lamp].handle(), VK_OBJECT_TYPE_IMAGE,
+                           name.c_str());
+        }
+
+        shadow_sampler_ = vkc::Sampler(
+            context(), vkc::SamplerDesc{
+                           .mag_filter = filterable ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
+                           .min_filter = filterable ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
+```
+
+```cpp title="code/src/5.advanced_lighting/normal_mapping/main.cpp"
+        // 5.4's multiview shadow pipeline.
+        shadow_pipeline_ = vkc::PipelineBuilder(device)
+                               .shaders(scene_shader, "shadowVertexMain", "")
+                               .cull(VK_CULL_MODE_BACK_BIT, VK_FRONT_FACE_CLOCKWISE)
+                               .depth(VK_FORMAT_D32_SFLOAT, /*test=*/true, /*write=*/true)
+                               .depth_bias(kConstantBias, kSlopeBias)
+                               .view_mask(kAllFaces)
+                               .layout(pipeline_layout_)
+                               .build();
+```
+
+```cpp title="code/src/5.advanced_lighting/normal_mapping/main.cpp"
+        context().name(shadow_pipeline_, VK_OBJECT_TYPE_PIPELINE, "shadow, multiview");
+```
+
+`Globals` loses its filter field and is 1424 bytes; its flags are three new bits:
+
+```cpp title="code/src/5.advanced_lighting/normal_mapping/main.cpp"
+// The bits of Globals::flags.
+constexpr uint32_t kNormalMapsOn = 1U << 0;
+constexpr uint32_t kFlipGreen = 1U << 1;
+constexpr uint32_t kShowNormals = 1U << 2;
+```
+
+```cpp title="code/src/5.advanced_lighting/normal_mapping/main.cpp"
+static_assert(sizeof(Globals) == 1424);
+```
+
+```cpp title="code/src/5.advanced_lighting/normal_mapping/main.cpp"
+            .flags = (normal_maps_ ? kNormalMapsOn : 0U) | (flip_green_ ? kFlipGreen : 0U) |
+                     (show_normals_ ? kShowNormals : 0U),
+```
+
+## The application
+
+The rest of what changed: the build entry, the keys, the members and the teardown.
+
+```cmake title="code/src/5.advanced_lighting/normal_mapping/CMakeLists.txt"
+add_chapter(5.5.normal_mapping
+    SOURCES main.cpp
+    SHADERS scene.slang
+)
+```
+
+```cpp title="code/src/5.advanced_lighting/normal_mapping/main.cpp"
+#include <filesystem>
+```
+
+```cpp title="code/src/5.advanced_lighting/normal_mapping/main.cpp"
+class NormalMappingApp : public vkc::App {
+```
+
+```cpp title="code/src/5.advanced_lighting/normal_mapping/main.cpp"
+        camera_.position = {-0.4F, 0.4F, 2.6F};
+        camera_.yaw = -134.0F;
+        camera_.pitch = -19.0F;
+
+        spdlog::info("1 normal maps, 2 UNORM or SRGB, 3 flip green, 4 show normals, "
+                     "5 move the lamps.");
+        log_mode();
+```
+
+```cpp title="code/src/5.advanced_lighting/normal_mapping/main.cpp"
+            case SDL_SCANCODE_1:
+                normal_maps_ = !normal_maps_;
+                log_mode();
+                break;
+            case SDL_SCANCODE_2:
+                read_ = read_ == NormalRead::Unorm ? NormalRead::Srgb : NormalRead::Unorm;
+                log_mode();
+                break;
+            case SDL_SCANCODE_3:
+                flip_green_ = !flip_green_;
+                log_mode();
+                break;
+            case SDL_SCANCODE_4:
+                show_normals_ = !show_normals_;
+                log_mode();
+                break;
+            case SDL_SCANCODE_5:
+                moving_ = !moving_;
+                log_mode();
+                break;
+```
+
+```cpp title="code/src/5.advanced_lighting/normal_mapping/main.cpp"
+        vkDestroyPipeline(device, lamp_pipeline_, nullptr);
+        vkDestroyPipeline(device, shadow_pipeline_, nullptr);
+        vkDestroyPipeline(device, opaque_pipeline_, nullptr);
+```
+
+```cpp title="code/src/5.advanced_lighting/normal_mapping/main.cpp"
+        shadow_sampler_.destroy();
+        for (vkc::Image& cube : shadow_cubes_) {
+            cube.destroy();
+        }
+
+        sampler_.destroy();
+        for (vkc::Image& map : floor_normals_) {
+            map.destroy();
+        }
+        for (vkc::Image& map : crate_normals_) {
+            map.destroy();
+        }
+```
+
+```cpp title="code/src/5.advanced_lighting/normal_mapping/main.cpp"
+    void log_mode() const {
+        spdlog::info("normal maps {}, {}, green {}{}{}", normal_maps_ ? "on" : "off",
+                     kReadNames[static_cast<uint32_t>(read_)],
+                     flip_green_ ? "flipped" : "as stored",
+                     show_normals_ ? ", showing normals" : "",
+                     moving_ ? ", lamps moving" : "");
+    }
+```
+
+```cpp title="code/src/5.advanced_lighting/normal_mapping/main.cpp"
+    vkc::Image crate_map_;
+    vkc::Image floor_map_;
+    // Indexed by NormalRead.
+    std::array<vkc::Image, 2> crate_normals_;
+    std::array<vkc::Image, 2> floor_normals_;
+    vkc::Sampler sampler_;
+
+    std::array<vkc::Image, kLampCount> shadow_cubes_;
+    vkc::Sampler shadow_sampler_;
+
+    // Indexed by NormalRead.
+    std::array<VkDescriptorSet, 2> crate_sets_{};
+    std::array<VkDescriptorSet, 2> floor_sets_{};
+    VkDescriptorSet shadow_set_ = VK_NULL_HANDLE;
+```
+
+```cpp title="code/src/5.advanced_lighting/normal_mapping/main.cpp"
+    VkPipeline shadow_pipeline_ = VK_NULL_HANDLE;
+
+    bool normal_maps_ = true;
+    NormalRead read_ = NormalRead::Unorm;
+    bool flip_green_ = false;
+    bool show_normals_ = false;
+    bool moving_ = false;
+    float lamp_time_ = 0.0F;
+};
+```
+
+```cpp title="code/src/5.advanced_lighting/normal_mapping/main.cpp"
+        options.title = "LearnVulkan 5.5 - Normal mapping";
+        NormalMappingApp app(vkc::App::parse_args(argc, argv, options));
+```
+
+## What changed since 5.4
+
+- a normal map each for the crates and the floor, drawn from height fields by
+  `tools/make_textures.py`
+- `Corner` for the hand-written tables, and a 48-byte `Vertex` with a tangent and its handedness
+- `with_tangents`, solving each triangle for ∂p/∂u and ∂p/∂v
+- the tangent carried into world space by the model matrix, and the TBN basis built per fragment
+- separate geometric and shading normals: the facing test on one, the lighting on the other
+- set 0's second binding, and an SRGB copy of each map for key 2
+- 5.4's comparison keys removed: only the multiview fill and the 3×3 reads remain
+- 39 chapters in the build now
+
+## Words introduced in this chapter
+
+| | |
+|---|---|
+| **normal map** | a texture whose texels are directions, each stored as c × 0.5 + 0.5, giving the surface a normal per texel instead of per vertex |
+| **height field** | a surface given as a height above each point of a plane, z = h(x, y) |
+| **central difference** | a slope estimated from the values one step ahead and one step behind, centred on the point it is for |
+| **tangent space** | the frame a normal map's directions are measured in: x across the image, y up it, z out of the surface |
+| **tangent** | the direction along a surface in which the texture's u increases |
+| **bitangent** | the third axis of tangent space, along the surface and perpendicular to the tangent; here, up the image |
+| **handedness** | whether a frame's three axes turn the way the right-hand rule says or the mirror way; stored as ±1 in the tangent's w |
+| **mirrored UVs** | uvs laid onto part of a model back to front, so that one half of a texture serves both halves of a symmetric object; there the handedness is −1 |
+| **TBN matrix** | the matrix whose columns are the tangent, the bitangent and the normal, which carries a tangent-space direction into world space |
+| **Gram-Schmidt** | making vectors perpendicular by removing from each its projection onto the ones already fixed |
+| **shading normal** | the normal the lighting uses: here, the normal map's direction carried into the world |
+| **geometric normal** | the normal of the triangle itself, from the vertices; it says which side of the surface a lamp is on |
+| **normal map convention** | which way a normal map's y axis points, up the image or down it; nothing in the file records it |
+| **silhouette** | an object's outline against what is behind it, drawn by its triangles and untouched by a normal map |
+
+## Exercises
+
+1. Set `NORMAL_STRENGTH` in `tools/make_textures.py` to 6 and regenerate. Where does the
+   crate stop looking like relief and start looking like a drawing of relief? Look at the edges
+   from a low angle.
+2. Load the normal maps with `vkc::load_texture`'s default format, without changing anything
+   else. Which key now shows the right picture?
+3. Mirror the front face's uvs by swapping u = 0 and u = 1 in its four rows of `kCubeVertices`.
+   What does `with_tangents` now give that face as its handedness? Press key 4 and compare the
+   rivets with the other faces, then set w to +1 by hand and look again.
+4. Remove the `normalize` from the last line of `shading_normal`. Fly away from a crate until its
+   texture is minified. Which parts of the map dim first, and why those?
+5. The facing test cuts the bevel off at the crate's corner. Replace the hard test with a fade,
+   multiplying the lamp's light by `saturate(dot(surface, to_light) * 8.0)`, and compare the
+   corner with both halves of the figure above.
+6. Put the tangent through `normal_matrix` instead of the model matrix. Why does the post, scaled
+   0.3 by 2.6 by 0.3, look the same? Rotate the floor by 30° about its normal before scaling it
+   by 2 along x, and find the difference.
+
+Next: 5.6 Parallax mapping. The grooves turn to the light, but not to the eye: seen from a low
+angle, the planks still lie flat on the face instead of hiding the gaps behind them. The next
+chapter moves the texture lookup itself.
